@@ -6,7 +6,7 @@
 <meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="referrer" content="no-referrer">
 <title>ZCode 对话控制台</title>
-<link rel="stylesheet" href="/static/style.css?v=20260917b">
+<link rel="stylesheet" href="/static/style.css?v=20260918a">
 </head>
 <body>
 
@@ -121,6 +121,10 @@
             <span>思考</span>
             <select id="thought-select"></select>
           </label>
+          <button id="auto-run-btn" class="pick auto-toggle" type="button"
+                  title="连续执行：一轮收尾后自动发「继续」开下一轮；执行出错时自动重试同一条消息（最多 3 次）。点「停止生成」即可全部关闭。">
+            <span>连续</span><i id="auto-run-dot" class="auto-dot"></i>
+          </button>
         </div>
         <div class="composer-right">
           <label class="pick" title="本会话的权限模式">
@@ -591,6 +595,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js?v=20260917b"></script>
+<script src="/static/app.js?v=20260918a"></script>
 </body>
 </html>

@@ -538,6 +538,9 @@
       case 'title':
         loadSessions(true);
         break;
+      case 'notice':
+        toast('「' + titleOf(sid) + '」' + (d.message || ''));
+        break;
     }
   }
 
@@ -603,6 +606,11 @@
 
       case 'cancelled':
         toast('已停止生成');
+        break;
+
+      case 'notice':
+        // 自动续跑 / 自动重试的进度提示
+        toast(d.message || '');
         break;
 
       case 'model-scheduled':
@@ -1274,6 +1282,34 @@
   $('mode-select').addEventListener('change', updateModeDesc);
   // 改了模型就只影响当前这个会话（不重启 app-server、不影响别的会话）
   $('model-select').addEventListener('change', function () { applySessionModel(this); });
+
+  // 连续执行：收尾自动续跑 + 出错自动重试；「停止生成」是总闸
+  function setAutoRunUI(on) {
+    var btn = $('auto-run-btn');
+    if (!btn) return;
+    btn.classList.toggle('active', !!on);
+  }
+
+  $('auto-run-btn').addEventListener('click', function () {
+    var sid = state.sessionId;
+    if (!sid) { toast('请先选择会话', 'err'); return; }
+    var btn = $('auto-run-btn');
+    var enable = !btn.classList.contains('active');
+    btn.disabled = true;
+    req('/api/sessions/' + encodeURIComponent(sid) + '/auto-run', {
+      method: 'POST', body: JSON.stringify({ enabled: enable })
+    }).then(function (r) {
+      btn.disabled = false;
+      if (!r.data.ok) { toast(r.data.error || '设置失败', 'err'); return; }
+      setAutoRunUI(enable);
+      var s = state.sessions.filter(function (x) { return x.id === sid; })[0];
+      if (s) s.autoRun = enable;
+      renderRunningMarks();
+      toast(enable ? '连续执行已开启：收尾后自动续跑，出错自动重试（点「停止生成」可随时关）'
+                   : '连续执行已关闭', enable ? 'ok' : '');
+    }).catch(function () { btn.disabled = false; toast('设置失败', 'err'); });
+  });
+
   $('nc-mode').addEventListener('change', function () {
     $('nc-mode-desc').textContent = modeDesc(this.value);
   });
@@ -1476,6 +1512,14 @@
           ((pick.providerId || '') + '/' + mid);
         sub.appendChild(mt);
       }
+      // 连续执行中的会话给个小标记，一眼知道它会自己续跑
+      if (s.autoRun) {
+        var at = document.createElement('span');
+        at.className = 'model-tag auto';
+        at.textContent = '连续';
+        at.title = '连续执行中：收尾后自动续跑，出错自动重试';
+        sub.appendChild(at);
+      }
       // 后台还在跑的会话要一眼看得出来（不只在打开它的那个标签页里）
       var tag = document.createElement('span');
       tag.className = 'run-tag';
@@ -1661,6 +1705,7 @@
       $('mode-select').value = s.mode;
       updateModeDesc();
     }
+    setAutoRunUI(!!s.autoRun);
     var m = s.model;
     if (m && m.providerId && m.modelId) {
       var v = m.providerId + '|' + m.modelId;

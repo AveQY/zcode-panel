@@ -46,6 +46,16 @@ CONFIG_PATH = BASE_DIR / "config.json"
 BAN_PATH = DATA_DIR / "banned.json"
 WORKSPACE_PATH = DATA_DIR / "workspaces.json"
 SCHEDULE_PATH = DATA_DIR / "model_schedules.json"
+AUTO_RUN_PATH = DATA_DIR / "auto_run.json"
+
+# ---- 自动续跑 / 失败自动重试 ------------------------------------------------
+# 「连续执行」开着时：一轮正常收尾 → 延迟几秒自动发续跑消息开下一轮；
+# 一轮以错误收场（如模型 API 连不上）→ 自动重发同一条消息，指数退避。
+# 任何手动「停止」都是总闸；手动发消息会重置连续计数。
+AUTO_RUN_DELAY = 8                     # 正常收尾后几秒自动续跑
+AUTO_RUN_MAX_ROUNDS = 30               # 连续自动续跑轮数上限（防失控兜底）
+AUTO_RETRY_MAX = 3                     # 出错后重试原消息的次数
+AUTO_RETRY_DELAYS = [20, 60, 180]      # 重试退避（秒）
 
 ZCODE_BIN = "/usr/local/bin/zcode"
 ZCODE_DB = "/root/.zcode/cli/db/db.sqlite"
@@ -1083,6 +1093,7 @@ class SessionFeedManager:
             return
         log(f"开始拉取事件: {session_id}")
         fails = 0
+        outcome = None           # completed / failed；None 表示非正常收尾（如停机），不触发自动续跑
         try:
             while True:
                 if not f.turn_active:
@@ -1098,6 +1109,7 @@ class SessionFeedManager:
                         continue
                     await f.broadcast({"type": "error", "sessionId": session_id,
                                        "message": "执行超时，已停止接收事件"})
+                    outcome = "failed"
                     break
                 try:
                     res = await zc.call("session/events", {
@@ -1111,6 +1123,7 @@ class SessionFeedManager:
                         await f.broadcast({"type": "error", "sessionId": session_id,
                                            "message": "与 app-server 的连接已中断，"
                                                       "已停止接收输出（结果以刷新后的历史为准）"})
+                        outcome = "failed"
                         break
                     log(f"拉取事件失败 {session_id}: {exc}")
                     await asyncio.sleep(1.5)
@@ -1132,11 +1145,13 @@ class SessionFeedManager:
                         runner.finish(session_id)
                     await f.broadcast({"type": "done", "sessionId": session_id,
                                        "usage": f.usage, "title": session_title(session_id)})
+                    outcome = "failed" if f.error else "completed"
                     break
                 await asyncio.sleep(EVENT_POLL_INTERVAL)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            outcome = "failed"
             log(f"事件拉取任务异常 {session_id}: {exc}")
         finally:
             f.turn_active = False
@@ -1144,6 +1159,11 @@ class SessionFeedManager:
             if runner:
                 runner.finish(session_id)
             log(f"事件拉取结束: {session_id}")
+            if runner and outcome is not None:
+                try:
+                    runner._after_turn(session_id, outcome)
+                except Exception as exc:
+                    log(f"自动续跑决策异常 {session_id}: {exc}")
 
     async def _handle_event(self, f, e):
         etype = e.get("type") or ""
@@ -1246,6 +1266,32 @@ class SessionFeedManager:
 
 # ---------------------------------------------------------------- 对话执行
 
+def load_auto_run(runner):
+    """把「连续执行」状态从盘上恢复回来（面板重启不丢）。"""
+    try:
+        if AUTO_RUN_PATH.exists():
+            d = json.loads(AUTO_RUN_PATH.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                runner.auto_run.update(
+                    {k: v for k, v in d.items() if isinstance(v, dict)})
+                n = len(runner.auto_run)
+                if n:
+                    log(f"已恢复 {n} 个会话的连续执行状态")
+    except Exception as exc:
+        log(f"连续执行状态读取失败，按空处理: {exc}")
+
+
+def save_auto_run(runner):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = AUTO_RUN_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(runner.auto_run, ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        tmp.replace(AUTO_RUN_PATH)
+    except Exception as exc:
+        log(f"连续执行状态保存失败: {exc}")
+
+
 class TurnManager:
     """负责发消息、取消、以及确保会话处于我们想要的模式/模型/思考等级。"""
 
@@ -1261,6 +1307,114 @@ class TurnManager:
         # 用户改会话设置时，如果会话正在跑（不能打断），就先把改动记在这里，
         # 等这一轮结束、下一次发消息时由 apply_settings 落下去。
         self.pending_settings = {}   # session_id -> {"mode","model","thoughtLevel"}
+        # 自动续跑 / 失败自动重试。sid -> {"enabled","message","max_rounds","rounds","retries"}
+        self.auto_run = {}
+        self.last_sent = {}     # sid -> 最近一条发出去的消息（失败重试用）
+        load_auto_run(self)
+
+    # ---- 自动续跑 -----------------------------------------------------------
+
+    def auto_of(self, session_id):
+        return self.auto_run.get(session_id) or {}
+
+    def set_auto(self, session_id, enabled, message=None, max_rounds=None):
+        if enabled:
+            cur = self.auto_run.get(session_id) or {}
+            cur["enabled"] = True
+            cur["message"] = (message if message is not None
+                              else cur.get("message") or "继续")
+            cur["max_rounds"] = int(max_rounds or cur.get("max_rounds")
+                                    or AUTO_RUN_MAX_ROUNDS)
+            cur.setdefault("rounds", 0)
+            cur.setdefault("retries", 0)
+            self.auto_run[session_id] = cur
+        else:
+            self.auto_run.pop(session_id, None)
+        save_auto_run(self)
+        return self.auto_of(session_id)
+
+    def note_user_send(self, session_id, content):
+        """手动发消息：重置连续计数（用户还在主动参与，重新给一整段预算），
+        并记住内容供失败重试。自动续跑发出的消息不会走到这里。"""
+        self.last_sent[session_id] = content
+        ar = self.auto_run.get(session_id)
+        if ar:
+            ar["rounds"] = 0
+            ar["retries"] = 0
+            save_auto_run(self)
+
+    def _notice(self, session_id, message):
+        log(f"[自动续跑] {session_id}: {message}")
+        f = feed.get(session_id) if feed else None
+        if f:
+            asyncio.create_task(f.broadcast(
+                {"type": "notice", "sessionId": session_id, "message": message}))
+
+    def _after_turn(self, session_id, outcome):
+        """一轮结束后的自动续跑/重试决策。outcome: completed / failed / cancelled。"""
+        ar = self.auto_run.get(session_id)
+        if not ar or not ar.get("enabled"):
+            return
+        f = feed.get(session_id) if feed else None
+        if f is not None and f.stop_requested:
+            return                      # 用户点了停止，总闸拉下
+        if outcome == "cancelled":
+            self.set_auto(session_id, False)
+            self._notice(session_id, "已手动停止，连续执行已关闭")
+            return
+        if outcome == "failed":
+            retries = int(ar.get("retries", 0))
+            if retries >= AUTO_RETRY_MAX:
+                self.set_auto(session_id, False)
+                self._notice(session_id,
+                             f"连续 {AUTO_RETRY_MAX} 次自动重试仍失败，连续执行已关闭。"
+                             "请检查模型端点连通性后再手动发起。")
+                return
+            delay = AUTO_RETRY_DELAYS[min(retries, len(AUTO_RETRY_DELAYS) - 1)]
+            ar["retries"] = retries + 1
+            content = self.last_sent.get(session_id) or ar.get("message") or "继续"
+            save_auto_run(self)
+            self._notice(session_id,
+                         f"本轮执行出错，{delay} 秒后自动重试同一条消息"
+                         f"（第 {ar['retries']}/{AUTO_RETRY_MAX} 次）")
+        else:
+            ar["retries"] = 0
+            rounds = int(ar.get("rounds", 0))
+            if rounds >= int(ar.get("max_rounds") or AUTO_RUN_MAX_ROUNDS):
+                self.set_auto(session_id, False)
+                self._notice(session_id,
+                             f"已连续自动续跑 {rounds} 轮，达到上限，连续执行已关闭")
+                return
+            ar["rounds"] = rounds + 1
+            delay = AUTO_RUN_DELAY
+            content = ar.get("message") or "继续"
+            save_auto_run(self)
+            self._notice(session_id,
+                         f"本轮已收尾，{delay} 秒后自动续跑"
+                         f"（第 {ar['rounds']}/{ar.get('max_rounds')} 轮）")
+        asyncio.create_task(self._auto_send(session_id, content, delay))
+
+    async def _auto_send(self, session_id, content, delay):
+        try:
+            await asyncio.sleep(delay)
+            f = feed.get(session_id) if feed else None
+            if f is not None and (f.stop_requested or session_id in self.running):
+                return
+            ar = self.auto_run.get(session_id)
+            if not ar or not ar.get("enabled"):
+                return
+            await self.send(session_id, content, auto=True)
+            self._notice(session_id, "自动消息已发出")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            msg = str(exc)
+            if "正在执行中" in msg or "还没真正停下来" in msg:
+                # 手动操作抢先了，把这一拍让出去；等这轮结束后 _after_turn 再排
+                self._notice(session_id, "自动续跑让位于手动操作，本轮跳过")
+                return
+            self._notice(session_id, f"自动发送失败: {msg}")
+            self.set_auto(session_id, False)
 
     def is_running(self, session_id):
         return session_id in self.running
@@ -1392,10 +1546,16 @@ class TurnManager:
         await self.ensure_active(session_id, force=True)
         await self.apply_settings(session_id, mode, model, thought_level)
 
-    async def send(self, session_id, content, mode=None, model=None, thought_level=None):
+    async def send(self, session_id, content, mode=None, model=None, thought_level=None,
+                   auto=False):
         async with self.lock:
             if session_id in self.running:
                 raise RuntimeError("这个会话正在执行中，请稍候")
+            if not auto:
+                # 手动发消息：重置连续执行的计数，并记住内容供失败重试
+                self.note_user_send(session_id, content)
+            else:
+                self.last_sent[session_id] = content
             await self._ensure_ready(session_id, mode, model, thought_level)
             # 刚点过「停止」但 app-server 其实还在跑（session/stop 并不保证中断已经
             # 发出的模型请求）：这时直接发，消息会被压成 session_input(queue) 然后
@@ -1501,6 +1661,10 @@ class TurnManager:
             await f.broadcast({"type": "cancelled", "sessionId": session_id})
             await f.broadcast({"type": "done", "sessionId": session_id, "cancelled": True})
         self.running.pop(session_id, None)
+        # 手动停止是自动续跑的总闸：用户喊停就全停，绝不自动再拉起来
+        if self.auto_run.get(session_id, {}).get("enabled"):
+            self.set_auto(session_id, False)
+            self._notice(session_id, "已手动停止，连续执行已关闭")
         return True
 
     def finish(self, session_id):
@@ -3307,6 +3471,7 @@ async def handle_sessions(request):
             "mode": s.get("mode"),
             "model": model,
             "pendingModel": pending,
+            "autoRun": bool((runner.auto_of(sid) or {}).get("enabled")) if runner else False,
             "kind": s.get("sessionKind") or "interactive",
             "archived": False,
         })
@@ -3516,6 +3681,37 @@ async def handle_session_settings(request):
         })
     return web.json_response({"ok": True, "applied": True, "pending": False,
                               "model": model, "mode": mode, "thoughtLevel": tl})
+
+
+async def handle_auto_run(request):
+    """开关某个会话的「连续执行」：收尾自动续跑 + 出错自动重试。
+
+    状态落在面板自己的 auto_run.json 里，面板重启也不丢。
+    """
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    sid = request.match_info["sid"]
+    if not SESSION_ID_RE.match(sid):
+        return json_error("非法的会话 ID", 400)
+    data = await body_json(request)
+    enabled = bool(data.get("enabled"))
+    message = data.get("message")
+    if message is not None:
+        message = str(message).strip()
+        if len(message) > 200:
+            return json_error("续跑消息过长（上限 200 字）", 400)
+        if not message:
+            message = "继续"
+    max_rounds = data.get("maxRounds")
+    if max_rounds is not None:
+        try:
+            max_rounds = max(1, min(int(max_rounds), 200))
+        except Exception:
+            max_rounds = None
+    ar = runner.set_auto(sid, enabled, message=message, max_rounds=max_rounds)
+    log(f"会话 {sid} 连续执行 -> {'开' if enabled else '关'}")
+    return web.json_response({"ok": True, "autoRun": ar})
 
 
 # ---------------------------------------------------------------- 路由：设置
@@ -4225,6 +4421,7 @@ def make_app():
     app.router.add_post("/api/sessions/{sid}/archive", handle_session_archive)
     app.router.add_delete("/api/sessions/{sid}", handle_session_delete)
     app.router.add_post("/api/sessions/{sid}/settings", handle_session_settings)
+    app.router.add_post("/api/sessions/{sid}/auto-run", handle_auto_run)
 
     app.router.add_get("/api/settings/security", handle_settings_security)
     app.router.add_post("/api/settings/key", handle_settings_key)

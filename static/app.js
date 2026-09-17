@@ -5,7 +5,8 @@
 
   var state = {
     sessionId: null,
-    sending: false,
+    sending: false,             // 只表示「当前视图这个会话在跑」，真正来源是 state.running
+    running: {},                // sessionId -> {since}：每个会话各自的执行状态
     ws: null,
     messageMap: new Map(),
     listTimer: null,
@@ -48,6 +49,25 @@
   };
 
   var WS_COLLAPSE_KEY = 'zwc_ws_collapsed';
+  var LAST_SESSION_KEY = 'zwc_last_session';
+
+  function rememberSession(sid) {
+    try {
+      if (sid) localStorage.setItem(LAST_SESSION_KEY, sid);
+      else localStorage.removeItem(LAST_SESSION_KEY);
+    } catch (e) {}
+  }
+
+  // 重开页面时回到上次的会话：如果它在后台跑着，正好直接接回输出
+  function restoreLastSession() {
+    if (state.sessionId) return;
+    var sid = null;
+    try { sid = localStorage.getItem(LAST_SESSION_KEY); } catch (e) {}
+    if (!sid) return;
+    var hit = (state.sessions || []).filter(function (s) { return s.id === sid; })[0];
+    if (!hit) return;
+    openSession(sid);
+  }
 
   try {
     state.wsCollapsed = JSON.parse(localStorage.getItem(WS_COLLAPSE_KEY) || '{}') || {};
@@ -239,13 +259,14 @@
     $('app-view').classList.remove('hidden');
     startListTimer();
     state.wsEnabled = true;
+    syncComposer();
     connectWs();
     loadOptions();
     loadUsage('today');
     loadSchedules();
     // 会话列表要按工作区分组，所以先拿到工作区清单再渲染列表
     loadWorkspaces().then(function () {
-      loadSessions(true);
+      loadSessions(true).then(restoreLastSession);
     });
     if (window.innerWidth <= 720) {
       $('sidebar').classList.add('collapsed');
@@ -428,7 +449,7 @@
       return;
     }
     // 生成过程中掉线：丢掉半截气泡，靠服务端回放把本轮续上
-    if (state.sessionId && state.sending) {
+    if (state.sessionId && isRunning(state.sessionId)) {
       resetLiveBubble();
       wsSend({ type: 'watch', sessionId: state.sessionId });
       setStatus('连接已恢复，正在恢复输出…');
@@ -452,7 +473,7 @@
   // 重连后 6 秒内没等到 resumed：说明那一轮其实已经跑完，用历史接口对齐并收尾
   function reconcileAfterReconnect() {
     state.wsResumeTimer = null;
-    if (!state.sending || !state.sessionId) return;
+    if (!state.sessionId || !isRunning(state.sessionId)) return;
     var sid = state.sessionId;
     req('/api/sessions/' + encodeURIComponent(sid) + '/messages').then(function (r) {
       if (state.sessionId !== sid) return;
@@ -465,7 +486,7 @@
     }).catch(function () {}).then(function () {
       if (state.sessionId !== sid) return;
       removeThinking();
-      setSending(false);
+      markRunning(sid, false);
       setStatus('');
     });
   }
@@ -488,12 +509,51 @@
     return false;
   }
 
+  // 切走之后仍在后台跑的会话：只更新它的状态并提示，绝不写进当前视图
+  function handleBackgroundEvent(d) {
+    var sid = d.sessionId;
+    switch (d.type) {
+      case 'accepted':
+      case 'started':
+      case 'resumed':
+        markRunning(sid, true);
+        markAcked(sid);
+        break;
+      case 'done':
+        markRunning(sid, false);
+        toast('「' + titleOf(sid) + '」已在后台执行完成', 'ok');
+        loadSessions(true);
+        loadUsage(null, true);
+        break;
+      case 'cancelled':
+        markRunning(sid, false);
+        toast('「' + titleOf(sid) + '」已停止生成');
+        loadSessions(true);
+        break;
+      case 'error':
+        markRunning(sid, false);
+        toast('「' + titleOf(sid) + '」' + (d.message || '出错了'), 'err');
+        loadSessions(true);
+        break;
+      case 'title':
+        loadSessions(true);
+        break;
+    }
+  }
+
   function handleEvent(d) {
+    // 会话级事件只渲染给「当前正在看的那个会话」——后台会话的输出绝不能
+    // 混进当前视图，否则切回来会发现两个会话的内容串在一起。
+    if (d.sessionId && d.sessionId !== state.sessionId) {
+      handleBackgroundEvent(d);
+      return;
+    }
     switch (d.type) {
       case 'ready':
         break;
 
       case 'accepted':
+        markAcked(state.sessionId);
         setStatus('已提交，模型正在处理…');
         break;
 
@@ -582,7 +642,24 @@
         break;
 
       case 'error':
-        setSending(false);
+        if (d.sessionId && (d.message || '').indexOf('正在执行中') >= 0) {
+          // 服务端说它在跑，说明本地状态落后了：纠正成「执行中」，别清成空闲，
+          // 否则用户以为能发消息，而 app-server 只会把新消息压进队列。
+          markRunning(d.sessionId, true);
+          markAcked(d.sessionId);
+          setStatus('');
+          toast(d.message, 'err');
+          break;
+        }
+        // 只有明确的会话级错误才动「执行中」标记。协议级错误（不带 sessionId，
+        // 例如「当前没有正在执行的对话」）跟会话是否在跑无关，误清会让用户
+        // 以为可以发新消息，而 app-server 那边其实还在跑，消息会被静默压进队列。
+        // 唯一例外是「乐观等确认」的窗口期：刚发出去就被拒了，得把界面放回来。
+        if (d.sessionId
+            || (state.sessionId && state.running[state.sessionId]
+                && !state.running[state.sessionId].acked)) {
+          setSending(false);
+        }
         setStatus('');
         toast(d.message || '出错了', 'err');
         clearCursors();
@@ -858,7 +935,49 @@
 
   /* ============================================ 状态与发送 */
 
-  function setSending(on) {
+  // ---- 执行状态：按会话分开记 ----------------------------------------
+  // 一个会话在跑，不影响你切到别的会话接着干活；切回来时状态要还在，
+  // 后台跑完了也要能通知到。
+  function isRunning(sid) { return !!(sid && state.running[sid]); }
+
+  function titleOf(sid) {
+    var list = state.tab === 'archived' ? (state.archived || []) : (state.sessions || []);
+    var s = list.filter(function (x) { return x.id === sid; })[0];
+    return (s && s.title) || '会话';
+  }
+
+  function markRunning(sid, on) {
+    if (!sid) return;
+    if (on) {
+      if (!state.running[sid]) state.running[sid] = { since: Date.now() };
+    } else if (state.running[sid]) {
+      delete state.running[sid];
+    }
+    if (sid === state.sessionId) syncComposer();
+    renderRunningMarks();
+  }
+
+  // 服务端确认收到这一轮之后才叫 acked：在那之前失败要允许界面回退
+  function markAcked(sid) {
+    var r = state.running[sid];
+    if (r) r.acked = true;
+  }
+
+  // 左侧列表上的「执行中」小圆点
+  function renderRunningMarks() {
+    var list = state.tab === 'archived' ? (state.archived || []) : (state.sessions || []);
+    var items = document.querySelectorAll('.session-item');
+    for (var i = 0; i < items.length; i++) {
+      var sid = items[i].dataset.sid;
+      var s = list.filter(function (x) { return x.id === sid; })[0];
+      var on = isRunning(sid) || !!(s && s.status === 'running');
+      items[i].classList.toggle('running', on);
+    }
+  }
+
+  // 输入区只反映「当前正在看的这个会话」
+  function syncComposer() {
+    var on = isRunning(state.sessionId);
     state.sending = on;
     $('send-btn').disabled = on;
     var stop = $('stop-btn');
@@ -868,17 +987,21 @@
       stop.textContent = '停止生成';
     }
     if (on) {
-      state.startedAt = Date.now();
+      state.startedAt = (state.running[state.sessionId] || {}).since || Date.now();
       clearInterval(state.statusTimer);
       state.statusTimer = setInterval(function () {
         var el = $('thinking-elapsed');
         if (el) el.textContent = ' ' + Math.round((Date.now() - state.startedAt) / 1000) + 's';
       }, 1000);
-      setStatus('已提交，模型正在处理…');
     } else {
       clearInterval(state.statusTimer);
       state.statusTimer = null;
     }
+  }
+
+  // 兼容旧调用：不传 sid 就作用于当前会话
+  function setSending(on, sid) {
+    markRunning(sid || state.sessionId, on);
   }
 
   function setStatus(text) { $('status-text').textContent = text || ''; }
@@ -893,7 +1016,7 @@
   function send() {
     var input = $('input');
     var text = input.value.trim();
-    if (!text || state.sending) return;
+    if (!text || isRunning(state.sessionId)) return;
     if (!state.sessionId) {
       toast('请先新建会话', 'err');
       openNewChat();
@@ -944,7 +1067,7 @@
   $('send-btn').addEventListener('click', send);
 
   $('stop-btn').addEventListener('click', function () {
-    if (!state.sending) return;
+    if (!isRunning(state.sessionId)) return;
     if (!wsOpen()) {
       toast('连接中断，正在重连，请稍候再停止', 'err');
       return;
@@ -1109,7 +1232,9 @@
   function startListTimer() {
     stopListTimer();
     state.listTimer = setInterval(function () {
-      if (!state.sending) loadSessions(true);
+      // 就算当前会话在跑，列表也要继续刷新：后台可能还有别的会话在跑，
+      // 得让「执行中」标记和完成状态及时反映出来。
+      loadSessions(true);
     }, 20000);
   }
 
@@ -1277,7 +1402,17 @@
     var sub = document.createElement('div');
     sub.className = 'session-item-sub';
     var when = s.archived ? relTime(s.archivedAt) : relTime(s.updated || s.created);
-    sub.textContent = when + (s.status === 'running' ? ' · 执行中' : '');
+    var whenEl = document.createElement('span');
+    whenEl.textContent = when;
+    sub.appendChild(whenEl);
+    if (!s.archived) {
+      // 后台还在跑的会话要一眼看得出来（不只在打开它的那个标签页里）
+      var tag = document.createElement('span');
+      tag.className = 'run-tag';
+      tag.innerHTML = '<i class="run-pulse"></i>执行中';
+      sub.appendChild(tag);
+    }
+    if (s.status === 'running') item.classList.add('running');
 
     main.appendChild(t);
     main.appendChild(sub);
@@ -1399,17 +1534,22 @@
   });
 
   function openSession(sid) {
-    if (state.sending) { toast('当前任务执行中，请稍候', 'err'); return; }
     if (sid === state.sessionId) return;
 
     state.sessionId = sid;
+    rememberSession(sid);
     renderActive();
+    // 先按已知状态摆好输入区（这个会话可能正在后台跑，那就不该让再发消息）
+    syncComposer();
 
     clearMessages();
     $('chat-title').textContent = '加载中…';
     $('chat-meta').textContent = '';
 
     req('/api/sessions/' + encodeURIComponent(sid) + '/messages').then(function (r) {
+      // 期间用户又切到别的会话了：这份结果已经不属于当前视图，直接丢弃，
+      // 否则快速来回切会让上一个会话的内容渲染进来。
+      if (state.sessionId !== sid) return;
       if (!r.data.ok) {
         toast(r.data.error || '加载对话失败', 'err');
         $('chat-title').textContent = '会话';
@@ -1427,9 +1567,17 @@
       var s = state.sessions.filter(function (x) { return x.id === sid; })[0];
       if (s) applySessionSettings(s);
 
+      // 用服务端状态校准「它还在不在跑」：网页关着的时候它可能已经跑完了。
+      // 还在跑就把事件流接回来，服务端会把本轮已产生的事件重放一遍，
+      // 于是切回去就能看到正在输出的内容，而不是一片空白。
       if (r.data.live) {
-        setSending(true);
+        markRunning(sid, true);
+        showThinking();
         wsSend({ type: 'watch', sessionId: sid });
+        setStatus('已接回后台执行，正在恢复输出…');
+      } else {
+        markRunning(sid, false);
+        setStatus('');
       }
       if (window.innerWidth <= 720) {
         $('sidebar').classList.add('collapsed');
@@ -1539,8 +1687,10 @@
   }
 
   function newChat() {
-    if (state.sending) { toast('当前任务执行中，请稍候', 'err'); return; }
+    // 别的会话在后台跑着，也不影响你开一个新会话
     state.sessionId = null;
+    state.cur = null;
+    rememberSession(null);
     clearMessages();
     $('messages').innerHTML = welcomeHtml();
     $('chat-title').textContent = '新会话';
@@ -1550,13 +1700,13 @@
     renderModelSelects();
     var ww = $('welcome-ws');
     if (ww) ww.textContent = '/root';
+    syncComposer();
     $('input').focus();
   }
 
   /* ============================================ 新建会话 */
 
   function openNewChat() {
-    if (state.sending) { toast('当前任务执行中，请稍候', 'err'); return; }
     $('nc-mode').value = $('mode-select').value || 'build';
     $('nc-mode-desc').textContent = modeDesc($('nc-mode').value);
     loadWorkspaces().then(function () { openModal('newchat-modal'); });
@@ -1820,6 +1970,7 @@
       closeModal('newchat-modal');
       newChat();
       state.sessionId = r.data.sessionId;
+      rememberSession(r.data.sessionId);
       if (model) {
         var v = model.providerId + '|' + model.modelId;
         var sel = $('model-select');

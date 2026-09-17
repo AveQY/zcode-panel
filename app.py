@@ -84,8 +84,15 @@ DEFAULT_LOGIN_KEY = "admin123"
 
 EVENT_BUFFER_MAX = 4000        # 每个会话缓存多少条事件供迟到者回放
 EVENT_POLL_INTERVAL = 0.35     # 拉取事件的间隔
+EVENT_FAIL_MAX = 40            # 连续拉取失败多少次就放弃跟随（连接已废时别无限刷日志）
 APP_SERVER_CALL_TIMEOUT = 90
-TURN_IDLE_TIMEOUT = 900        # 单轮最长执行时间
+MAX_RPC_LINE = 32 * 1024 * 1024   # app-server 单行 JSON 上限（默认 64KB 会把读线程打死）
+TURN_IDLE_TIMEOUT = 900        # 事件连续静默多久就向 app-server 求证一次
+TURN_ABSOLUTE_MAX = 12 * 3600  # 单轮硬上限（求证后仍然在跑也不能无限跟下去）
+# app-server 侧「还在执行」的状态值。会话列表里查不到时保守认为还在跑：
+# 新建会话要等第一轮结束才落库，查不到不代表没在干活。
+TURN_IDLE_STATES = ("idle", "completed", "done", "stopped", "cancelled",
+                    "canceled", "closed", "archived", "error", "failed")
 MAX_MESSAGE_CHARS = 20000
 
 # ---- 模型定时 --------------------------------------------------------------
@@ -700,6 +707,7 @@ class ZCodeServer:
         self.pending = {}
         self.seq = 0
         self.reader_task = None
+        self.reader_dead = False   # 读线程意外退出（stdio 连接已废）
         self.stderr_task = None
         self.lock = asyncio.Lock()
         self.ready = asyncio.Event()
@@ -723,8 +731,14 @@ class ZCodeServer:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
             env=env,
+            # 关键：asyncio 默认单行上限只有 64KB。app-server 的响应是「一行一个 JSON」，
+            # 会话一长（冷启动 resume 会把整段历史一次性推回来）就会超限，
+            # 抛 LimitOverrunError 把读线程打死 —— 进程还活着，但再也没人读它的回答，
+            # 之后所有 RPC 都只能等到超时。这里把上限抬到 32MB。
+            limit=MAX_RPC_LINE,
         )
         self.ready.clear()
+        self.reader_dead = False
         self.reader_task = asyncio.create_task(self._reader())
         self.stderr_task = asyncio.create_task(self._drain_stderr())
         # 这里**故意不同步等待握手**：app-server 在我们发第一个请求之前不会说任何话，
@@ -763,6 +777,23 @@ class ZCodeServer:
             raise
         except Exception as exc:
             log(f"app-server 读线程异常: {exc}")
+            self.reader_dead = True
+            # 读线程没了 = 这条 stdio 连接废了：进程可能还在，但它的回答再也没人读。
+            # 手里没有正在跑的任务时直接重建连接；有的话**不动它**，
+            # 免得把正在做的工作杀掉（那一轮会自己跑完并落库）。
+            if not (runner and runner.running):
+                asyncio.create_task(self._recover_reader())
+
+    async def _recover_reader(self):
+        """读线程意外退出后重建 app-server 连接（只在没人在跑任务时调用）。"""
+        await asyncio.sleep(1.0)
+        if not self.reader_dead:
+            return
+        try:
+            log("读线程已失效，自动重建 app-server 连接")
+            await self.restart("读线程异常后自愈")
+        except Exception as exc:
+            log(f"重建 app-server 失败: {exc}")
         finally:
             for fut in list(self.pending.values()):
                 if not fut.done():
@@ -836,6 +867,9 @@ class ZCodeServer:
             await self.proc.stdin.drain()
 
     async def call(self, method, params=None, timeout=APP_SERVER_CALL_TIMEOUT):
+        if self.reader_dead:
+            # 连接已废：立刻如实报错，别让调用方白等 30~90 秒才拿到超时
+            raise RuntimeError("app-server 连接已失效（读线程退出），请稍候重试")
         self.seq += 1
         rid = "r%d" % self.seq
         fut = asyncio.get_running_loop().create_future()
@@ -894,6 +928,7 @@ class SessionFeed:
         self.turn_active = False
         self.turn_done = False      # 本轮是否已收到收尾事件（turn.completed / failed）
         self.turn_seq = 0           # 轮次计数：用来校验「发出去的消息有没有真的开新轮」
+        self.turn_started_at = 0.0  # 本轮开始时间（硬上限用）
         self.stop_requested = False  # 已请求停止，但 app-server 还没把轮次收尾
         self.subscribed = False
         self.last_activity = time.time()
@@ -922,6 +957,35 @@ class SessionFeed:
                 dead.append(ws)
         for ws in dead:
             self.subscribers.discard(ws)
+
+
+async def remote_turn_state(session_id):
+    """问 app-server 这个会话到底在不在跑，返回 active / idle / unknown。
+
+    查不到（新建会话要等第一轮结束才落库）或查询本身失败都算 unknown ——
+    保守方向由调用方按场景决定：跟着跑的场景宁可当「还在跑」，
+    挡住用户发消息的场景则不该乱挡，只有明确 active 才拦。
+    """
+    try:
+        res = await zc.call("session/list", {}, timeout=30)
+    except Exception as exc:
+        log(f"查询会话执行状态失败 {session_id}: {exc}")
+        return "unknown"
+    for s in ((res or {}).get("sessions") or []):
+        if s.get("sessionId") == session_id:
+            st = str(s.get("status") or "").strip().lower()
+            return "idle" if st in TURN_IDLE_STATES else "active"
+    return "unknown"
+
+
+async def remote_turn_alive(session_id):
+    """事件静默超时时用：unknown 也当「还在跑」。
+
+    长时间工具（装依赖、构建、长 sleep）期间 app-server 一个事件都不吐，
+    光看「多久没事件」会把还在后台干活的任务误判成结束 —— 那正是
+    「关掉网页也要跑完」最不能出的错。所以先求证，证不出来就继续跟着。
+    """
+    return (await remote_turn_state(session_id)) != "idle"
 
 
 class SessionFeedManager:
@@ -970,6 +1034,8 @@ class SessionFeedManager:
         f.error = None
         f.usage = None
         f.last_activity = time.time()
+        f.turn_started_at = time.time()
+        f.stop_requested = False     # 新一轮开始，之前的停止请求已经翻篇
         # 只保留本轮的事件：迟到者重连时前端已经渲染过历史消息，
         # 要是把上一轮的缓冲一起回放就会整段重复。
         f.buffer.clear()
@@ -1006,11 +1072,20 @@ class SessionFeedManager:
         if not f:
             return
         log(f"开始拉取事件: {session_id}")
+        fails = 0
         try:
             while True:
                 if not f.turn_active:
                     break
                 if time.time() - f.last_activity > TURN_IDLE_TIMEOUT:
+                    # 静默不等于跑完：长工具期间本来就没事件。先求证，还在跑就继续跟着，
+                    # 这样即使用户关了网页，任务也能在后台被完整跟到底。
+                    if (time.time() - f.turn_started_at < TURN_ABSOLUTE_MAX
+                            and await remote_turn_alive(session_id)):
+                        f.last_activity = time.time()
+                        log(f"事件静默 {TURN_IDLE_TIMEOUT}s，但 {session_id} 仍在执行，继续跟随")
+                        await asyncio.sleep(EVENT_POLL_INTERVAL)
+                        continue
                     await f.broadcast({"type": "error", "sessionId": session_id,
                                        "message": "执行超时，已停止接收事件"})
                     break
@@ -1018,9 +1093,19 @@ class SessionFeedManager:
                     res = await zc.call("session/events", {
                         "sessionId": session_id, "afterSeq": f.cursor, "limit": 200}, timeout=20)
                 except Exception as exc:
+                    fails += 1
+                    # 连续拉不到（连接已废）就别无限循环刷日志了：如实收工，
+                    # 让会话回到空闲，结果以落库的历史为准。
+                    if fails >= EVENT_FAIL_MAX:
+                        log(f"拉取事件连续失败 {fails} 次，放弃跟随 {session_id}: {exc}")
+                        await f.broadcast({"type": "error", "sessionId": session_id,
+                                           "message": "与 app-server 的连接已中断，"
+                                                      "已停止接收输出（结果以刷新后的历史为准）"})
+                        break
                     log(f"拉取事件失败 {session_id}: {exc}")
                     await asyncio.sleep(1.5)
                     continue
+                fails = 0
 
                 events = (res or {}).get("events") or []
                 if events:
@@ -1275,6 +1360,21 @@ class TurnManager:
             if session_id in self.running:
                 raise RuntimeError("这个会话正在执行中，请稍候")
             await self._ensure_ready(session_id, mode, model, thought_level)
+            # 刚点过「停止」但 app-server 其实还在跑（session/stop 并不保证中断已经
+            # 发出的模型请求）：这时直接发，消息会被压成 session_input(queue) 然后
+            # 永远不被提升 —— 静默丢失。等它一会儿，等不掉就如实报错，绝不假装发成功。
+            f0 = feed.get(session_id) if feed else None
+            if f0 is not None and f0.stop_requested:
+                state = "active"
+                for _ in range(3):
+                    state = await remote_turn_state(session_id)
+                    if state != "active":
+                        break
+                    await asyncio.sleep(1.5)
+                f0.stop_requested = False
+                if state == "active":
+                    raise RuntimeError("上一轮还没真正停下来（app-server 仍在执行），"
+                                       "请稍等几秒再发")
             await feed.start_pump(session_id)
             self.running[session_id] = {"startedAt": int(time.time() * 1000)}
             payload = {"sessionId": session_id, "content": content}
@@ -1358,6 +1458,9 @@ class TurnManager:
         if f:
             f.turn_active = False
             f.turn_done = True
+            # 记住「刚被请求停止」：session/stop 不保证真的中断了，
+            # 下一条消息发出去之前要先跟 app-server 对一次账（见 TurnManager.send）
+            f.stop_requested = True
             await f.broadcast({"type": "cancelled", "sessionId": session_id})
             await f.broadcast({"type": "done", "sessionId": session_id, "cancelled": True})
         self.running.pop(session_id, None)
@@ -2227,7 +2330,9 @@ async def handle_health(request):
     return web.json_response({
         "ok": True,
         "service": "zcode-chat",
-        "appServer": bool(zc and zc.proc and zc.proc.returncode is None),
+        # 进程活着不代表连接可用：读线程死掉之后所有 RPC 都拿不到回答，如实报出来
+        "appServer": bool(zc and zc.proc and zc.proc.returncode is None
+                          and not getattr(zc, "reader_dead", False)),
         "running": len(runner.running) if runner else 0,
         "banned": sum(1 for v in ban_store.data.values() if v.get("banned")),
         "uptime": int(time.time() - START_TIME),
@@ -2828,6 +2933,28 @@ async def handle_session_messages(request):
     })
 
 
+# ---------------------------------------------------------------- 路由：会话管理
+
+def running_sessions(exclude=None):
+    """当前正在执行的会话（可排除某一个）。"""
+    if not runner:
+        return []
+    return [s for s in list(runner.running.keys()) if s != exclude]
+
+
+def restart_guard(exclude=None):
+    """凡是会重启 app-server 的操作，都得先过这一关。
+
+    重启会掐断**所有**正在跑的会话。既然要求「除了停止按钮，任何操作都不要影响
+    正在执行的任务」，那就宁可让用户等一下，也不能把别人的任务悄悄杀掉。
+    """
+    busy = running_sessions(exclude)
+    if busy:
+        return json_error("还有 %d 个会话正在执行。重启服务会打断它们，"
+                          "请等它跑完或点「停止」之后再试。" % len(busy), 409)
+    return None
+
+
 async def handle_session_archive(request):
     blocked = guard(request)
     if blocked:
@@ -2837,6 +2964,9 @@ async def handle_session_archive(request):
         return json_error("非法的会话 ID", 400)
     if runner.is_running(sid):
         return json_error("会话正在执行中，请先停止", 409)
+    blocked = restart_guard(sid)
+    if blocked:
+        return blocked
     data = await body_json(request)
     archived = bool(data.get("archived", True))
     n = archive_session(sid, archived)
@@ -2855,6 +2985,9 @@ async def handle_session_delete(request):
         return json_error("非法的会话 ID", 400)
     if runner.is_running(sid):
         return json_error("会话正在执行中，请先停止", 409)
+    blocked = restart_guard(sid)
+    if blocked:
+        return blocked
     n = delete_session(sid)
     feed.feeds.pop(sid, None)
     await zc.restart("会话已删除")
@@ -2974,6 +3107,9 @@ async def handle_provider_upsert(request):
     blocked = guard(request)
     if blocked:
         return blocked
+    blocked = restart_guard()
+    if blocked:
+        return blocked
     data = await body_json(request)
     pid = str(data.get("providerId") or "").strip()
     if not pid or not PROVIDER_ID_RE.match(pid):
@@ -2995,6 +3131,9 @@ async def handle_provider_upsert(request):
 
 async def handle_provider_delete(request):
     blocked = guard(request)
+    if blocked:
+        return blocked
+    blocked = restart_guard()
     if blocked:
         return blocked
     pid = request.match_info["pid"]
@@ -3028,6 +3167,9 @@ def json_response_ok(**extra):
 
 async def handle_model_upsert(request):
     blocked = guard(request)
+    if blocked:
+        return blocked
+    blocked = restart_guard()
     if blocked:
         return blocked
     pid = request.match_info["pid"]
@@ -3069,6 +3211,9 @@ async def handle_model_delete(request):
     blocked = guard(request)
     if blocked:
         return blocked
+    blocked = restart_guard()
+    if blocked:
+        return blocked
     pid = request.match_info["pid"]
     mid = request.match_info["mid"]
     async with zc.config_lock:
@@ -3093,6 +3238,9 @@ async def handle_model_delete(request):
 
 async def handle_active_model(request):
     blocked = guard(request)
+    if blocked:
+        return blocked
+    blocked = restart_guard()
     if blocked:
         return blocked
     data = await body_json(request)

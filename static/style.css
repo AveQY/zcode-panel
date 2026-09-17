@@ -664,6 +664,11 @@ select { cursor: pointer; }
 
 .modal { position: fixed; inset: 0; z-index: 90; display: flex; align-items: center; justify-content: center; padding: 20px; }
 .modal-mask { position: absolute; inset: 0; background: rgba(16, 24, 40, 0.42); }
+/* 弹窗叠加层级：同层时由 DOM 顺序决定，后开的浮层会被先开的挡住。
+   这里显式分层——二级弹窗（从设置里打开）要盖住设置弹窗，确认框盖住一切弹窗。 */
+#sched-modal { z-index: 96; }
+#provider-modal { z-index: 96; }
+#confirm-modal { z-index: 108; }
 .modal-card {
   position: relative;
   width: 100%;
@@ -990,6 +995,80 @@ select { cursor: pointer; }
 
 .confirm-text { margin: 0; font-size: 13.5px; color: var(--text-dim); line-height: 1.8; word-break: break-all; }
 
+/* ---------- 设置：模型定时 ---------- */
+
+.ghost-btn.xs, .text-btn.xs { padding: 3px 9px; font-size: 12px; border-radius: 6px; }
+
+.sched-active {
+  margin-top: 12px; padding: 12px 14px; border-radius: var(--radius);
+  background: var(--green-soft); border: 1px solid #bfe6cb;
+}
+.sched-active-head { display: flex; align-items: center; gap: 8px; font-size: 13.5px; }
+.sched-active-body { margin: 6px 0 10px; font-size: 12.5px; color: var(--text-dim); line-height: 1.8; }
+.sched-active-body code { font-family: var(--mono); font-size: 11.5px; background: #fff;
+                          padding: 1px 5px; border-radius: 4px; }
+
+.sched-dot { width: 8px; height: 8px; border-radius: 50%; background: #c9ced6; flex-shrink: 0; }
+.sched-dot.on { background: var(--green); box-shadow: 0 0 0 3px rgba(26,127,55,.15); }
+
+.sched-list { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+.sched-row {
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 11px 13px; background: #fff;
+}
+.sched-row.running { border-color: #bfe6cb; background: #fcfffd; }
+.sched-row.off { opacity: .62; }
+.sched-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sched-name { font-size: 13.5px; }
+.sched-tag {
+  font-size: 11px; color: var(--text-dim); background: var(--sidebar);
+  border: 1px solid var(--border-soft); border-radius: 5px; padding: 1px 6px;
+}
+.sched-tag.live { color: var(--green); background: var(--green-soft); border-color: #bfe6cb; }
+.sched-tag.off { color: var(--text-mute); }
+.sched-row-body {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 7px; font-size: 12.5px; color: var(--text-dim);
+}
+.sched-arrow { color: var(--text-mute); }
+.sched-model { color: var(--accent); font-family: var(--mono); font-size: 12px; }
+.sched-dur { color: var(--text-mute); }
+.sched-row-sub { margin-top: 6px; font-size: 11.5px; color: var(--text-mute); line-height: 1.7; }
+.sched-row-ops { display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+
+.day-picker { display: flex; gap: 6px; flex-wrap: wrap; }
+.day-picker label { cursor: pointer; }
+.day-picker input { position: absolute; opacity: 0; pointer-events: none; }
+.day-picker span {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: 8px; font-size: 12.5px;
+  border: 1px solid var(--border); background: #fff; color: var(--text-dim);
+}
+.day-picker input:checked + span {
+  background: var(--accent-soft); border-color: var(--accent-border);
+  color: var(--accent); font-weight: 600;
+}
+
+.form-suffix { font-size: 12.5px; color: var(--text-mute); }
+
+select.locked, select:disabled.locked { background: var(--sidebar); color: var(--text-mute); cursor: not-allowed; }
+
+/* ---------- 输入框上方的定时提示 ---------- */
+
+.sched-banner {
+  display: flex; align-items: center; gap: 8px;
+  margin: 0 auto 8px; max-width: 900px; width: 100%;
+  padding: 7px 11px; border-radius: var(--radius);
+  background: var(--amber-soft); border: 1px solid #f0dda1;
+  font-size: 12.5px; color: var(--text-dim);
+}
+.sched-banner-icon { flex-shrink: 0; }
+.sched-banner-text { flex: 1; min-width: 0; }
+.sched-banner-text b { color: var(--amber); }
+.sched-banner-text code { font-family: var(--mono); font-size: 11.5px; }
+/* 「有会话等空闲后自动续跑」的提示 */
+.sched-banner-text .sched-pend { color: var(--amber); font-weight: 600; }
+
 @media (max-width: 720px) {
   .modal-card.wide { height: 88vh; max-width: 100%; }
   .settings-nav { width: 112px; }
@@ -1002,4 +1081,6 @@ select { cursor: pointer; }
   .usage-head { flex-wrap: wrap; }
   .usage-head .seg { margin-left: 0; }
   .usage-cards { grid-template-columns: repeat(2, 1fr); }
+  .sched-banner { flex-wrap: wrap; }
+  .sched-row-ops { gap: 5px; }
 }

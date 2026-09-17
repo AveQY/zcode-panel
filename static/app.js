@@ -41,6 +41,10 @@
     // --- 使用统计 ---
     usage: null,
     usageRange: 'today',
+    // --- 模型定时 ---
+    schedules: [],
+    scheduleRuntime: { active: null },
+    schedEditing: null,         // 正在编辑的规则（null = 新建）
   };
 
   var WS_COLLAPSE_KEY = 'zwc_ws_collapsed';
@@ -238,6 +242,7 @@
     connectWs();
     loadOptions();
     loadUsage('today');
+    loadSchedules();
     // 会话列表要按工作区分组，所以先拿到工作区清单再渲染列表
     loadWorkspaces().then(function () {
       loadSessions(true);
@@ -538,6 +543,38 @@
 
       case 'cancelled':
         toast('已停止生成');
+        break;
+
+      case 'model-scheduled':
+        // 服务端定时切换模型的通知：scope = switch | revert | resume | sync
+        if (d.scope === 'switch') {
+          var msg = '模型定时已生效：' + ((d.active && d.active.modelLabel) || '');
+          // 有会话因为在跑长时间工具没停下来时，如实说明「还没接上」，
+          // 免得用户以为任务已经被续上了（它会在空闲后自动补发）。
+          var rp = d.report || {};
+          if (rp.pending) {
+            msg += '（' + rp.pending + ' 个会话在跑长任务，空闲后会自动续跑）';
+          }
+          if (rp.resumeSkipped) {
+            msg += '（' + rp.resumeSkipped + ' 个会话的续跑提示未被接受）';
+          }
+          toast(msg, (rp.pending || rp.resumeSkipped) ? 'err' : 'ok');
+          refreshSchedViews();
+        } else if (d.scope === 'revert') {
+          toast('定时时段结束，模型已切回');
+          refreshSchedViews();
+        } else if (d.scope === 'resume') {
+          // 之前没停下来的会话，现在空闲了、续跑提示已补发成功
+          if (d.ok) toast('定时切换：已自动接上之前未中断的任务');
+          refreshSchedViews();
+        } else if (d.scope === 'sync') {
+          // 老服务端可能不带 pending 字段，这种情况下别把已经拿到的值抹成 0
+          var prevPend = (state.scheduleRuntime || {}).pending || 0;
+          state.scheduleRuntime = { active: d.active || null,
+                                    pending: (d.pending === undefined ? prevPend : d.pending) || 0 };
+          renderSchedBanner();
+          renderModelSelects();
+        }
         break;
 
       case 'done':
@@ -937,6 +974,10 @@
       if (r.status === 401) { showLogin('登录已过期，请重新输入密钥'); return; }
       if (!r.data.ok) { toast(r.data.error || '读取模型目录失败', 'err'); return; }
       state.options = r.data;
+      if (r.data.schedule) {
+        state.scheduleRuntime = r.data.schedule;
+        renderSchedBanner();
+      }
       renderModelSelects();
       return r.data;
     }).catch(function () {});
@@ -994,6 +1035,22 @@
       })[0];
       wm.textContent = cm ? (cm.label || cm.modelId) : '—';
     }
+
+    // 定时生效期间，模型由服务端强制指定，选择器锁住并说明原因，
+    // 免得用户改了没用、还以为坏了。
+    var locked = !!(state.scheduleRuntime && state.scheduleRuntime.active);
+    var lockTip = locked
+      ? '模型定时生效中：' + ((state.scheduleRuntime.active.modelLabel) || '') +
+        '，需要先「恢复原模型」才能手动改'
+      : '';
+    ['model-select', 'nc-model'].forEach(function (id) {
+      var el = $(id);
+      if (!el) return;
+      el.disabled = locked;
+      el.classList.toggle('locked', locked);
+      var wrap = el.closest ? el.closest('.pick') : null;
+      if (wrap) wrap.title = locked ? lockTip : (id === 'model-select' ? '本会话使用的模型' : '');
+    });
   }
 
   function renderModeSelects() {
@@ -1789,7 +1846,7 @@
 
   /* ============================================ 设置：框架 */
 
-  var SETTINGS_PANES = ['general', 'security', 'models', 'usage'];
+  var SETTINGS_PANES = ['general', 'security', 'models', 'schedule', 'usage'];
 
   function showSettingsPane(name) {
     if (SETTINGS_PANES.indexOf(name) < 0) name = 'general';
@@ -1801,6 +1858,7 @@
       if (el) el.classList.toggle('hidden', p !== name);
     });
     if (name === 'usage') loadUsage(state.usageRange, true);
+    if (name === 'schedule') loadSchedules(true);
   }
 
   $('settings-btn').addEventListener('click', function () {
@@ -1813,6 +1871,7 @@
     loadSecurity();
     loadProviders();
     loadUsage(state.usageRange);
+    loadSchedules();
   });
 
   document.querySelectorAll('#settings-modal .nav-item').forEach(function (b) {
@@ -2117,6 +2176,381 @@
             }, 1200);
           }).catch(function () { toast('网络异常', 'err'); });
       });
+  });
+
+  /* ============================================ 模型定时 */
+
+  var SCHED_KIND_HINT = {
+    once: '只在指定日期的这个时间点执行一次。',
+    daily: '每天到这个时间点切换一次。',
+    weekly: '只在选中的星期几到这个时间点切换。',
+  };
+  var DAY_LABELS = ['日', '一', '二', '三', '四', '五', '六'];
+
+  function fmtDT(ms) {
+    if (!ms) return '—';
+    var d = new Date(ms);
+    return (d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' +
+      pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  function fmtDTFull(ms) {
+    if (!ms) return '—';
+    var d = new Date(ms);
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' +
+      pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  function schedDurText(min) {
+    min = Number(min) || 0;
+    if (!min) return '持续生效';
+    if (min % 1440 === 0) return '持续 ' + (min / 1440) + ' 天';
+    if (min % 60 === 0) return '持续 ' + (min / 60) + ' 小时';
+    return '持续 ' + min + ' 分钟';
+  }
+
+  function schedEndText(startMs, min) {
+    if (!startMs || !min) return '';
+    var d = new Date(startMs + min * 60000);
+    return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) +
+      '（' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + '）';
+  }
+
+  function loadSchedules(force) {
+    return req('/api/schedules' + (force ? '?_=' + Date.now() : '')).then(function (r) {
+      if (r.status === 401) { showLogin('登录已过期，请重新输入密钥'); return; }
+      if (!r.data.ok) return;
+      state.schedules = r.data.schedules || [];
+      state.scheduleRuntime = r.data.runtime || { active: null };
+      renderSchedules();
+      renderSchedBanner();
+      renderModelSelects();
+      return r.data;
+    }).catch(function () {});
+  }
+
+  function renderSchedules() {
+    var rt = state.scheduleRuntime || {};
+    var box = $('sched-active');
+    if (rt.active) {
+      var a = rt.active;
+      var untilTxt = a.until ? ('到 ' + fmtDTFull(a.until)) : '持续生效（直到恢复或下一条规则）';
+      var prevTxt = (rt.prev && rt.prev.model)
+        ? (rt.prev.model.providerId + '/' + rt.prev.model.modelId) : '未知';
+      box.classList.remove('hidden');
+      box.innerHTML =
+        '<div class="sched-active-head">' +
+        '<span class="sched-dot on"></span>' +
+        '<b>生效中：' + esc(a.name || '定时规则') + '</b>' +
+        '<span class="sched-tag">' + (a.manual ? '手动' : '定时') + '</span>' +
+        '</div>' +
+        '<div class="sched-active-body">所有会话当前使用 <b>' +
+        esc(a.modelLabel || (a.model ? a.model.modelId : '—')) + '</b>' +
+        '（' + esc(a.model ? a.model.providerId : '') + '/' + esc(a.model ? a.model.modelId : '') + '）' +
+        '，' + esc(untilTxt) + '。' +
+        '<br>生效前模型：<code>' + esc(prevTxt) + '</code>' +
+        '　开始于 ' + fmtDTFull(a.since) + '</div>' +
+        '<button class="ghost-btn" id="sched-revert">恢复原模型</button>';
+      var rb = $('sched-revert');
+      if (rb) rb.addEventListener('click', revertSched);
+    } else {
+      box.classList.add('hidden');
+      box.innerHTML = '';
+    }
+
+    var list = $('sched-list');
+    if (!state.schedules.length) {
+      list.innerHTML = '<div class="usage-empty">还没有定时规则。点右上角「新建规则」添加一条。</div>';
+    } else {
+      list.innerHTML = state.schedules.map(function (s) {
+        var on = !!s.enabled;
+        var dur = Number(s.durationMinutes) || 0;
+        var last = '';
+        if (s.lastRunAt && s.lastResult) {
+          last = '上次 ' + fmtDT(s.lastRunAt) + '：命中 ' + (s.lastResult.total || 0) +
+            ' 个会话，成功 ' + (s.lastResult.switched || 0) +
+            (s.lastResult.interrupted ? '，中断 ' + s.lastResult.interrupted + ' 个并续跑 ' +
+              (s.lastResult.resumed || 0) + ' 个' : '');
+        }
+        return '<div class="sched-row' + (on ? '' : ' off') + (s.active ? ' running' : '') +
+          '" data-id="' + esc(s.id) + '">' +
+          '<div class="sched-row-head">' +
+          '<span class="sched-dot' + (s.active ? ' on' : '') + '"></span>' +
+          '<b class="sched-name">' + esc(s.name) + '</b>' +
+          '<span class="sched-tag">' + esc(s.kindLabel) + '</span>' +
+          (s.active ? '<span class="sched-tag live">生效中</span>' : '') +
+          (on ? '' : '<span class="sched-tag off">已停用</span>') +
+          '</div>' +
+          '<div class="sched-row-body">' +
+          '<span class="sched-when">' + esc(s.when) + '</span>' +
+          '<span class="sched-arrow">→</span>' +
+          '<b class="sched-model">' + esc(s.modelLabel) + '</b>' +
+          '<span class="sched-dur">' + esc(schedDurText(dur)) + '</span>' +
+          '</div>' +
+          '<div class="sched-row-sub">' +
+          (on ? '下次 ' + fmtDT(s.nextRunAt) : '已停用') +
+          (last ? '　·　' + esc(last) : '') +
+          (s.resumeRunning ? '　·　自动续跑' : '　·　不续跑') +
+          '</div>' +
+          '<div class="sched-row-ops">' +
+          '<button class="ghost-btn xs" data-act="run">立即执行</button>' +
+          '<button class="ghost-btn xs" data-act="toggle">' + (on ? '停用' : '启用') + '</button>' +
+          '<button class="ghost-btn xs" data-act="edit">编辑</button>' +
+          '<button class="text-btn xs danger" data-act="del">删除</button>' +
+          '</div>' +
+          '</div>';
+      }).join('');
+    }
+
+    var enabled = state.schedules.filter(function (s) { return s.enabled; }).length;
+    $('sched-note').textContent = '共 ' + state.schedules.length + ' 条规则，启用 ' + enabled +
+      ' 条。调度器每 ' + ((state.scheduleRuntime.tickSeconds) || 10) + ' 秒核对一次；' +
+      '规则改动、服务重启都会自动重新对齐，不会漏执行。';
+  }
+
+  function refreshSchedViews() {
+    loadSchedules(true);
+    loadOptions(true);
+  }
+
+  function renderSchedBanner() {
+    var bar = $('sched-banner');
+    if (!bar) return;
+    var rt = state.scheduleRuntime || {};
+    var a = rt.active;
+    if (!a) { bar.classList.add('hidden'); return; }
+    var untilTxt = a.until ? ('，到 ' + fmtDT(a.until) + ' 结束') : '';
+    // 有会话因为长任务没停下来时会登记成「待续跑」，把这件事说出来，
+    // 免得用户看着一个已经结束的轮次以为定时没生效。
+    var pendTxt = rt.pending ? ('　<span class="sched-pend">' + rt.pending +
+      ' 个会话等空闲后自动续跑</span>') : '';
+    $('sched-banner-text').innerHTML =
+      '模型定时生效中：所有会话使用 <b>' + esc(a.modelLabel || '') + '</b>' +
+      esc(untilTxt) + '　<code>' + esc(a.model ? a.model.providerId : '') + '</code>' + pendTxt;
+    bar.classList.remove('hidden');
+  }
+
+  // ---- 规则弹窗 ----
+  function schedKind() {
+    var b = document.querySelector('#sm-kind .seg-btn.active');
+    return b ? b.dataset.kind : 'daily';
+  }
+
+  function setSchedKind(kind) {
+    document.querySelectorAll('#sm-kind .seg-btn').forEach(function (b) {
+      b.classList.toggle('active', b.dataset.kind === kind);
+    });
+    $('sm-date-row').classList.toggle('hidden', kind !== 'once');
+    $('sm-days-row').classList.toggle('hidden', kind !== 'weekly');
+    $('sm-kind-hint').textContent = SCHED_KIND_HINT[kind] || '';
+    updateSchedForm();
+  }
+
+  function fillSchedModels(selectedPid, selectedMid) {
+    var models = (state.options && state.options.models) || [];
+    var sel = $('sm-model');
+    if (!models.length) {
+      sel.innerHTML = '<option value="">（模型目录还没加载好）</option>';
+      return;
+    }
+    sel.innerHTML = models.map(function (m) {
+      var v = (m.providerId || '') + '|' + (m.modelId || '');
+      var on = m.providerId === selectedPid && m.modelId === selectedMid;
+      return '<option value="' + esc(v) + '"' + (on ? ' selected' : '') + '>' +
+        esc(m.label || m.modelId) + (m.providerLabel ? ' · ' + esc(m.providerLabel) : '') +
+        '</option>';
+    }).join('');
+  }
+
+  function updateSchedForm() {
+    var kind = schedKind();
+    var dur = Number($('sm-duration').value) || 0;
+    var hh = $('sm-at').value || '09:00';
+    $('sm-duration-hint').textContent = dur > 0
+      ? ('到点切换，' + schedDurText(dur) + '后自动切回原模型。')
+      : '0 = 一直生效，直到你点「恢复原模型」或下一条规则到点接管。';
+
+    var when;
+    if (kind === 'once') {
+      when = ($('sm-date').value || '（未选日期）') + ' ' + hh;
+    } else if (kind === 'weekly') {
+      var days = [];
+      document.querySelectorAll('#sm-days input:checked').forEach(function (c) {
+        days.push(DAY_LABELS[Number(c.value)]);
+      });
+      when = '每周' + (days.length ? days.join('、') : '（未选星期）') + ' ' + hh;
+    } else {
+      when = '每天 ' + hh;
+    }
+    var pid = ($('sm-model').value || '').split('|');
+    var label = $('sm-model').selectedIndex >= 0
+      ? $('sm-model').options[$('sm-model').selectedIndex].text : '—';
+    var txt = when + ' 切换到 ' + label;
+    if (dur > 0) txt += '，' + schedDurText(dur) + '后切回';
+    $('sm-preview').textContent = '预览：' + txt +
+      ($('sm-resume').checked ? '；被打断的会话会收到「' +
+        ($('sm-prompt').value || '请继续执行任务。') + '」' : '；不打断正在跑的会话');
+  }
+
+  function openSchedModal(rule) {
+    state.schedEditing = rule || null;
+    var isEdit = !!rule;
+    $('sm-title').textContent = isEdit ? '编辑定时规则' : '新建定时规则';
+    $('sm-delete').classList.toggle('hidden', !isEdit);
+    $('sm-run').classList.toggle('hidden', !isEdit);
+    $('sm-save').textContent = isEdit ? '保存' : '创建';
+
+    var d = new Date(Date.now() + 3600000);
+    $('sm-name').value = isEdit ? (rule.name || '') : '';
+    $('sm-at').value = isEdit ? (rule.at || '09:00') : '09:00';
+    $('sm-date').value = isEdit && rule.date
+      ? rule.date
+      : (d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()));
+    $('sm-duration').value = isEdit ? (rule.durationMinutes || 0) : 0;
+    $('sm-resume').checked = isEdit ? !!rule.resumeRunning : true;
+    $('sm-prompt').value = isEdit ? (rule.resumePrompt || '') : '';
+    $('sm-enabled').checked = isEdit ? !!rule.enabled : true;
+
+    var days = (isEdit && rule.days) || [];
+    document.querySelectorAll('#sm-days input').forEach(function (c) {
+      c.checked = days.indexOf(Number(c.value)) >= 0;
+    });
+
+    var cur = (state.options && state.options.currentModel) || {};
+    fillSchedModels(isEdit ? rule.providerId : cur.providerId,
+                    isEdit ? rule.modelId : cur.modelId);
+    setSchedKind(isEdit ? (rule.kind || 'daily') : 'daily');
+    openModal('sched-modal');
+  }
+
+  function schedFormPayload() {
+    var mv = ($('sm-model').value || '').split('|');
+    var days = [];
+    document.querySelectorAll('#sm-days input:checked').forEach(function (c) {
+      days.push(Number(c.value));
+    });
+    return {
+      id: state.schedEditing ? state.schedEditing.id : '',
+      name: $('sm-name').value.trim(),
+      kind: schedKind(),
+      at: $('sm-at').value,
+      date: $('sm-date').value,
+      days: days,
+      durationMinutes: Number($('sm-duration').value) || 0,
+      providerId: mv[0] || '',
+      modelId: mv.slice(1).join('|') || '',
+      resumeRunning: $('sm-resume').checked,
+      resumePrompt: $('sm-prompt').value.trim(),
+      enabled: $('sm-enabled').checked,
+    };
+  }
+
+  function saveSchedule() {
+    var payload = schedFormPayload();
+    if (!payload.providerId || !payload.modelId) {
+      toast('请选择要切换到的模型', 'err');
+      return;
+    }
+    $('sm-save').disabled = true;
+    req('/api/schedules', { method: 'POST', body: JSON.stringify(payload) }).then(function (r) {
+      $('sm-save').disabled = false;
+      if (r.status === 401) { showLogin('登录已过期，请重新输入密钥'); return; }
+      if (!r.data.ok) { toast(r.data.error || '保存失败', 'err'); return; }
+      closeModal('sched-modal');
+      toast('规则已保存');
+      loadSchedules(true);
+    }).catch(function () { $('sm-save').disabled = false; });
+  }
+
+  function deleteSchedule(id, name) {
+    confirmBox('删除定时规则', '确定要删除「' + name + '」吗？\n如果它正在生效，会立刻把模型切回原来的。', '删除')
+      .then(function (ok) {
+        if (!ok) return;
+        req('/api/schedules/' + encodeURIComponent(id), { method: 'DELETE' }).then(function (r) {
+          if (!r.data.ok) { toast(r.data.error || '删除失败', 'err'); return; }
+          closeModal('sched-modal');
+          toast(r.data.wasActive ? '规则已删除，模型已恢复' : '规则已删除');
+          loadSchedules(true);
+          loadOptions(true);
+        });
+      });
+  }
+
+  function runScheduleNow(id) {
+    req('/api/schedules/' + encodeURIComponent(id) + '/run', { method: 'POST' }).then(function (r) {
+      if (!r.data.ok) { toast(r.data.error || '执行失败', 'err'); return; }
+      var rep = r.data.report || {};
+      toast('已切换：命中 ' + (rep.total || 0) + ' 个会话，成功 ' + (rep.switched || 0) +
+            (rep.interrupted ? '，中断并续跑 ' + (rep.resumed || 0) + ' 个' : ''));
+      loadSchedules(true);
+      loadOptions(true);
+    });
+  }
+
+  function revertSched() {
+    confirmBox('恢复原模型', '把定时生效前的模型重新下发给所有会话？\n正在跑的会话同样会被打断后继续。', '恢复')
+      .then(function (ok) {
+        if (!ok) return;
+        req('/api/schedules/revert', { method: 'POST' }).then(function (r) {
+          if (!r.data.ok) { toast(r.data.error || '恢复失败', 'err'); return; }
+          var m = r.data.model || {};
+          toast('已恢复为 ' + (m.providerId ? m.providerId + '/' + m.modelId : '默认模型'));
+          loadSchedules(true);
+          loadOptions(true);
+        });
+      });
+  }
+
+  function toggleSchedule(id, enabled) {
+    var s = state.schedules.filter(function (x) { return x.id === id; })[0];
+    if (!s) return;
+    req('/api/schedules', {
+      method: 'POST',
+      body: JSON.stringify({ id: id, enabled: enabled }),
+    }).then(function (r) {
+      if (!r.data.ok) { toast(r.data.error || '操作失败', 'err'); return; }
+      toast(enabled ? '规则已启用' : '规则已停用');
+      loadSchedules(true);
+    });
+  }
+
+  $('sched-add').addEventListener('click', function () { openSchedModal(null); });
+
+  document.querySelectorAll('#sm-kind .seg-btn').forEach(function (b) {
+    b.addEventListener('click', function () { setSchedKind(b.dataset.kind); });
+  });
+  ['sm-at', 'sm-date', 'sm-duration', 'sm-model', 'sm-resume', 'sm-prompt'].forEach(function (id) {
+    var el = $(id);
+    if (el) el.addEventListener('input', updateSchedForm);
+    if (el) el.addEventListener('change', updateSchedForm);
+  });
+  $('sm-days').addEventListener('change', updateSchedForm);
+  $('sm-save').addEventListener('click', saveSchedule);
+  $('sm-run').addEventListener('click', function () {
+    if (state.schedEditing) runScheduleNow(state.schedEditing.id);
+  });
+  $('sm-delete').addEventListener('click', function () {
+    if (state.schedEditing) deleteSchedule(state.schedEditing.id, state.schedEditing.name);
+  });
+
+  $('sched-list').addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('button[data-act]') : null;
+    if (!btn) return;
+    var row = btn.closest('.sched-row');
+    var id = row && row.dataset.id;
+    var rule = state.schedules.filter(function (x) { return x.id === id; })[0];
+    if (!rule) return;
+    var act = btn.dataset.act;
+    if (act === 'edit') openSchedModal(rule);
+    else if (act === 'del') deleteSchedule(rule.id, rule.name);
+    else if (act === 'run') runScheduleNow(rule.id);
+    else if (act === 'toggle') toggleSchedule(rule.id, !rule.enabled);
+  });
+
+  $('sched-banner-revert').addEventListener('click', revertSched);
+  $('sched-banner-detail').addEventListener('click', function () {
+    openModal('settings-modal');
+    showSettingsPane('schedule');
   });
 
   /* ============================================ 使用统计 */

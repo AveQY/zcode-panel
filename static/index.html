@@ -96,6 +96,12 @@
     </div>
 
     <div class="composer">
+      <div id="sched-banner" class="sched-banner hidden">
+        <span class="sched-banner-icon">&#128336;</span>
+        <span class="sched-banner-text" id="sched-banner-text"></span>
+        <button class="text-btn" id="sched-banner-revert">恢复原模型</button>
+        <button class="icon-btn" id="sched-banner-detail" title="查看全部定时规则">&#8943;</button>
+      </div>
       <div class="composer-box">
         <textarea id="input" rows="1" placeholder="输入消息…（Enter 发送，Shift + Enter 换行）"
                   spellcheck="false"></textarea>
@@ -235,6 +241,100 @@
   </div>
 </div>
 
+<!-- ============================ 模型定时规则 ============================ -->
+<div id="sched-modal" class="modal hidden">
+  <div class="modal-mask" data-close="sched-modal"></div>
+  <div class="modal-card mid">
+    <div class="modal-head">
+      <h3 id="sm-title">新建定时规则</h3>
+      <button class="icon-btn" data-close="sched-modal">&#10005;</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label class="form-label" for="sm-name">规则名称</label>
+        <input id="sm-name" type="text" placeholder="留空则用模型名" maxlength="40"
+               autocomplete="off" spellcheck="false">
+      </div>
+
+      <div class="form-row">
+        <label class="form-label">触发方式</label>
+        <div class="seg" id="sm-kind">
+          <button class="seg-btn" data-kind="once">单次</button>
+          <button class="seg-btn active" data-kind="daily">每日</button>
+          <button class="seg-btn" data-kind="weekly">每周</button>
+        </div>
+        <div class="form-hint" id="sm-kind-hint"></div>
+      </div>
+
+      <div class="form-row hidden" id="sm-date-row">
+        <label class="form-label" for="sm-date">日期</label>
+        <input id="sm-date" type="date">
+      </div>
+
+      <div class="form-row hidden" id="sm-days-row">
+        <label class="form-label">星期</label>
+        <div class="day-picker" id="sm-days">
+          <label><input type="checkbox" value="1"><span>一</span></label>
+          <label><input type="checkbox" value="2"><span>二</span></label>
+          <label><input type="checkbox" value="3"><span>三</span></label>
+          <label><input type="checkbox" value="4"><span>四</span></label>
+          <label><input type="checkbox" value="5"><span>五</span></label>
+          <label><input type="checkbox" value="6"><span>六</span></label>
+          <label><input type="checkbox" value="0"><span>日</span></label>
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label class="form-label" for="sm-at">时间</label>
+        <input id="sm-at" type="time" value="09:00">
+      </div>
+
+      <div class="form-row">
+        <label class="form-label" for="sm-duration">持续时长</label>
+        <div class="row-inline">
+          <input id="sm-duration" type="number" min="0" max="10080" value="0" class="narrow">
+          <span class="form-suffix">分钟</span>
+        </div>
+        <div class="form-hint" id="sm-duration-hint"></div>
+      </div>
+
+      <div class="form-row">
+        <label class="form-label" for="sm-model">切换到的模型</label>
+        <select id="sm-model"></select>
+      </div>
+
+      <div class="form-row">
+        <label class="form-label">正在对话的会话</label>
+        <label class="check-row">
+          <input type="checkbox" id="sm-resume" checked>
+          <span>先停止当前这一轮，换完模型后自动让它接着做</span>
+        </label>
+        <input id="sm-prompt" type="text" maxlength="200"
+               placeholder="请继续执行任务。"
+               autocomplete="off" spellcheck="false">
+        <div class="form-hint">上面这条消息会在换完模型后发给被中断的会话。</div>
+      </div>
+
+      <div class="form-row">
+        <label class="form-label">状态</label>
+        <label class="check-row">
+          <input type="checkbox" id="sm-enabled" checked>
+          <span>启用这条规则</span>
+        </label>
+      </div>
+
+      <div class="form-hint" id="sm-preview"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="text-btn danger hidden" id="sm-delete">删除规则</button>
+      <button class="text-btn hidden" id="sm-run">立即执行</button>
+      <span class="grow"></span>
+      <button class="ghost-btn" data-close="sched-modal">取消</button>
+      <button id="sm-save" class="primary-btn">保存</button>
+    </div>
+  </div>
+</div>
+
 <!-- ============================ 设置 ============================ -->
 <div id="settings-modal" class="modal hidden">
   <div class="modal-mask" data-close="settings-modal"></div>
@@ -248,6 +348,7 @@
         <button class="nav-item active" data-pane="general">通用设置</button>
         <button class="nav-item" data-pane="security">登录安全</button>
         <button class="nav-item" data-pane="models">模型配置</button>
+        <button class="nav-item" data-pane="schedule">模型定时</button>
         <button class="nav-item" data-pane="usage">使用统计</button>
         <div class="nav-sep"></div>
         <div class="nav-note" id="settings-note"></div>
@@ -337,6 +438,23 @@
         </div>
         <div id="prov-list" class="prov-list"></div>
         <div class="pane-note" id="prov-note"></div>
+      </section>
+
+      <section class="settings-pane hidden" id="pane-schedule">
+        <div class="usage-head">
+          <h4>模型定时</h4>
+          <button class="ghost-btn right" id="sched-add">+ 新建规则</button>
+        </div>
+        <div class="pane-note">
+          到点后把<b>所有会话</b>切到指定模型；时间窗结束（或手动恢复）自动切回原来的模型。
+          正在跑的会话会先停下、换完模型再自动让它接着做。
+        </div>
+
+        <div id="sched-active" class="sched-active hidden"></div>
+
+        <div id="sched-list" class="sched-list"></div>
+
+        <div class="pane-note" id="sched-note"></div>
       </section>
 
       <section class="settings-pane hidden" id="pane-usage">

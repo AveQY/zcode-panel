@@ -45,6 +45,7 @@ DATA_DIR = BASE_DIR / "data"
 CONFIG_PATH = BASE_DIR / "config.json"
 BAN_PATH = DATA_DIR / "banned.json"
 WORKSPACE_PATH = DATA_DIR / "workspaces.json"
+SCHEDULE_PATH = DATA_DIR / "model_schedules.json"
 
 ZCODE_BIN = "/usr/local/bin/zcode"
 ZCODE_DB = "/root/.zcode/cli/db/db.sqlite"
@@ -87,6 +88,33 @@ APP_SERVER_CALL_TIMEOUT = 90
 TURN_IDLE_TIMEOUT = 900        # 单轮最长执行时间
 MAX_MESSAGE_CHARS = 20000
 
+# ---- 模型定时 --------------------------------------------------------------
+# 定时切换**不动 zcode 的全局配置，也不重启 app-server**（重启会掐断所有在跑的会话）。
+# 只做两件事：对活着的会话调 session/setModel；把定时模型作为「覆盖项」记在内存里，
+# 让任何会话下一次发消息时自动用上它 —— 这样休眠的历史会话也一并覆盖到，成本却接近零。
+SCHEDULE_KINDS = ("once", "daily", "weekly")
+SCHEDULE_TICK = 10             # 调度器轮询间隔（秒）；按分钟触发，10s 精度足够且能自愈
+SCHEDULE_RESUME_DEFAULT = "请继续执行任务。"
+SCHEDULE_SETTLE_SEC = 1.2      # 停掉一轮后，等 app-server 内部收尾的时间
+SCHEDULE_SWITCH_TRIES = 3      # setModel 重试次数
+# session/stop 不会打断已经派发出去的工具（如正在跑的 sleep），
+# 所以「真的停下来」要等，等不到就不硬发续跑提示（发了也只会被静默丢弃）。
+SCHEDULE_STOP_WAIT_SEC = 25    # 等当前轮次真正收尾的上限
+SCHEDULE_RESUME_VERIFY_SEC = 12  # 发出续跑提示后，等「新一轮真的开始」的上限
+# 轮次没能在 STOP_WAIT 内结束（长时间工具 / 超长生成）时，把这个会话登记成
+# 「待续跑」：调度器每一轮 tick 都看它有没有空闲，一空闲就把续跑提示补发出去，
+# 保证「让任务继续」这件事最终一定发生，而不是就这样算了。
+SCHEDULE_PENDING_MAX_SEC = 600  # 待续跑的最长等待时间
+SCHEDULE_MAX_DURATION_MIN = 10080      # 单条规则最长生效 7 天
+SCHEDULE_HISTORY_MAX = 50
+# 回看天数：时段可以跨午夜，所以要看昨天；每周规则要看到上一个同名星期几，
+# 否则「每周三 10:00」到周六就会因为本周三超出回看窗口而误判为失效。
+SCHEDULE_LOOKBACK = {"daily": 2, "weekly": 8, "once": 0}
+
+
+def rule_lookback(kind):
+    return SCHEDULE_LOOKBACK.get(kind, 2)
+
 DEFAULT_CONFIG = {
     "port": 8081,
     "bind": "0.0.0.0",
@@ -108,6 +136,10 @@ token_store = None
 zc = None            # ZCodeServer
 feed = None          # SessionFeedManager
 runner = None        # TurnManager
+scheduler = None     # ModelScheduler
+schedules = []       # 定时规则（持久化在 data/model_schedules.json）
+# 全局 WS 订阅者：会话事件流是「按会话」广播的，定时切换是全局事件，需要单独一份
+NOTIFY_SUBSCRIBERS = set()
 
 
 def log(msg):
@@ -861,6 +893,8 @@ class SessionFeed:
         self.task = None
         self.turn_active = False
         self.turn_done = False      # 本轮是否已收到收尾事件（turn.completed / failed）
+        self.turn_seq = 0           # 轮次计数：用来校验「发出去的消息有没有真的开新轮」
+        self.stop_requested = False  # 已请求停止，但 app-server 还没把轮次收尾
         self.subscribed = False
         self.last_activity = time.time()
         self.usage = None
@@ -1022,6 +1056,8 @@ class SessionFeedManager:
         sid = f.session_id
 
         if etype == "turn.started":
+            f.turn_seq += 1
+            f.stop_requested = False
             await f.broadcast({"type": "started", "sessionId": sid,
                                "messageId": pl.get("messageId"),
                                "turnNumber": pl.get("turnNumber")})
@@ -1122,21 +1158,37 @@ class TurnManager:
         self.lock = asyncio.Lock()
         self.running = {}       # session_id -> {"startedAt": ms}
         self.desired = {}       # session_id -> {"mode","model","thoughtLevel"}
+        # app-server 内存里激活着的会话。**不能拿 desired 当判据**：desired 只记
+        # 「想要的设置」，任何一个会话只要发过一次消息就会被写进去，之后即使
+        # app-server 早就把它卸掉了，也会被误判成「还激活」。闲置会话再发消息
+        # 就会直接报 Session is not active。
+        self.active = set()
 
     def is_running(self, session_id):
         return session_id in self.running
 
-    async def apply_settings(self, session_id, mode=None, model=None, thought_level=None):
-        """把模式 / 模型 / 思考等级同步到会话上（只在有变化时调用）。"""
+    async def apply_settings(self, session_id, mode=None, model=None, thought_level=None,
+                             force=False):
+        """把模式 / 模型 / 思考等级同步到会话上（只在有变化时调用）。
+
+        force=False 时会被「模型定时」的覆盖项劫持 —— 定时生效期间，无论前端选了
+        什么模型，所有会话都必须用定时指定的那个。调度器自己下发时传 force=True。
+        """
         want = self.desired.get(session_id) or {}
+        eff_model = model
+        if not force and scheduler is not None:
+            ov = scheduler.override_model()
+            if ov:
+                eff_model = ov
         changed = False
         if mode and want.get("mode") != mode:
             await zc.call("session/setMode", {"sessionId": session_id, "mode": mode}, timeout=30)
             want["mode"] = mode
             changed = True
-        if model and want.get("model") != model:
-            await zc.call("session/setModel", {"sessionId": session_id, "model": model}, timeout=30)
-            want["model"] = model
+        if eff_model and want.get("model") != eff_model:
+            await zc.call("session/setModel",
+                          {"sessionId": session_id, "model": eff_model}, timeout=30)
+            want["model"] = eff_model
             changed = True
         if thought_level and want.get("thoughtLevel") != thought_level:
             await zc.call("session/setThoughtLevel",
@@ -1166,37 +1218,63 @@ class TurnManager:
             # 拿不到会话 id 时必须立刻报错，否则后面所有调用都会带着 None 往下传
             raise RuntimeError("zcode 没有返回会话 ID（app-server 可能未就绪，请稍后重试）")
         self.desired[sid] = {"mode": mode, "model": model, "thoughtLevel": thought_level}
+        self.active.add(sid)
         return res, sid
 
-    async def ensure_active(self, session_id):
+    @staticmethod
+    def is_inactive_error(exc):
+        """app-server 说这个会话已经不在内存里了（闲置太久被卸掉）。"""
+        return "not active" in str(exc).lower()
+
+    async def ensure_active(self, session_id, force=False):
         """确保会话在 app-server 里是激活的。
 
-        新建的会话本来就在内存里；但从侧栏点开的**旧会话**不一定还激活着，
-        `session/send` 会报 not active。所以先 resume 一次把它拉起来。
+        新建的会话本来就在内存里；但从侧栏点开的**旧会话**不一定还激活着 ——
+        闲置一段时间后 app-server 会把它卸掉，此后 `session/setMode` / `session/send`
+        都会报 not active。所以这里先 resume 一次把它拉起来。
         """
-        if session_id in self.desired:
-            return
+        if not force and session_id in self.active:
+            return True
         row = session_row(session_id) or {}
         ws_path = row.get("directory") or config.get("workspace_root", "/root")
         try:
             await self.resume(session_id,
                               {"workspaceKey": ws_path, "workspacePath": ws_path})
+            self.active.add(session_id)
             log(f"已激活旧会话: {session_id}")
+            return True
         except Exception as exc:
             log(f"激活旧会话失败 {session_id}: {exc}")
-        self.desired.setdefault(session_id, {})
+            self.active.discard(session_id)
+            return False
 
     @staticmethod
     def _stale_model_error(exc):
         msg = str(exc)
         return "模型" in msg and "不可用" in msg
 
+    async def _ensure_ready(self, session_id, mode, model, thought_level):
+        """激活会话 + 下发设置，遇到「会话已闲置」自动拉起来重试一次。
+
+        顺序很重要：闲置会话上 setMode/setModel/send 都会报 not active，
+        所以必须先把它 resume 回来，后面的设置和消息才有意义。
+        """
+        try:
+            await self.ensure_active(session_id)
+            await self.apply_settings(session_id, mode, model, thought_level)
+            return
+        except Exception as exc:
+            if not self.is_inactive_error(exc):
+                raise
+            log(f"会话 {session_id} 在 app-server 里已闲置，重新激活后重试")
+        await self.ensure_active(session_id, force=True)
+        await self.apply_settings(session_id, mode, model, thought_level)
+
     async def send(self, session_id, content, mode=None, model=None, thought_level=None):
         async with self.lock:
             if session_id in self.running:
                 raise RuntimeError("这个会话正在执行中，请稍候")
-            await self.ensure_active(session_id)
-            await self.apply_settings(session_id, mode, model, thought_level)
+            await self._ensure_ready(session_id, mode, model, thought_level)
             await feed.start_pump(session_id)
             self.running[session_id] = {"startedAt": int(time.time() * 1000)}
             payload = {"sessionId": session_id, "content": content}
@@ -1204,7 +1282,14 @@ class TurnManager:
                 res = await zc.call("session/send", payload, timeout=60)
             except Exception as exc:
                 res = None
-                if self._stale_model_error(exc):
+                if self.is_inactive_error(exc):
+                    # 上面的激活判据可能刚好过期（会话正好在这一刻被卸掉）
+                    try:
+                        await self.ensure_active(session_id, force=True)
+                        res = await zc.call("session/send", payload, timeout=60)
+                    except Exception as exc2:
+                        log(f"重新激活后重发仍然失败 {session_id}: {exc2}")
+                if res is None and self._stale_model_error(exc):
                     res = await self._retry_with_runtime_model(session_id, payload)
                 if res is None:
                     self.running.pop(session_id, None)
@@ -1248,7 +1333,16 @@ class TurnManager:
             log(f"带 runtimeModel 重试仍然失败 {session_id}: {exc}")
             return None
 
-    async def cancel(self, session_id):
+    async def cancel(self, session_id, strict=False):
+        """请求停止当前轮次。
+
+        strict=True（模型定时用）：只发停止请求，**不假装已经停了** ——
+        `session/stop` 打断的是模型生成，已经派发出去的工具（比如正在跑的
+        `sleep`）不会被中止，app-server 仍认为轮次在进行中。这时候如果乐观地
+        把 turn_active 抹掉，后续消息会被 app-server 当成 queue 投递 ——
+        排进 session_input 后再也不会被提升成真正的消息，也就是**静默丢失**。
+        所以严格模式保留真实状态，交给调用方等它自然收尾。
+        """
         if session_id not in self.running:
             return False
         try:
@@ -1256,6 +1350,11 @@ class TurnManager:
         except Exception as exc:
             log(f"停止会话失败 {session_id}: {exc}")
         f = feed.get(session_id)
+        if strict:
+            if f:
+                f.stop_requested = True
+                await f.broadcast({"type": "cancelling", "sessionId": session_id})
+            return True
         if f:
             f.turn_active = False
             f.turn_done = True
@@ -1266,6 +1365,647 @@ class TurnManager:
 
     def finish(self, session_id):
         self.running.pop(session_id, None)
+
+
+# ---------------------------------------------------------------- 模型定时
+
+SCHEDULE_ID_RE = re.compile(r"^ms_[A-Za-z0-9]{6,32}$")
+WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+
+
+def load_schedules():
+    global schedules
+    if SCHEDULE_PATH.exists():
+        try:
+            d = json.loads(SCHEDULE_PATH.read_text(encoding="utf-8"))
+            items = d.get("schedules") or []
+            schedules = [it for it in items if isinstance(it, dict)]
+        except Exception as exc:
+            log(f"定时规则读取失败，按空处理: {exc}")
+            schedules = []
+    else:
+        schedules = []
+    return schedules
+
+
+def save_schedules():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SCHEDULE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"schedules": schedules}, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    tmp.replace(SCHEDULE_PATH)
+
+
+def find_schedule(sid):
+    return next((s for s in schedules if s.get("id") == sid), None)
+
+
+def current_global_model():
+    """zcode 配置里的默认模型（用于「恢复原模型」）。"""
+    main = (read_zcode_config().get("model") or {}).get("main") or ""
+    if "/" not in main:
+        return None
+    pid, mid = main.split("/", 1)
+    return {"providerId": pid, "modelId": mid}
+
+
+def model_label(provider_id, model_id):
+    """从 registry 里取一个好读的名字，取不到就退回 id。
+
+    注意：build_registry() 里每个 provider 的 models 是**列表**（每项含 modelId），
+    不是以 modelId 为键的字典，别写成 .items()。
+    """
+    try:
+        for p in build_registry()["providers"]:
+            if p.get("providerId") != provider_id:
+                continue
+            for m in (p.get("models") or []):
+                if isinstance(m, dict) and m.get("modelId") == model_id:
+                    return m.get("label") or m.get("name") or model_id
+            return model_id
+    except Exception:
+        pass
+    return model_id
+
+
+# ---- 时间计算 -------------------------------------------------------------
+# 全部用本地时区的 naive 时间戳（秒）。规则「此刻该不该生效」是按**时间窗反推**的，
+# 不是靠「到点触发一次」的事件流 —— 这样服务重启、机器休眠、漏掉几次 tick 都能自愈。
+
+def hhmm_valid(s):
+    return bool(re.match(r"^([01]\d|2[0-3]):[0-5]\d$", str(s or "")))
+
+
+def parse_hhmm(s):
+    h, m = str(s).split(":")
+    return int(h), int(m)
+
+
+def date_valid(s):
+    return bool(re.match(r"^\d{4}-\d{2}-\d{2}$", str(s or "")))
+
+
+def _at_ts(y, mo, da, hh, mm):
+    return time.mktime((y, mo, da, hh, mm, 0, 0, 0, -1))
+
+
+def rule_occurrences(rule, now_ts=None, lookback=None):
+    """该规则在「最近 lookback 天」里落到过的触发时刻，最新的在前。"""
+    if not hhmm_valid(rule.get("at")):
+        return []
+    hh, mm = parse_hhmm(rule["at"])
+    kind = rule.get("kind")
+    if lookback is None:
+        lookback = rule_lookback(kind)
+    out = []
+    if kind == "once":
+        d = rule.get("date") or ""
+        if not date_valid(d):
+            return []
+        y, mo, da = [int(x) for x in d.split("-")]
+        out.append(_at_ts(y, mo, da, hh, mm))
+        return out
+    now_ts = now_ts if now_ts is not None else time.time()
+    lt = time.localtime(now_ts)
+    want_days = None
+    if kind == "weekly":
+        want_days = [int(x) for x in (rule.get("days") or []) if str(x).lstrip("-").isdigit()]
+        want_days = [d for d in want_days if 0 <= d <= 6]
+        if not want_days:
+            return []
+    for back in range(0, lookback + 1):
+        # 用 mktime 归一化越界的「日」，跨月跨年都不用自己算
+        ts = _at_ts(lt.tm_year, lt.tm_mon, lt.tm_mday - back, hh, mm)
+        wd = (time.localtime(ts).tm_wday + 1) % 7      # tm_wday: 周一=0 → 统一成 周日=0
+        if want_days is not None and wd not in want_days:
+            continue
+        out.append(ts)
+    out.sort(reverse=True)
+    return out
+
+
+def rule_state(rule, now_ts=None):
+    """规则此刻是否应生效。返回 (active, fired_at, expires_at)；expires_at 为 None 表示无时长。"""
+    now_ts = now_ts if now_ts is not None else time.time()
+    if not rule.get("enabled", True):
+        return False, None, None
+    try:
+        dur = int(rule.get("durationMinutes") or 0) * 60
+    except Exception:
+        dur = 0
+    created = rule.get("createdAt")
+    created_ts = created / 1000.0 if isinstance(created, (int, float)) and created else 0
+    for fire in rule_occurrences(rule, now_ts):
+        if fire > now_ts:
+            continue                    # 还没到点
+        if created_ts and fire < created_ts - 60:
+            continue                    # 规则建立之前的触发点不算，避免「一建就立刻生效」
+        if dur <= 0:
+            return True, fire, None     # 无时长：生效到下一条规则接管（或手动恢复）
+        expires = fire + dur
+        if now_ts < expires:
+            return True, fire, expires
+    return False, None, None
+
+
+def next_fire_at(rule, now_ts=None):
+    """下一次触发时刻（毫秒）；单次规则已过则返回 None。"""
+    now_ts = now_ts if now_ts is not None else time.time()
+    if not rule.get("enabled", True) or not hhmm_valid(rule.get("at")):
+        return None
+    hh, mm = parse_hhmm(rule["at"])
+    kind = rule.get("kind")
+    if kind == "once":
+        d = rule.get("date") or ""
+        if not date_valid(d):
+            return None
+        y, mo, da = [int(x) for x in d.split("-")]
+        ts = _at_ts(y, mo, da, hh, mm)
+        return int(ts * 1000) if ts > now_ts else None
+    lt = time.localtime(now_ts)
+    want_days = None
+    if kind == "weekly":
+        want_days = [int(x) for x in (rule.get("days") or []) if str(x).lstrip("-").isdigit()]
+        want_days = [d for d in want_days if 0 <= d <= 6]
+        if not want_days:
+            return None
+    # 最多往后找 8 天，够覆盖每周规则
+    for fwd in range(0, 8):
+        ts = _at_ts(lt.tm_year, lt.tm_mon, lt.tm_mday + fwd, hh, mm)
+        if ts <= now_ts:
+            continue
+        wd = (time.localtime(ts).tm_wday + 1) % 7
+        if want_days is not None and wd not in want_days:
+            continue
+        return int(ts * 1000)
+    return None
+
+
+def evaluate_schedule(now_ts=None):
+    """在所有「此刻应生效」的规则里选一条：触发时间最新的胜出。"""
+    now_ts = now_ts if now_ts is not None else time.time()
+    best = None
+    for rule in schedules:
+        active, fired, expires = rule_state(rule, now_ts)
+        if not active:
+            continue
+        if best is None or fired > best[1]:
+            best = (rule, fired, expires)
+    return best
+
+
+def describe_rule(rule, now_ts=None):
+    """给前端的规则视图。"""
+    now_ts = now_ts if now_ts is not None else time.time()
+    active, fired, expires = rule_state(rule, now_ts)
+    kind = rule.get("kind")
+    if kind == "once":
+        when = "%s %s" % (rule.get("date") or "—", rule.get("at") or "—")
+    elif kind == "weekly":
+        days = sorted(int(x) for x in (rule.get("days") or [])
+                      if str(x).lstrip("-").isdigit() and 0 <= int(x) <= 6)
+        when = "%s %s" % ("、".join(WEEKDAY_LABELS[d] for d in days) or "—",
+                          rule.get("at") or "—")
+    else:
+        when = "每天 %s" % (rule.get("at") or "—")
+    out = dict(rule)
+    out.update({
+        "when": when,
+        "kindLabel": {"once": "单次", "daily": "每日", "weekly": "每周"}.get(kind, kind or "—"),
+        "modelLabel": model_label(rule.get("providerId"), rule.get("modelId")),
+        "active": active,
+        "firedAt": int(fired * 1000) if fired else None,
+        "expiresAt": int(expires * 1000) if expires else None,
+        "nextRunAt": next_fire_at(rule, now_ts),
+    })
+    return out
+
+
+# ---- 下发 -----------------------------------------------------------------
+
+def target_sessions():
+    """本进程「见过」的会话 —— 也就是真正可能正在被使用的那些。
+
+    数据库里还有几十条休眠的历史会话，为它们逐个 resume + setModel 才是「影响线上」；
+    那些会话由内存里的覆盖项惰性接管，下次一发消息就是新模型。
+    """
+    ids = set()
+    if runner:
+        ids |= set(runner.desired.keys())
+        ids |= set(runner.running.keys())
+    if feed:
+        ids |= set(feed.feeds.keys())
+    return sorted(ids)
+
+
+async def wait_turn_stopped(session_id, timeout=SCHEDULE_STOP_WAIT_SEC):
+    """等 app-server 把当前轮次真正收尾。返回是否真的停了。
+
+    不能只看本地标记：cancel(strict=True) 只是「请求」停止，长时间工具还在跑
+    的时候 app-server 依然认为轮次活跃。这里的 turn_active 是 pump 根据
+    app-server 的真实事件（turn.completed / 事件流结束）收敛出来的，才可信。
+    """
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        f = feed.get(session_id) if feed else None
+        if f is None:
+            break
+        if not f.turn_active:
+            await asyncio.sleep(SCHEDULE_SETTLE_SEC)
+            return True
+        await asyncio.sleep(0.4)
+    log(f"定时切换：会话 {session_id} 在 {timeout}s 内未见轮次结束")
+    return False
+
+
+async def resume_and_verify(session_id, prompt, timeout=SCHEDULE_RESUME_VERIFY_SEC):
+    """发续跑提示，并确认 app-server 真的把它当成新一轮接受了。
+
+    判据不能只看 `turn.started`：实测这台 app-server 并不总是把该事件吐给面板，
+    只用它会把「其实已经续上了」误判成失败。真正的判别点是**有没有新事件回来** ——
+    没有活跃轮次时 session/send 会立刻开新轮，pump 随即收到该轮的事件（buffer 非空）；
+    而被当成队列消息（delivery=queue）静默吞掉时，什么事件都不会有。
+    """
+    f = feed.get(session_id) if feed else None
+    before = f.turn_seq if f else 0
+    try:
+        await runner.send(session_id, prompt)
+    except Exception as exc:
+        log(f"定时切换：会话 {session_id} 续跑失败: {exc}")
+        return False
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        f = feed.get(session_id) if feed else None
+        if f is None:
+            return False
+        if f.turn_seq > before or f.buffer:
+            return True
+        await asyncio.sleep(0.4)
+    log(f"定时切换：会话 {session_id} 发出续跑提示后 {timeout}s 内没有任何事件回来，判为未生效")
+    # 全程没有任何事件回来 ⇒ app-server 那边其实什么都没跑，把本地状态放掉免卡住
+    if f is not None:
+        f.turn_active = False
+        if runner:
+            runner.finish(session_id)
+    return False
+
+
+async def switch_session_model(session_id, target, tries=SCHEDULE_SWITCH_TRIES):
+    last = None
+    for i in range(tries):
+        try:
+            await runner.apply_settings(session_id, model=dict(target), force=True)
+            return True, None
+        except Exception as exc:
+            last = exc
+            log(f"定时切换：会话 {session_id} setModel 失败（第 {i + 1}/{tries} 次）: {exc}")
+            if runner.is_inactive_error(exc):
+                # 会话闲置太久被 app-server 卸掉了：先把它拉起来，
+                # 否则重试多少次都是同一个错。拉不起来就交给内存覆盖项兜底。
+                if not await runner.ensure_active(session_id, force=True):
+                    return False, str(exc)
+                continue
+            if i < tries - 1:
+                await asyncio.sleep(2.0)
+    return False, str(last)
+
+
+async def apply_model_everywhere(target, *, reason="", resume=True,
+                                 prompt=SCHEDULE_RESUME_DEFAULT, scope="all",
+                                 interrupt=True):
+    """把 target 模型下发给所有已知会话；正在跑的会话会先停、换完再让它接着做。
+
+    scope="running-only" 用于「恢复」时避免无谓地打扰空闲会话。
+    interrupt=False 用于「恢复」：只把模型改回去，不打断正在跑的轮次
+    （恢复不该杀掉用户正在进行的工作）。
+    """
+    pid, mid = target.get("providerId"), target.get("modelId")
+    report = {"total": 0, "switched": 0, "failed": 0, "interrupted": 0, "stopped": 0,
+              "resumed": 0, "resumeSkipped": 0, "inactive": 0, "pending": 0,
+              "pendingItems": [], "reason": reason,
+              "at": int(time.time() * 1000), "api": "session/setModel",
+              "restart": False, "sessions": []}
+    if not pid or not mid:
+        report["failed"] = 0
+        return report
+
+    for sid in target_sessions():
+        was_running = bool(runner and runner.is_running(sid))
+        if scope == "running-only" and not was_running:
+            continue
+        report["total"] += 1
+        row = {"sessionId": sid, "wasRunning": was_running}
+        stopped = None
+        if was_running and interrupt:
+            # 正在跑：先请求停止，再等它真的收尾，最后才换模型、续跑
+            try:
+                await runner.cancel(sid, strict=True)
+                report["interrupted"] += 1
+                row["interrupted"] = True
+            except Exception as exc:
+                row["cancelError"] = str(exc)
+                log(f"定时切换：停止会话 {sid} 失败: {exc}")
+            stopped = await wait_turn_stopped(sid)
+            row["stopped"] = stopped
+            if stopped:
+                report["stopped"] += 1
+
+        ok, err = await switch_session_model(sid, target)
+        if ok:
+            report["switched"] += 1
+            row["switched"] = True
+        elif err and "not active" in str(err).lower():
+            # 会话已经闲置：app-server 不再接受 setModel。这不算失败 ——
+            # 面板内存里的定时覆盖会在它下次发消息时自动接管模型。
+            report["inactive"] += 1
+            row["switched"] = False
+            row["inactive"] = True
+        else:
+            report["failed"] += 1
+            row["switched"] = False
+            row["error"] = err
+
+        if was_running and resume and interrupt:
+            if stopped:
+                if ok and await resume_and_verify(sid, prompt):
+                    report["resumed"] += 1
+                    row["resumed"] = True
+                else:
+                    report["resumeSkipped"] += 1
+                    row["resumeSkipped"] = "续跑提示未被 app-server 接受为新轮次"
+                    log(f"定时切换：会话 {sid} 的续跑提示未被接受（不重试，避免重复发送）")
+            else:
+                # 轮次没停下来（长时间工具 / 超长生成）：此刻硬发只会被 app-server
+                # 当成队列消息收下、然后永远不提升（静默丢失）。登记成待续跑，
+                # 交给调度器等它空闲后补发。
+                report["pending"] += 1
+                row["pending"] = ("轮次未在 %ds 内结束，已登记：空闲后自动补发续跑提示"
+                                  % SCHEDULE_STOP_WAIT_SEC)
+                report["pendingItems"].append({
+                    "sessionId": sid, "prompt": prompt, "target": target,
+                    "needSwitch": not ok,
+                })
+                log(f"定时切换：会话 {sid} 未停下，登记待续跑（空闲后补发）")
+        report["sessions"].append(row)
+
+    log("模型下发完成（%s）：目标 %s/%s，命中 %d 个会话，切换成功 %d，失败 %d，闲置跳过 %d，"
+        "请求打断 %d，确认停止 %d，续跑成功 %d，跳过续跑 %d，待续跑 %d"
+        % (reason or "未注明", pid, mid, report["total"], report["switched"],
+           report["failed"], report["inactive"], report["interrupted"], report["stopped"],
+           report["resumed"], report["resumeSkipped"], report["pending"]))
+    return report
+
+
+async def notify_global(payload):
+    """给所有控制台连接广播一条全局事件（会话事件流是按会话订阅的，用不上）。"""
+    dead = []
+    for ws in list(NOTIFY_SUBSCRIBERS):
+        try:
+            if ws.closed:
+                dead.append(ws)
+                continue
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        NOTIFY_SUBSCRIBERS.discard(ws)
+
+
+class ModelScheduler:
+    """按时间窗把「当前该用的模型」推给所有会话。
+
+    与事件驱动相比，这里每次都重新求值「现在该是哪条规则」，所以：
+      * 服务重启、机器休眠、漏掉几次 tick 都不会漏掉规则
+      * 规则被改/被删，下一次 tick 自然就纠正过来
+    """
+
+    def __init__(self):
+        self.task = None
+        self.lock = asyncio.Lock()
+        self.active = None      # {"id","name","model","since","until","manual"}
+        self.prev = None        # 覆盖生效前的模型（用于恢复）
+        self.history = []
+        self.pending = {}       # sid -> 待续跑项（轮次没停下来时的兜底）
+        self.started_at = int(time.time() * 1000)
+
+    # ---- 对外只读 ----
+    def override_model(self):
+        """当前生效的定时模型；没有则 None。发消息 / 新建会话 / 读模型目录都会用它。"""
+        a = self.active
+        if not a:
+            return None
+        m = a.get("model") or {}
+        if not (m.get("providerId") and m.get("modelId")):
+            return None
+        return {"providerId": m["providerId"], "modelId": m["modelId"]}
+
+    def public_runtime(self):
+        a = self.active
+        out = {"active": None, "prev": self.prev, "serverTime": int(time.time() * 1000),
+               "tickSeconds": SCHEDULE_TICK, "pending": len(self.pending)}
+        if a:
+            out["active"] = {
+                "id": a.get("id"), "name": a.get("name"),
+                "model": a.get("model"),
+                "modelLabel": model_label((a.get("model") or {}).get("providerId"),
+                                          (a.get("model") or {}).get("modelId")),
+                "since": a.get("since"), "until": a.get("until"),
+                "manual": bool(a.get("manual")),
+                "resume": bool(a.get("resume")),
+                "prompt": a.get("prompt"),
+            }
+        return out
+
+    def _record(self, item):
+        item["at"] = int(time.time() * 1000)
+        self.history.append(item)
+        del self.history[:-SCHEDULE_HISTORY_MAX]
+
+    # ---- 待续跑（兜底）----
+    def register_pending(self, items, reason=""):
+        """登记「轮次没能及时停下」的会话，等它空闲后补发续跑提示。"""
+        for it in items or []:
+            sid = it.get("sessionId")
+            if not sid:
+                continue
+            self.pending[sid] = {
+                "target": it.get("target"),
+                "prompt": it.get("prompt") or SCHEDULE_RESUME_DEFAULT,
+                "needSwitch": bool(it.get("needSwitch")),
+                "reason": reason,
+                "deadline": time.time() + SCHEDULE_PENDING_MAX_SEC,
+            }
+            log(f"定时切换：会话 {sid} 已登记待续跑（空闲后自动补发）")
+
+    async def process_pending(self):
+        """每一轮 tick 之后调用：把已经空闲下来的待续跑会话补上续跑提示。
+
+        放在 tick 之外（不持锁），因为它要等 app-server 回包；同时锁被占用时直接
+        跳过，避免和「立即执行 / 恢复」这类手动操作交错。
+        """
+        if not self.pending or self.lock.locked():
+            return
+        for sid in list(self.pending):
+            item = self.pending.get(sid)
+            if not item:
+                continue
+            f = feed.get(sid) if feed else None
+            if (f and f.turn_active) or (runner and runner.is_running(sid)):
+                if time.time() > item["deadline"]:
+                    self.pending.pop(sid, None)
+                    log(f"定时切换：会话 {sid} 等待续跑超时（{SCHEDULE_PENDING_MAX_SEC}s），放弃补发")
+                continue
+            if item.get("needSwitch") and item.get("target"):
+                ok, err = await switch_session_model(sid, item["target"])
+                if not ok and not (err and "not active" in str(err).lower()):
+                    if time.time() > item["deadline"]:
+                        self.pending.pop(sid, None)
+                        log(f"定时切换：会话 {sid} 补发前 setModel 失败（{err}），放弃")
+                    continue
+            self.pending.pop(sid, None)
+            ok = await resume_and_verify(sid, item["prompt"])
+            log(f"定时切换：会话 {sid} 空闲后补发续跑提示 → {ok}")
+            await notify_global({"type": "model-scheduled", "scope": "resume",
+                                 "sessionId": sid, "ok": ok,
+                                 "active": self.public_runtime()["active"]})
+
+    # ---- 生效 / 恢复 ----
+    async def activate(self, rule, fired=None, expires=None, manual=False):
+        """对外入口：拿锁，避免和调度 tick 并发下发。"""
+        async with self.lock:
+            return await self._activate_locked(rule, fired, expires, manual)
+
+    async def _activate_locked(self, rule, fired=None, expires=None, manual=False):
+        model = {"providerId": rule.get("providerId"), "modelId": rule.get("modelId")}
+        pid, mid = model["providerId"], model["modelId"]
+        if not pid or not mid:
+            log(f"定时规则 {rule.get('id')} 没有配模型，跳过")
+            return {"ok": False, "error": "规则没有配置目标模型"}
+
+        was_active = bool(self.active)
+        if not was_active:
+            self.prev = {"model": current_global_model(), "at": int(time.time() * 1000)}
+        resume = bool(rule.get("resumeRunning", True))
+        prompt = (rule.get("resumePrompt") or "").strip() or SCHEDULE_RESUME_DEFAULT
+
+        self.active = {
+            "id": rule.get("id"),
+            "name": rule.get("name") or model_label(pid, mid),
+            "model": model,
+            "since": int((fired or time.time()) * 1000),
+            "until": int(expires * 1000) if expires else None,
+            "manual": manual,
+            "resume": resume,
+            "prompt": prompt,
+        }
+        log("模型定时生效：%s -> %s/%s（手动=%s，续跑=%s）"
+            % (self.active["name"], pid, mid, manual, resume))
+        report = await apply_model_everywhere(model, reason="定时生效：" + self.active["name"],
+                                              resume=resume, prompt=prompt)
+        if resume:
+            self.register_pending(report.get("pendingItems"), reason="定时生效：" + self.active["name"])
+        rule["lastRunAt"] = int(time.time() * 1000)
+        rule["lastResult"] = {k: report[k] for k in
+                              ("total", "switched", "failed", "interrupted", "stopped",
+                                  "resumed", "resumeSkipped", "inactive", "pending")}
+        if not manual:
+            save_schedules()
+        self._record({"scope": "switch", "id": rule.get("id"),
+                      "name": self.active["name"], "model": model, "report": rule["lastResult"]})
+        await notify_global({"type": "model-scheduled", "scope": "switch",
+                             "active": self.public_runtime()["active"],
+                             "report": rule["lastResult"]})
+        return {"ok": True, "active": self.public_runtime()["active"], "report": report}
+
+    async def revert(self, reason="定时时段结束", manual=False, scope="all"):
+        async with self.lock:
+            return await self._revert_locked(reason, manual, scope)
+
+    async def _revert_locked(self, reason="定时时段结束", manual=False, scope="all"):
+        prev_model = (self.prev or {}).get("model") if self.prev else None
+        name = (self.active or {}).get("name")
+        self.active = None
+        self.prev = None
+        if not prev_model:
+            self._record({"scope": "revert", "reason": reason, "model": None})
+            await notify_global({"type": "model-scheduled", "scope": "revert",
+                                 "reason": reason, "active": None})
+            return {"ok": True, "model": None, "report": None}
+        log("模型定时恢复：%s -> %s/%s（%s）"
+            % (name, prev_model["providerId"], prev_model["modelId"], reason))
+        report = await apply_model_everywhere(prev_model, reason="定时恢复：" + reason,
+                                             prompt=SCHEDULE_RESUME_DEFAULT, scope=scope,
+                                             interrupt=False, resume=False)
+        self._record({"scope": "revert", "reason": reason, "model": prev_model,
+                      "report": {k: report[k] for k in
+                                 ("total", "switched", "failed", "interrupted", "stopped",
+                                  "resumed", "resumeSkipped", "inactive", "pending")}})
+        await notify_global({"type": "model-scheduled", "scope": "revert",
+                             "reason": reason, "active": None,
+                             "model": prev_model, "report": report})
+        return {"ok": True, "model": prev_model, "report": report}
+
+    # ---- 调度循环 ----
+    async def tick(self):
+        if self.lock.locked():
+            return
+        async with self.lock:
+            now = time.time()
+            best = evaluate_schedule(now)
+            want = best[0] if best else None
+            cur = self.active
+            cur_id = (cur or {}).get("id")
+            cur_manual = bool(cur and cur.get("manual"))
+
+            if want is not None and want.get("id") == cur_id:
+                new_model = {"providerId": want.get("providerId"),
+                             "modelId": want.get("modelId")}
+                # 生效中的规则被改了模型/续跑开关 → 立刻按新值重新下发
+                if (cur.get("model") != new_model
+                        or cur.get("resume") != bool(want.get("resumeRunning", True))):
+                    await self._activate_locked(want, best[1], best[2])
+                    return
+                cur["manual"] = False       # 手动切换的规则被自然命中 → 转正
+                cur["until"] = int(best[2] * 1000) if best[2] else None
+                return
+            if want is None:
+                # 手动切换不会被自然规则的空档回收，要用户自己点「恢复」
+                if cur_id and not cur_manual:
+                    await self._revert_locked("定时时段结束")
+                return
+            # 有自然到点的规则且与当前不同 → 切过去（手动切换也会被自然规则接管）
+            await self._activate_locked(want, best[1], best[2])
+
+    async def run(self):
+        log("模型定时调度器已启动（轮询 %ds）" % SCHEDULE_TICK)
+        while True:
+            try:
+                await self.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log(f"模型定时调度异常: {exc}")
+            try:
+                await self.process_pending()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log(f"模型定时续跑处理异常: {exc}")
+            await asyncio.sleep(SCHEDULE_TICK)
+
+    def start(self):
+        if self.task and not self.task.done():
+            return
+        self.task = asyncio.create_task(self.run())
+
+    async def stop(self):
+        if self.task and not self.task.done():
+            self.task.cancel()
+            try:
+                await self.task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self.task = None
 
 
 # ---------------------------------------------------------------- 模型与厂商配置
@@ -1491,6 +2231,9 @@ async def handle_health(request):
         "running": len(runner.running) if runner else 0,
         "banned": sum(1 for v in ban_store.data.values() if v.get("banned")),
         "uptime": int(time.time() - START_TIME),
+        # 部署脚本靠 running 判断「现在有没有人在对话」，据此决定要不要等空闲再重启
+        "scheduledModel": (scheduler.override_model() if scheduler else None),
+        "scheduleActive": bool(scheduler and scheduler.active),
     })
 
 
@@ -1760,6 +2503,13 @@ async def handle_options(request):
     except Exception as exc:
         # 预热还没成功时给前端一个能看的兜底，不要整页卡住
         return json_error(f"读取模型目录失败: {exc}", 502)
+    if scheduler is not None:
+        # 注意 get_options 有缓存，别改到缓存里的对象
+        data = dict(data)
+        data["schedule"] = scheduler.public_runtime()
+        ov = scheduler.override_model()
+        if ov:
+            data["currentModel"] = ov          # 定时生效期间，选择器就显示定时模型
     return web.json_response(data)
 
 
@@ -2033,6 +2783,11 @@ async def handle_session_create(request):
     if isinstance(model, dict):
         model = {"providerId": model.get("providerId"), "modelId": model.get("modelId")}
     tl = data.get("thoughtLevel") or None
+    # 模型定时生效期间，新建会话也要落到定时模型上
+    if scheduler is not None:
+        ov = scheduler.override_model()
+        if ov:
+            model = ov
 
     if purpose in ("project", "task") and os.path.isdir(ws_path):
         ensure_workspace_registered(ws_path, purpose)
@@ -2356,6 +3111,224 @@ async def handle_active_model(request):
     return json_response_ok(main=full)
 
 
+# ---------------------------------------------------------------- 路由：模型定时
+
+def _clamp_int(value, lo, hi, default):
+    try:
+        n = int(value)
+    except Exception:
+        return default
+    return max(lo, min(hi, n))
+
+
+def build_schedule_entry(data, existing=None):
+    """校验并归一化一条规则。返回 (entry, error)。"""
+    e = dict(existing or {})
+    name = str(data.get("name") if data.get("name") is not None
+               else e.get("name") or "").strip()
+    if len(name) > 40:
+        return None, "名称最长 40 字"
+
+    kind = str(data.get("kind") or e.get("kind") or "daily").strip()
+    if kind not in SCHEDULE_KINDS:
+        return None, "定时类型只能是 单次 / 每日 / 每周"
+
+    at = str(data.get("at") if data.get("at") is not None else e.get("at") or "").strip()
+    if not hhmm_valid(at):
+        return None, "时间格式应为 HH:MM（24 小时制）"
+
+    date = str(data.get("date") if data.get("date") is not None
+               else e.get("date") or "").strip()
+    if kind == "once":
+        if not date_valid(date):
+            return None, "单次定时需要选择日期"
+        y, mo, da = [int(x) for x in date.split("-")]
+        try:
+            time.mktime((y, mo, da, 0, 0, 0, 0, 0, -1))
+        except Exception:
+            return None, "日期不合法"
+
+    days = []
+    if kind == "weekly":
+        raw = data.get("days") if data.get("days") is not None else e.get("days") or []
+        if isinstance(raw, (str, int)):
+            raw = [raw]
+        for x in (raw or []):
+            try:
+                d = int(x)
+            except Exception:
+                continue
+            if 0 <= d <= 6 and d not in days:
+                days.append(d)
+        if not days:
+            return None, "每周定时至少要选一个星期几"
+        days.sort()
+
+    dur = _clamp_int(data.get("durationMinutes") if data.get("durationMinutes") is not None
+                     else e.get("durationMinutes"), 0, SCHEDULE_MAX_DURATION_MIN, 0)
+
+    pid = str(data.get("providerId") if data.get("providerId") is not None
+              else e.get("providerId") or "").strip()
+    mid = str(data.get("modelId") if data.get("modelId") is not None
+              else e.get("modelId") or "").strip()
+    if not pid or not mid:
+        return None, "请选择要切换到的模型"
+    if not PROVIDER_ID_RE.match(pid):
+        return None, "厂商 ID 不合法"
+    try:
+        providers = build_registry()["providers"]
+    except Exception as exc:
+        return None, f"读取模型目录失败：{exc}"
+    prov = next((p for p in providers if p.get("providerId") == pid), None)
+    if prov is None:
+        return None, "模型不存在，请刷新后重新选择"
+    # models 是列表（每项含 modelId），兼容字典形态以防 registry 结构变化
+    known = prov.get("models") or []
+    if isinstance(known, dict):
+        known = list(known.keys())
+    else:
+        known = [m.get("modelId") for m in known if isinstance(m, dict)]
+    if mid not in known:
+        return None, "模型不存在，请刷新后重新选择"
+
+    e.update({
+        "name": name or model_label(pid, mid),
+        "kind": kind,
+        "at": at,
+        "date": date if kind == "once" else "",
+        "days": days if kind == "weekly" else [],
+        "durationMinutes": dur,
+        "providerId": pid,
+        "modelId": mid,
+        "resumeRunning": bool(data.get("resumeRunning")
+                              if data.get("resumeRunning") is not None
+                              else e.get("resumeRunning", True)),
+        "resumePrompt": str(data.get("resumePrompt") if data.get("resumePrompt") is not None
+                            else e.get("resumePrompt") or SCHEDULE_RESUME_DEFAULT)[:200].strip()
+                        or SCHEDULE_RESUME_DEFAULT,
+        "enabled": bool(data.get("enabled") if data.get("enabled") is not None
+                        else e.get("enabled", True)),
+    })
+    if not e["resumePrompt"]:
+        e["resumePrompt"] = SCHEDULE_RESUME_DEFAULT
+    return e, None
+
+
+async def activate_rule(rule, *, manual=False, write=True):
+    """把一条规则立刻应用上去（供「立即执行」和调度器共用）。"""
+    if scheduler is None:
+        return {"ok": False, "error": "调度器未就绪"}
+    if write:
+        save_schedules()
+    return await scheduler.activate(rule, fired=None, expires=None, manual=manual)
+
+
+async def handle_schedules(request):
+    """GET 列表 / POST 新建或更新。"""
+    blocked = guard(request)
+    if blocked:
+        return blocked
+
+    if request.method == "GET":
+        now = time.time()
+        return web.json_response({
+            "ok": True,
+            "schedules": [describe_rule(r, now) for r in schedules],
+            "runtime": scheduler.public_runtime() if scheduler else {"active": None},
+            "history": (scheduler.history[-10:] if scheduler else []),
+            "defaults": {"prompt": SCHEDULE_RESUME_DEFAULT, "tick": SCHEDULE_TICK},
+        })
+
+    data = await body_json(request)
+    sid = str(data.get("id") or "").strip()
+    existing = find_schedule(sid) if sid else None
+    if sid and not existing:
+        return json_error("规则不存在", 404)
+    if sid and not SCHEDULE_ID_RE.match(sid):
+        return json_error("非法的规则 ID", 400)
+
+    entry, err = build_schedule_entry(data, existing)
+    if err:
+        return json_error(err, 400)
+
+    if existing:
+        existing.clear()
+        existing.update(entry)
+        rule = existing
+        action = "更新"
+    else:
+        rule = dict(entry)
+        rule["id"] = "ms_" + hashlib.sha1(
+            ("%s|%s|%s" % (rule.get("kind"), time.time(), os.urandom(8))).encode()
+        ).hexdigest()[:12]
+        rule["createdAt"] = int(time.time() * 1000)
+        rule["lastRunAt"] = None
+        rule["lastResult"] = None
+        schedules.append(rule)
+        action = "新建"
+
+    save_schedules()
+    # 改完立刻让调度器重新求值：可能马上就该生效，也可能该从生效变成不生效
+    if scheduler:
+        asyncio.create_task(scheduler.tick())
+    log("模型定时规则%s: %s（%s %s -> %s/%s%s）"
+        % (action, rule.get("name"), rule.get("kind"), rule.get("at"),
+           rule.get("providerId"), rule.get("modelId"),
+           "" if rule.get("durationMinutes") else "，无时长"))
+    return web.json_response({"ok": True, "id": rule["id"],
+                              "schedule": describe_rule(rule),
+                              "runtime": scheduler.public_runtime() if scheduler else None})
+
+
+async def handle_schedule_delete(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    sid = request.match_info["sid"]
+    rule = find_schedule(sid)
+    if not rule:
+        return json_error("规则不存在", 404)
+    was_active = bool(scheduler and scheduler.active
+                      and scheduler.active.get("id") == sid)
+    schedules.remove(rule)
+    save_schedules()
+    log(f"删除模型定时规则: {rule.get('name')}（{sid}）")
+    if was_active:
+        # 生效中的规则被删了，立刻恢复原模型
+        asyncio.create_task(scheduler.revert("规则已删除"))
+    elif scheduler:
+        asyncio.create_task(scheduler.tick())
+    return web.json_response({"ok": True, "wasActive": was_active})
+
+
+async def handle_schedule_run(request):
+    """立即把这条规则应用一次（不算定时生效，不会被空档自动回收）。"""
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    sid = request.match_info["sid"]
+    rule = find_schedule(sid)
+    if not rule:
+        return json_error("规则不存在", 404)
+    res = await activate_rule(rule, manual=True)
+    if not res.get("ok"):
+        return json_error(res.get("error") or "执行失败", 502)
+    return web.json_response({"ok": True, "active": res.get("active"),
+                              "report": res.get("report")})
+
+
+async def handle_schedule_revert(request):
+    """立即恢复定时生效前的模型。"""
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    if scheduler is None or not scheduler.active:
+        return json_error("当前没有生效中的定时规则", 409)
+    res = await scheduler.revert("手动恢复", manual=True)
+    return web.json_response({"ok": True, "model": res.get("model"),
+                              "report": res.get("report")})
+
+
 # ---------------------------------------------------------------- WebSocket
 
 async def handle_ws(request):
@@ -2374,7 +3347,13 @@ async def handle_ws(request):
     await ws.prepare(request)
 
     watched = set()      # 本连接订阅的 sessionId
+    NOTIFY_SUBSCRIBERS.add(ws)      # 顺带接收全局事件（模型定时切换等）
     await safe_send(ws, {"type": "ready", "appServer": bool(zc and zc.proc and zc.proc.returncode is None)})
+    if scheduler:
+        # 让刚连上的控制台立刻知道定时生效状态，不用等下一次广播
+        rt = scheduler.public_runtime()
+        await safe_send(ws, {"type": "model-scheduled", "scope": "sync",
+                             "active": rt["active"], "pending": rt["pending"]})
 
     try:
         async for msg in ws:
@@ -2480,6 +3459,7 @@ async def handle_ws(request):
     except Exception as exc:
         log(f"WebSocket 异常: {exc}")
     finally:
+        NOTIFY_SUBSCRIBERS.discard(ws)
         for sid in watched:
             f = feed.get(sid)
             if f:
@@ -2506,7 +3486,7 @@ START_TIME = time.time()
 
 
 async def on_startup(app):
-    global ban_store, token_store, zc, feed, runner
+    global ban_store, token_store, zc, feed, runner, scheduler
     load_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ban_store = BanStore(BAN_PATH)
@@ -2515,6 +3495,8 @@ async def on_startup(app):
     zc.auto_approve = bool(config.get("auto_approve", True))
     feed = SessionFeedManager()
     runner = TurnManager()
+    load_schedules()
+    scheduler = ModelScheduler()
     log("封禁名单已载入：%d 条记录，其中永久封禁 %d 个"
         % (len(ban_store.data), sum(1 for v in ban_store.data.values() if v.get("banned"))))
     try:
@@ -2523,12 +3505,17 @@ async def on_startup(app):
         log(f"app-server 启动失败: {exc}")
     # 后台重建 provider registry + 预热模型目录（readState 首次调用要等 MCP 初始化，很慢）
     asyncio.create_task(bootstrap_catalog("服务启动"))
+    enabled = [s for s in schedules if s.get("enabled", True)]
+    log("模型定时：已载入 %d 条规则（启用 %d 条）" % (len(schedules), len(enabled)))
+    scheduler.start()
     log("监听 %s:%s，默认模式 %s" % (config.get("bind"), config.get("port"),
                                     config.get("default_mode")))
     log("zcode 配置：%s" % ZCODE_CONFIG)
 
 
 async def on_cleanup(app):
+    if scheduler:
+        await scheduler.stop()
     if zc:
         await zc.stop()
 
@@ -2564,6 +3551,12 @@ def make_app():
     app.router.add_post("/api/settings/providers/{pid}/models", handle_model_upsert)
     app.router.add_delete("/api/settings/providers/{pid}/models/{mid}", handle_model_delete)
     app.router.add_post("/api/settings/active-model", handle_active_model)
+
+    app.router.add_get("/api/schedules", handle_schedules)
+    app.router.add_post("/api/schedules", handle_schedules)
+    app.router.add_delete("/api/schedules/{sid}", handle_schedule_delete)
+    app.router.add_post("/api/schedules/{sid}/run", handle_schedule_run)
+    app.router.add_post("/api/schedules/revert", handle_schedule_revert)
 
     app.router.add_get("/ws", handle_ws)
     app.router.add_static("/static/", STATIC_DIR)

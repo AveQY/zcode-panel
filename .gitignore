@@ -1,0 +1,22 @@
+# 运行时配置与安全数据
+config.json
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# 本地验证产物
+*.log
+*.png
+# 根目录交付报告（静态页面源码仍需纳入版本控制）
+/zcode-chat-console.html
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+{
+  "port": 8081,
+  "bind": "0.0.0.0",
+  "key_sha256": "",
+  "key_plain": "",
+  "max_attempts": 5,
+  "token_ttl": 43200,
+  "allow_cidr": [],
+  "trust_proxy": false,
+  "default_mode": "build",
+  "default_thought_level": "",
+  "auto_approve": true,
+  "workspace_root": "/root"
+}

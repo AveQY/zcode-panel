@@ -1,0 +1,25 @@
+[Unit]
+Description=ZCode Chat Console (Web Control Panel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/zcode-chat
+Environment=HOME=/root
+Environment=LANG=C.UTF-8
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/zcode-chat/app.py
+Restart=always
+RestartSec=3
+# 将正在执行的 zcode 子进程和 Web 服务一起回收，避免留下孤儿进程。
+KillMode=control-group
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zcode-chat
+
+[Install]
+WantedBy=multi-user.target

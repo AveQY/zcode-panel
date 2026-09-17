@@ -1,0 +1,1661 @@
+(function () {
+  'use strict';
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  var state = {
+    sessionId: null,
+    sending: false,
+    ws: null,
+    messageMap: new Map(),
+    listTimer: null,
+    toastTimer: null,
+    startedAt: 0,
+    statusTimer: null,
+    tab: 'active',              // active | archived
+    sessions: [],
+    archived: [],
+    workspaces: [],
+    options: null,              // /api/options 结果
+    modes: [],
+    providers: [],
+    provScope: 'official',      // official | custom（默认停在「官方配置」，与 HTML 里 active 的按钮一致）
+    editingProvider: null,
+    cur: null,                  // 当前正在流式渲染的助手消息
+    confirmResolve: null,
+  };
+
+  /* ============================================ 基础工具 */
+
+  function esc(s) {
+    return String(s == null ? '' : s)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function mdParse(text) {
+    var M = window.marked;
+    if (!M) return esc(text).replace(/\n/g, '<br>');
+    var fn = typeof M === 'function' ? M : M.parse;
+    if (typeof fn !== 'function') return esc(text).replace(/\n/g, '<br>');
+    var html;
+    try {
+      html = fn.call(M, String(text || ''));
+    } catch (e) {
+      return esc(text).replace(/\n/g, '<br>');
+    }
+    return html
+      .replace(/<script[\s\S]*?<\/script>/gi, '')
+      .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
+      .replace(/\son\w+\s*=\s*"[^"]*"/gi, '')
+      .replace(/\son\w+\s*=\s*'[^']*'/gi, '')
+      .replace(/\son\w+\s*=\s*[^\s>]+/gi, '')
+      .replace(/javascript:/gi, '');
+  }
+
+  function toast(msg, kind) {
+    var el = $('toast');
+    el.textContent = msg;
+    el.className = 'toast' + (kind ? ' ' + kind : '');
+    clearTimeout(state.toastTimer);
+    state.toastTimer = setTimeout(function () { el.classList.add('hidden'); }, 3600);
+  }
+
+  function req(path, opts) {
+    opts = opts || {};
+    opts.credentials = 'same-origin';
+    opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+    return fetch(path, opts).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        return { status: res.status, data: data || {} };
+      });
+    });
+  }
+
+  function pad2(n) { return String(n).length < 2 ? '0' + n : String(n); }
+
+  function relTime(ms) {
+    if (!ms) return '';
+    var diff = Date.now() - ms;
+    if (diff < 60000) return '刚刚';
+    if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前';
+    if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前';
+    if (diff < 604800000) return Math.floor(diff / 86400000) + ' 天前';
+    var d = new Date(ms);
+    return (d.getMonth() + 1) + '/' + d.getDate();
+  }
+
+  function scrollToBottom(force) {
+    var box = $('messages');
+    if (!box) return;
+    var near = box.scrollHeight - box.scrollTop - box.clientHeight < 220;
+    if (force || near) box.scrollTop = box.scrollHeight;
+  }
+
+  /* ============================================ 弹窗 */
+
+  function openModal(id) { $(id).classList.remove('hidden'); }
+  function closeModal(id) {
+    $(id).classList.add('hidden');
+    if (id === 'settings-modal') { /* 保留内容，下次打开会重新拉 */ }
+  }
+
+  function confirmBox(title, text, okLabel) {
+    $('cf-title').textContent = title;
+    $('cf-text').textContent = text;
+    $('cf-ok').textContent = okLabel || '确定';
+    openModal('confirm-modal');
+    return new Promise(function (resolve) {
+      state.confirmResolve = resolve;
+    });
+  }
+
+  $('cf-ok').addEventListener('click', function () {
+    closeModal('confirm-modal');
+    if (state.confirmResolve) { state.confirmResolve(true); state.confirmResolve = null; }
+  });
+
+  document.addEventListener('click', function (e) {
+    var t = e.target;
+    if (!t || !t.getAttribute) return;
+    var c = t.getAttribute('data-close');
+    if (c) {
+      closeModal(c);
+      if (c === 'confirm-modal' && state.confirmResolve) {
+        state.confirmResolve(false);
+        state.confirmResolve = null;
+      }
+    }
+    // 点空白处关掉会话菜单
+    if (!t.closest || !t.closest('.session-menu') && !t.closest('.session-more')) {
+      var menus = document.querySelectorAll('.session-menu');
+      for (var i = 0; i < menus.length; i++) {
+        if (menus[i].parentNode) menus[i].parentNode.removeChild(menus[i]);
+      }
+    }
+  });
+
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    var mods = document.querySelectorAll('.modal:not(.hidden)');
+    if (mods.length) {
+      var top = mods[mods.length - 1];
+      closeModal(top.id);
+      if (top.id === 'confirm-modal' && state.confirmResolve) {
+        state.confirmResolve(false);
+        state.confirmResolve = null;
+      }
+    }
+  });
+
+  /* ============================================ 视图切换 */
+
+  function showLogin(msg, isWarn) {
+    stopListTimer();
+    $('app-view').classList.add('hidden');
+    $('login-view').classList.remove('hidden');
+    if (msg) {
+      $('login-msg').textContent = msg;
+      $('login-msg').className = 'msg' + (isWarn ? ' warn' : '');
+    }
+  }
+
+  function showApp() {
+    $('login-view').classList.add('hidden');
+    $('app-view').classList.remove('hidden');
+    loadSessions(true);
+    startListTimer();
+    connectWs();
+    loadOptions();
+    if (window.innerWidth <= 720) {
+      $('sidebar').classList.add('collapsed');
+      $('expand-btn').classList.remove('hidden');
+    }
+  }
+
+  /* ============================================ 登录 */
+
+  $('login-form').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var input = $('key-input');
+    var key = input.value;
+    if (!key) { input.focus(); return; }
+
+    var btn = $('login-btn');
+    btn.disabled = true;
+    btn.textContent = '验证中…';
+
+    req('/api/login', { method: 'POST', body: JSON.stringify({ key: key }) })
+      .then(function (r) {
+        var d = r.data;
+        if (d.ok) {
+          input.value = '';
+          $('login-msg').textContent = '';
+          $('attempt-hint').textContent = '';
+          showApp();
+          syncMe();
+          return;
+        }
+        if (d.banned) {
+          showLogin(d.error || '此 IP 已被永久封禁');
+          $('attempt-hint').textContent = '尝试次数已用尽，该地址已被永久拒绝访问。';
+          btn.disabled = true;
+          btn.textContent = '已封禁';
+          return;
+        }
+        showLogin(d.error || '密钥错误');
+        if (typeof d.remaining === 'number') {
+          $('attempt-hint').textContent = '剩余尝试次数 ' + d.remaining + ' 次。用尽后此 IP 将被永久封禁。';
+        }
+        btn.disabled = false;
+        btn.textContent = '进入控制台';
+        input.select();
+      })
+      .catch(function () {
+        showLogin('网络异常，请稍后重试');
+        btn.disabled = false;
+        btn.textContent = '进入控制台';
+      });
+  });
+
+  /* ============================================ WebSocket */
+
+  function connectWs() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var sock = new WebSocket(proto + '//' + location.host + '/ws');
+    state.ws = sock;
+
+    sock.onopen = function () { if (state.ws === sock) setStatus(''); };
+
+    sock.onmessage = function (ev) {
+      if (state.ws !== sock) return;
+      var data;
+      try { data = JSON.parse(ev.data); } catch (e) { return; }
+      handleEvent(data);
+    };
+
+    sock.onclose = function () {
+      if (state.ws !== sock) return;
+      state.ws = null;
+      if (state.sending) {
+        setSending(false);
+        toast('连接已断开，请刷新页面', 'err');
+      }
+    };
+
+    sock.onerror = function () {};
+  }
+
+  function wsSend(obj) {
+    if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify(obj));
+      return true;
+    }
+    return false;
+  }
+
+  function handleEvent(d) {
+    switch (d.type) {
+      case 'ready':
+        break;
+
+      case 'accepted':
+        setStatus('已提交，模型正在处理…');
+        break;
+
+      case 'started':
+        ensureAssistant(d.messageId);
+        setStatus('模型正在处理…');
+        break;
+
+      case 'title':
+        if (d.title) $('chat-title').textContent = d.title;
+        break;
+
+      case 'delta':
+        appendDelta(d.messageId, d.text);
+        break;
+
+      case 'reasoning':
+        appendReasoning(d.messageId, d.text);
+        break;
+
+      case 'tool':
+        handleTool(d);
+        break;
+
+      case 'final':
+        applyFinalText(d.messageId, d.text);
+        break;
+
+      case 'turnEnd':
+        if (d.response) applyFinalText(d.messageId, d.response);
+        break;
+
+      case 'meta':
+        break;
+
+      case 'resumed':
+        setStatus('正在恢复输出…');
+        break;
+
+      case 'cancelling':
+        setStatus('正在停止…');
+        var sb = $('stop-btn');
+        if (sb) sb.disabled = true;
+        break;
+
+      case 'cancelled':
+        toast('已停止生成');
+        break;
+
+      case 'done':
+        finishTurn(d);
+        break;
+
+      case 'error':
+        setSending(false);
+        setStatus('');
+        toast(d.message || '出错了', 'err');
+        clearCursors();
+        break;
+    }
+  }
+
+  /* ============================================ 消息渲染 */
+
+  function clearMessages() {
+    var box = $('messages');
+    box.innerHTML = '';
+    state.messageMap.clear();
+    state.cur = null;
+  }
+
+  function hideWelcome() {
+    var w = $('welcome');
+    if (w && w.parentNode) w.parentNode.removeChild(w);
+  }
+
+  function showThinking() {
+    removeThinking();
+    hideWelcome();
+    var box = $('messages');
+    var row = document.createElement('div');
+    row.className = 'row';
+    row.id = 'thinking-row';
+    row.innerHTML =
+      '<div class="assistant"><div class="avatar">Z</div>' +
+      '<div class="assistant-body"><div class="thinking">' +
+      '<span>正在处理</span><span class="dots"><i></i><i></i><i></i></span>' +
+      '<span id="thinking-elapsed"></span></div></div></div>';
+    box.appendChild(row);
+    scrollToBottom(true);
+  }
+
+  function removeThinking() {
+    var row = $('thinking-row');
+    if (row && row.parentNode) row.parentNode.removeChild(row);
+  }
+
+  function ensureAssistant(messageId) {
+    var mid = messageId || 'live';
+    // 一轮对话只会有一个助手气泡。上游各事件带的 ID 字段并不统一：
+    //   model.streaming -> assistantMessageId
+    //   session.updated -> messageId
+    //   turn.completed  -> 没有 ID
+    // 若按 ID 严格比对，一条长回答会被渲染成两个（甚至三个）气泡。
+    // 因此只要本轮气泡还活着（state.cur 非空）就直接复用，顺便把真实 ID 补上。
+    if (state.cur) {
+      if (state.cur.mid === 'live' && mid !== 'live') state.cur.mid = mid;
+      return state.cur;
+    }
+    var entry = state.messageMap.get(mid);
+    if (entry) { state.cur = entry; return entry; }
+
+    removeThinking();
+    hideWelcome();
+
+    var box = $('messages');
+    var row = document.createElement('div');
+    row.className = 'row';
+    var wrap = document.createElement('div');
+    wrap.className = 'assistant';
+    var avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = 'Z';
+    var body = document.createElement('div');
+    body.className = 'assistant-body';
+    wrap.appendChild(avatar);
+    wrap.appendChild(body);
+    row.appendChild(wrap);
+    box.appendChild(row);
+
+    entry = { mid: mid, role: 'assistant', row: row, body: body, mdEl: null, raw: '' };
+    state.messageMap.set(mid, entry);
+    state.cur = entry;
+    scrollToBottom();
+    return entry;
+  }
+
+  function mdElOf(entry) {
+    if (!entry.mdEl || !entry.mdEl.parentNode) {
+      var el = document.createElement('div');
+      el.className = 'md';
+      entry.body.appendChild(el);
+      entry.mdEl = el;
+    }
+    return entry.mdEl;
+  }
+
+  function appendDelta(messageId, text) {
+    if (!text) return;
+    var entry = ensureAssistant(messageId);
+    entry.raw += text;
+    var el = mdElOf(entry);
+    el.dataset.raw = entry.raw;
+    el.innerHTML = mdParse(entry.raw) + '<span class="cursor-blink"></span>';
+    scrollToBottom();
+  }
+
+  function applyFinalText(messageId, text) {
+    if (!text) return;
+    var entry = ensureAssistant(messageId);
+    // 短回复上游不吐分片，整段文本只在 final / turnEnd 里出现一次；
+    // 这里做「对账」：和已流出的文本不一致就用权威文本整段替换。
+    if (text === entry.raw) return;
+    entry.raw = text;
+    var el = mdElOf(entry);
+    el.dataset.raw = text;
+    el.innerHTML = mdParse(text);
+    scrollToBottom();
+  }
+
+  function appendReasoning(messageId, text) {
+    if (!text) return;
+    var entry = ensureAssistant(messageId);
+    var last = entry.body.lastElementChild;
+    if (!last || !last.classList.contains('fold') || last.dataset.kind !== 'reason') {
+      var fold = document.createElement('details');
+      fold.className = 'fold';
+      fold.dataset.kind = 'reason';
+      var sum = document.createElement('summary');
+      sum.textContent = '思考过程';
+      var fb = document.createElement('div');
+      fb.className = 'fold-body';
+      fold.appendChild(sum);
+      fold.appendChild(fb);
+      entry.body.appendChild(fold);
+      entry.mdEl = null;
+      last = fold;
+    }
+    var body = last.querySelector('.fold-body');
+    body.textContent = (body.textContent || '') + text;
+    scrollToBottom();
+  }
+
+  function handleTool(d) {
+    var entry = ensureAssistant(d.messageId);
+    var id = d.toolCallId || 'tool';
+    var card = entry.body.querySelector('[data-tcid="' + id + '"]');
+    if (!card) {
+      card = document.createElement('div');
+      card.className = 'tool';
+      card.dataset.tcid = id;
+      card.innerHTML =
+        '<div class="tool-head"><span class="tool-name"></span>' +
+        '<span class="tool-desc"></span><span class="tool-status"></span></div>';
+      entry.body.appendChild(card);
+      entry.mdEl = null;
+    }
+    var nameEl = card.querySelector('.tool-name');
+    var descEl = card.querySelector('.tool-desc');
+    var statEl = card.querySelector('.tool-status');
+
+    if (d.toolName) nameEl.textContent = d.toolName;
+    if (d.input !== undefined && d.input !== null) {
+      descEl.textContent = describeTool(d.toolName, d.input);
+      var old = card.querySelector('.tool-body.in');
+      if (old) old.parentNode.removeChild(old);
+      var ib = document.createElement('div');
+      ib.className = 'tool-body in';
+      ib.textContent = formatToolInput(d.toolName, d.input);
+      card.appendChild(ib);
+    }
+    var label = {
+      call: '调用中', input_delta: '调用中', input_end: '调用中',
+      scheduled: '排队', started: '执行中', running: '执行中',
+      completed: '完成', result: '完成', failed: '失败', error: '失败',
+    }[d.state] || d.state || '';
+    statEl.textContent = label;
+    statEl.className = 'tool-status' +
+      (d.state === 'completed' || d.state === 'result' ? '' :
+        (d.state === 'failed' || d.state === 'error' ? ' error' : ' running'));
+
+    if (d.payload) {
+      var out = extractToolOutput(d.payload);
+      if (out) {
+        var ob = card.querySelector('.tool-body.out');
+        if (!ob) {
+          ob = document.createElement('div');
+          ob.className = 'tool-body out';
+          card.appendChild(ob);
+        }
+        ob.textContent = out.length > 4000 ? out.slice(0, 4000) + '\n…（输出过长已截断）' : out;
+      }
+    }
+    scrollToBottom();
+  }
+
+  function extractToolOutput(payload) {
+    var cands = [payload.output, payload.result, payload.text, payload.error];
+    for (var i = 0; i < cands.length; i++) {
+      if (typeof cands[i] === 'string' && cands[i]) return cands[i];
+      if (cands[i] && typeof cands[i] === 'object') {
+        try { return JSON.stringify(cands[i], null, 2); } catch (e) {}
+      }
+    }
+    return '';
+  }
+
+  function describeTool(tool, input) {
+    if (!input || typeof input !== 'object') return '';
+    if (input.description) return String(input.description);
+    if (input.command) return String(input.command);
+    if (input.filePath) return String(input.filePath);
+    if (input.path) return String(input.path);
+    if (input.pattern) return String(input.pattern);
+    if (input.query) return String(input.query);
+    if (input.skill) return String(input.skill);
+    var keys = Object.keys(input);
+    if (!keys.length) return '';
+    var v = input[keys[0]];
+    return typeof v === 'string' ? v : JSON.stringify(v);
+  }
+
+  function formatToolInput(tool, input) {
+    if (!input) return '';
+    if (typeof input === 'string') return input;
+    if (input.command) return '$ ' + input.command;
+    if (input.skill) return '技能：' + input.skill + (input.args ? '\n任务：' + input.args : '');
+    try { return JSON.stringify(input, null, 2); } catch (e) { return String(input); }
+  }
+
+  function appendUserMessage(text) {
+    hideWelcome();
+    var box = $('messages');
+    var row = document.createElement('div');
+    row.className = 'row user';
+    var bubble = document.createElement('div');
+    bubble.className = 'bubble-user';
+    bubble.textContent = text;
+    row.appendChild(bubble);
+    box.appendChild(row);
+    scrollToBottom(true);
+  }
+
+  function clearCursors() {
+    var cursors = document.querySelectorAll('.cursor-blink');
+    for (var i = 0; i < cursors.length; i++) {
+      if (cursors[i].parentNode) cursors[i].parentNode.removeChild(cursors[i]);
+    }
+  }
+
+  function finishTurn(d) {
+    clearCursors();
+    removeThinking();
+    setSending(false);
+    setStatus('');
+    if (state.cur && state.cur.raw) {
+      var el = state.cur.mdEl;
+      if (el) el.innerHTML = mdParse(state.cur.raw);
+    }
+    state.cur = null;
+    loadSessions(true).then(function () {
+      if (state.tab === 'active') renderActive();
+      var item = document.querySelector('.session-item[data-sid="' + state.sessionId + '"]');
+      if (item) {
+        var tEl = item.querySelector('.session-item-title');
+        if (tEl && tEl.textContent) $('chat-title').textContent = tEl.textContent;
+      } else {
+        setTimeout(function () { loadSessions(true); }, 2500);
+      }
+    });
+    if (d && d.usage && d.usage.totalTokens) {
+      $('chat-meta').textContent = '本轮 ' + d.usage.totalTokens + ' tokens';
+    }
+  }
+
+  /* ============================================ 状态与发送 */
+
+  function setSending(on) {
+    state.sending = on;
+    $('send-btn').disabled = on;
+    var stop = $('stop-btn');
+    if (stop) {
+      stop.classList.toggle('hidden', !on);
+      stop.disabled = false;
+      stop.textContent = '停止生成';
+    }
+    if (on) {
+      state.startedAt = Date.now();
+      clearInterval(state.statusTimer);
+      state.statusTimer = setInterval(function () {
+        var el = $('thinking-elapsed');
+        if (el) el.textContent = ' ' + Math.round((Date.now() - state.startedAt) / 1000) + 's';
+      }, 1000);
+      setStatus('已提交，模型正在处理…');
+    } else {
+      clearInterval(state.statusTimer);
+      state.statusTimer = null;
+    }
+  }
+
+  function setStatus(text) { $('status-text').textContent = text || ''; }
+
+  function currentModelValue() {
+    var v = $('model-select').value;
+    if (!v) return null;
+    var p = v.split('|');
+    return { providerId: p[0], modelId: p.slice(1).join('|') };
+  }
+
+  function send() {
+    var input = $('input');
+    var text = input.value.trim();
+    if (!text || state.sending) return;
+    if (!state.sessionId) {
+      toast('请先新建会话', 'err');
+      openNewChat();
+      return;
+    }
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+      toast('连接已断开，请刷新页面', 'err');
+      return;
+    }
+
+    appendUserMessage(text);
+    input.value = '';
+    input.style.height = 'auto';
+
+    setSending(true);
+    showThinking();
+
+    var ok = wsSend({
+      type: 'send',
+      sessionId: state.sessionId,
+      content: text,
+      mode: $('mode-select').value,
+      model: currentModelValue(),
+      thoughtLevel: $('thought-select').value || null,
+    });
+
+    if (!ok) {
+      setSending(false);
+      removeThinking();
+      toast('发送失败，请刷新页面', 'err');
+    }
+  }
+
+  $('send-btn').addEventListener('click', send);
+
+  $('stop-btn').addEventListener('click', function () {
+    if (!state.sending) return;
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    this.disabled = true;
+    this.textContent = '正在停止…';
+    wsSend({ type: 'cancel', sessionId: state.sessionId });
+  });
+
+  $('input').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      send();
+    }
+  });
+
+  $('input').addEventListener('input', function () {
+    this.style.height = 'auto';
+    this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+  });
+
+  /* ============================================ 模型 / 思考等级 / 模式 */
+
+  function loadOptions(force) {
+    var q = force ? '?refresh=1' : '';
+    return req('/api/options' + q).then(function (r) {
+      if (r.status === 401) { showLogin('登录已过期，请重新输入密钥'); return; }
+      if (!r.data.ok) { toast(r.data.error || '读取模型目录失败', 'err'); return; }
+      state.options = r.data;
+      renderModelSelects();
+      return r.data;
+    }).catch(function () {});
+  }
+
+  function renderModelSelects() {
+    var o = state.options;
+    if (!o) return;
+    var models = o.models || [];
+    var cur = o.currentModel || {};
+
+    var opts = models.map(function (m) {
+      var v = (m.providerId || '') + '|' + (m.modelId || '');
+      var sel = (m.providerId === cur.providerId && m.modelId === cur.modelId);
+      return '<option value="' + esc(v) + '"' + (sel ? ' selected' : '') + '>' +
+        esc(m.label || m.modelId) + (m.providerLabel ? ' · ' + esc(m.providerLabel) : '') +
+        '</option>';
+    }).join('');
+
+    var sel1 = $('model-select');
+    var keep1 = sel1.value;
+    sel1.innerHTML = opts || '<option value="">（没有可用模型）</option>';
+    if (keep1 && !sel1.value) sel1.value = keep1;
+
+    var sel2 = $('nc-model');
+    var keep2 = sel2.value;
+    sel2.innerHTML = opts || '<option value="">（没有可用模型）</option>';
+    if (keep2 && !sel2.value) sel2.value = keep2;
+
+    var levels = (o.thoughtLevel || {}).available || [];
+    var lvOpts = levels.map(function (l) {
+      var v = l.value || l;
+      return '<option value="' + esc(v) + '">' + esc(l.label || v) + '</option>';
+    }).join('');
+    if (!lvOpts) lvOpts = '<option value="">默认</option>';
+
+    ['thought-select', 'nc-thought'].forEach(function (id) {
+      var el = $(id);
+      var keep = el.value;
+      el.innerHTML = lvOpts;
+      var want = keep || (o.thoughtLevel || {}).current || '';
+      if (want) {
+        var found = false;
+        for (var i = 0; i < el.options.length; i++) {
+          if (el.options[i].value === want) { found = true; break; }
+        }
+        if (found) el.value = want;
+      }
+    });
+
+    var wm = $('welcome-model');
+    if (wm) {
+      var cm = models.filter(function (m) {
+        return m.providerId === cur.providerId && m.modelId === cur.modelId;
+      })[0];
+      wm.textContent = cm ? (cm.label || cm.modelId) : '—';
+    }
+  }
+
+  function renderModeSelects() {
+    var modes = state.modes || [];
+    var html = modes.map(function (m) {
+      return '<option value="' + esc(m.value) + '">' + esc(m.label) +
+        (m.short ? '（' + esc(m.short) + '）' : '') + '</option>';
+    }).join('');
+    if (!html) html = '<option value="build">构建</option>';
+
+    var s1 = $('mode-select');
+    var keep = s1.value;
+    s1.innerHTML = html;
+    if (keep) s1.value = keep;
+
+    var s2 = $('nc-mode');
+    s2.innerHTML = html;
+
+    var s3 = $('set-default-mode');
+    s3.innerHTML = html;
+
+    updateModeDesc();
+  }
+
+  function modeDesc(value) {
+    var modes = state.modes || [];
+    for (var i = 0; i < modes.length; i++) {
+      if (modes[i].value === value) return modes[i].desc || '';
+    }
+    return '';
+  }
+
+  function updateModeDesc() {
+    var v = $('mode-select').value;
+    $('mode-desc').textContent = modeDesc(v);
+    var w = $('welcome-mode');
+    if (w) {
+      var modes = state.modes || [];
+      var label = v;
+      for (var i = 0; i < modes.length; i++) {
+        if (modes[i].value === v) { label = modes[i].label; break; }
+      }
+      w.textContent = label;
+    }
+  }
+
+  $('mode-select').addEventListener('change', updateModeDesc);
+  $('nc-mode').addEventListener('change', function () {
+    $('nc-mode-desc').textContent = modeDesc(this.value);
+  });
+
+  /* ============================================ 会话列表 */
+
+  function startListTimer() {
+    stopListTimer();
+    state.listTimer = setInterval(function () {
+      if (!state.sending) loadSessions(true);
+    }, 20000);
+  }
+
+  function stopListTimer() {
+    if (state.listTimer) { clearInterval(state.listTimer); state.listTimer = null; }
+  }
+
+  function loadSessions(silent) {
+    var url = state.tab === 'archived' ? '/api/sessions?archived=1' : '/api/sessions';
+    return req(url).then(function (r) {
+      if (r.status === 401) { showLogin('登录已过期，请重新输入密钥'); return; }
+      if (r.status === 403) { showLogin(r.data.error || '此 IP 已被永久封禁'); return; }
+      if (!r.data.ok) {
+        if (!silent) toast(r.data.error || '获取会话列表失败', 'err');
+        return;
+      }
+      var list = r.data.sessions || [];
+      if (state.tab === 'archived') state.archived = list; else state.sessions = list;
+      renderSessions(list);
+    }).catch(function () {
+      if (!silent) toast('网络异常，无法获取会话列表', 'err');
+    });
+  }
+
+  function renderSessions(list) {
+    var box = $('session-list');
+    box.innerHTML = '';
+
+    if (!list.length) {
+      var empty = document.createElement('div');
+      empty.className = 'list-empty';
+      empty.innerHTML = state.tab === 'archived'
+        ? '没有归档的会话<br>在会话上点「⋯」可以归档'
+        : '还没有会话<br>点击「新建会话」开始';
+      box.appendChild(empty);
+      return;
+    }
+
+    list.forEach(function (s) {
+      var item = document.createElement('div');
+      item.className = 'session-item' + (s.id === state.sessionId ? ' active' : '');
+      item.dataset.sid = s.id;
+      item.title = s.title;
+
+      var main = document.createElement('div');
+      main.className = 'session-item-main';
+
+      var t = document.createElement('div');
+      t.className = 'session-item-title';
+      t.textContent = s.title || '(无标题)';
+      if (s.archived) {
+        var b = document.createElement('span');
+        b.className = 'badge-arch';
+        b.textContent = '已归档';
+        t.appendChild(b);
+      }
+
+      var sub = document.createElement('div');
+      sub.className = 'session-item-sub';
+      var when = s.archived ? relTime(s.archivedAt) : relTime(s.updated || s.created);
+      var wsName = (s.workspacePath || '').replace(/\/+$/, '').split('/').pop() || '';
+      sub.textContent = when + (wsName ? ' · ' + wsName : '') +
+        (s.status === 'running' ? ' · 执行中' : '');
+
+      main.appendChild(t);
+      main.appendChild(sub);
+      item.appendChild(main);
+
+      var more = document.createElement('button');
+      more.className = 'session-more';
+      more.type = 'button';
+      more.innerHTML = '&#8943;';
+      more.addEventListener('click', function (e) {
+        e.stopPropagation();
+        toggleSessionMenu(item, s);
+      });
+      item.appendChild(more);
+
+      item.addEventListener('click', function () { openSession(s.id); });
+      // 桌面端习惯：在左侧会话上右键直接打开同一套操作菜单。
+      // 不触发 openSession，避免用户只是想归档/删除时打断当前对话。
+      item.addEventListener('contextmenu', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        showSessionMenu(item, s);
+      });
+      box.appendChild(item);
+    });
+  }
+
+  function closeSessionMenus() {
+    var all = document.querySelectorAll('.session-menu');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].parentNode) all[i].parentNode.removeChild(all[i]);
+    }
+  }
+
+  function toggleSessionMenu(item, s) {
+    var exist = item.querySelector('.session-menu');
+    closeSessionMenus();
+    if (exist) return;
+    showSessionMenu(item, s);
+  }
+
+  function showSessionMenu(item, s) {
+    closeSessionMenus();
+    var menu = document.createElement('div');
+    menu.className = 'session-menu';
+    menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', '会话操作');
+
+    if (s.archived) {
+      addMenuItem(menu, '取消归档', function () { archiveSession(s.id, false); });
+      addMenuItem(menu, '彻底删除', function () { deleteSession(s.id); }, true);
+    } else {
+      addMenuItem(menu, '归档', function () { archiveSession(s.id, true); });
+      addMenuItem(menu, '彻底删除', function () { deleteSession(s.id); }, true);
+    }
+    item.appendChild(menu);
+  }
+
+  function addMenuItem(menu, label, fn, danger) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    if (danger) b.className = 'danger';
+    b.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (menu.parentNode) menu.parentNode.removeChild(menu);
+      fn();
+    });
+    menu.appendChild(b);
+  }
+
+  function archiveSession(sid, archived) {
+    var title = (state.sessions.concat(state.archived).filter(function (x) {
+      return x.id === sid;
+    })[0] || {}).title || sid;
+    var verb = archived ? '归档' : '取消归档';
+    var tip = archived
+      ? '归档后它会从会话列表移到「归档」里，随时可以取消归档。'
+      : '它会回到会话列表。';
+    confirmBox(verb + '会话', '确定要' + verb + '「' + title + '」吗？\n' + tip, verb)
+      .then(function (ok) {
+        if (!ok) return;
+        toast(verb + '中…');
+        req('/api/sessions/' + encodeURIComponent(sid) + '/archive', {
+          method: 'POST', body: JSON.stringify({ archived: archived }),
+        }).then(function (r) {
+          if (!r.data.ok) { toast(r.data.error || (verb + '失败'), 'err'); return; }
+          toast(verb + '成功', 'ok');
+          if (state.sessionId === sid && archived) newChat();
+          loadSessions(true);
+        }).catch(function () { toast('网络异常', 'err'); });
+      });
+  }
+
+  function deleteSession(sid) {
+    var title = (state.sessions.concat(state.archived).filter(function (x) {
+      return x.id === sid;
+    })[0] || {}).title || sid;
+    confirmBox('彻底删除会话',
+      '确定要彻底删除「' + title + '」吗？\n它的全部消息记录会从数据库里删掉，无法恢复。',
+      '彻底删除').then(function (ok) {
+      if (!ok) return;
+      req('/api/sessions/' + encodeURIComponent(sid), { method: 'DELETE' })
+        .then(function (r) {
+          if (!r.data.ok) { toast(r.data.error || '删除失败', 'err'); return; }
+          toast('已删除', 'ok');
+          if (state.sessionId === sid) newChat();
+          loadSessions(true);
+        }).catch(function () { toast('网络异常', 'err'); });
+    });
+  }
+
+  $('session-seg').addEventListener('click', function (e) {
+    var b = e.target.closest ? e.target.closest('.seg-btn') : null;
+    if (!b) return;
+    state.tab = b.dataset.tab;
+    var btns = this.querySelectorAll('.seg-btn');
+    for (var i = 0; i < btns.length; i++) btns[i].classList.toggle('active', btns[i] === b);
+    loadSessions(true);
+  });
+
+  function openSession(sid) {
+    if (state.sending) { toast('当前任务执行中，请稍候', 'err'); return; }
+    if (sid === state.sessionId) return;
+
+    state.sessionId = sid;
+    renderActive();
+
+    clearMessages();
+    $('chat-title').textContent = '加载中…';
+    $('chat-meta').textContent = '';
+
+    req('/api/sessions/' + encodeURIComponent(sid) + '/messages').then(function (r) {
+      if (!r.data.ok) {
+        toast(r.data.error || '加载对话失败', 'err');
+        $('chat-title').textContent = '会话';
+        return;
+      }
+      var msgs = r.data.messages || [];
+      msgs.forEach(function (m) { renderHistoryMessage(m); });
+      clearCursors();
+      scrollToBottom(true);
+
+      $('chat-title').textContent = r.data.title || '会话';
+      $('chat-meta').textContent = (r.data.workspacePath || '') + ' · ' + msgs.length + ' 条';
+
+      // 把会话自己的模式/模型同步到选择器
+      var s = state.sessions.filter(function (x) { return x.id === sid; })[0];
+      if (s) applySessionSettings(s);
+
+      if (r.data.live) {
+        setSending(true);
+        wsSend({ type: 'watch', sessionId: sid });
+      }
+      if (window.innerWidth <= 720) {
+        $('sidebar').classList.add('collapsed');
+        $('expand-btn').classList.remove('hidden');
+      }
+    });
+  }
+
+  function applySessionSettings(s) {
+    if (s.mode) {
+      $('mode-select').value = s.mode;
+      updateModeDesc();
+    }
+    var m = s.model;
+    if (m && m.providerId && m.modelId) {
+      var v = m.providerId + '|' + m.modelId;
+      var sel = $('model-select');
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === v) { sel.value = v; break; }
+      }
+    }
+  }
+
+  function renderHistoryMessage(m) {
+    if (m.role === 'user') {
+      var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
+        .map(function (p) { return p.text || ''; }).join('');
+      if (texts) appendUserMessage(texts);
+      return;
+    }
+    if (m.role !== 'assistant') return;
+
+    removeThinking();
+    hideWelcome();
+    var mid = m.id;
+    var box = $('messages');
+    var row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = '<div class="assistant"><div class="avatar">Z</div>' +
+      '<div class="assistant-body"></div></div>';
+    box.appendChild(row);
+    var entry = { mid: mid, role: 'assistant', row: row,
+                  body: row.querySelector('.assistant-body'), mdEl: null, raw: '' };
+    state.messageMap.set(mid, entry);
+
+    (m.parts || []).forEach(function (p) {
+      if (p.type === 'text' && p.text) {
+        var el = mdElOf(entry);
+        entry.raw += p.text;
+        el.dataset.raw = entry.raw;
+        el.innerHTML = mdParse(entry.raw);
+      } else if (p.type === 'reasoning' && p.text) {
+        var last = entry.body.lastElementChild;
+        if (!last || !last.classList.contains('fold') || last.dataset.kind !== 'reason') {
+          var fold = document.createElement('details');
+          fold.className = 'fold';
+          fold.dataset.kind = 'reason';
+          var sum = document.createElement('summary');
+          sum.textContent = '思考过程';
+          var fb = document.createElement('div');
+          fb.className = 'fold-body';
+          fold.appendChild(sum);
+          fold.appendChild(fb);
+          entry.body.appendChild(fold);
+          entry.mdEl = null;
+          last = fold;
+        }
+        var body = last.querySelector('.fold-body');
+        body.textContent = (body.textContent || '') + p.text;
+      } else if (p.type === 'tool') {
+        var st = p.state || {};
+        handleTool({
+          messageId: mid, toolCallId: p.callID || p.toolCallId,
+          toolName: p.tool, state: st.status || 'completed',
+          input: st.input, payload: { output: st.output, error: st.error },
+        });
+      }
+    });
+    if (m.error) {
+      var ed = document.createElement('div');
+      ed.className = 'tool';
+      ed.innerHTML = '<div class="tool-head"><span class="tool-name">错误</span>' +
+        '<span class="tool-status error">失败</span></div>' +
+        '<div class="tool-body out">' + esc(typeof m.error === 'string'
+          ? m.error : JSON.stringify(m.error)) + '</div>';
+      entry.body.appendChild(ed);
+    }
+  }
+
+  function renderActive() {
+    var items = document.querySelectorAll('.session-item');
+    for (var i = 0; i < items.length; i++) {
+      items[i].classList.toggle('active', items[i].dataset.sid === state.sessionId);
+    }
+  }
+
+  function welcomeHtml() {
+    return '<div id="welcome" class="welcome">' +
+      '<div class="welcome-mark">Z</div>' +
+      '<h2>开始一个新对话</h2>' +
+      '<p>点「新建会话」选择工作区与用途，或者在左侧挑一个已有会话接着聊。</p>' +
+      '<div class="welcome-hint">' +
+      '<span class="chip">模式 <b id="welcome-mode">构建</b></span>' +
+      '<span class="chip">模型 <b id="welcome-model">—</b></span>' +
+      '<span class="chip">工作区 <b id="welcome-ws">—</b></span>' +
+      '</div></div>';
+  }
+
+  function newChat() {
+    if (state.sending) { toast('当前任务执行中，请稍候', 'err'); return; }
+    state.sessionId = null;
+    clearMessages();
+    $('messages').innerHTML = welcomeHtml();
+    $('chat-title').textContent = '新会话';
+    $('chat-meta').textContent = '';
+    renderActive();
+    updateModeDesc();
+    renderModelSelects();
+    var ww = $('welcome-ws');
+    if (ww) ww.textContent = '/root';
+    $('input').focus();
+  }
+
+  /* ============================================ 新建会话 */
+
+  function openNewChat() {
+    if (state.sending) { toast('当前任务执行中，请稍候', 'err'); return; }
+    $('nc-new-ws-row').classList.add('hidden');
+    $('nc-ws-msg').textContent = '';
+    $('nc-ws-name').value = '';
+    $('nc-mode').value = $('mode-select').value || 'build';
+    $('nc-mode-desc').textContent = modeDesc($('nc-mode').value);
+    loadWorkspaces().then(function () { openModal('newchat-modal'); });
+  }
+
+  function loadWorkspaces() {
+    return req('/api/workspaces').then(function (r) {
+      if (!r.data.ok) return;
+      state.workspaces = r.data.workspaces || [];
+      var sel = $('nc-workspace');
+      sel.innerHTML = state.workspaces.map(function (w) {
+        return '<option value="' + esc(w.path) + '">' + esc(w.name) +
+          '　' + esc(w.path) + (w.sessions ? '（' + w.sessions + '）' : '') + '</option>';
+      }).join('') || '<option value="/root">/root</option>';
+      updateWsHint();
+      return state.workspaces;
+    });
+  }
+
+  function updateWsHint() {
+    var p = $('nc-workspace').value;
+    var w = state.workspaces.filter(function (x) { return x.path === p; })[0];
+    $('nc-ws-hint').textContent = w
+      ? '用途：' + (w.purpose === 'task' ? '任务' : '项目') +
+        '　已有 ' + (w.sessions || 0) + ' 个会话　路径：' + p
+      : p;
+    if (w && w.purpose) setPurpose(w.purpose);
+  }
+
+  function setPurpose(p) {
+    var cards = document.querySelectorAll('.purpose-card');
+    for (var i = 0; i < cards.length; i++) {
+      cards[i].classList.toggle('active', cards[i].dataset.purpose === p);
+    }
+  }
+
+  function currentPurpose() {
+    var a = document.querySelector('.purpose-card.active');
+    return a ? a.dataset.purpose : 'project';
+  }
+
+  $('nc-workspace').addEventListener('change', updateWsHint);
+
+  document.querySelectorAll('.purpose-card').forEach(function (c) {
+    c.addEventListener('click', function () { setPurpose(this.dataset.purpose); });
+  });
+
+  $('nc-new-ws').addEventListener('click', function () {
+    var row = $('nc-new-ws-row');
+    row.classList.toggle('hidden');
+    if (!row.classList.contains('hidden')) $('nc-ws-name').focus();
+  });
+
+  $('nc-ws-create').addEventListener('click', function () {
+    var name = $('nc-ws-name').value.trim();
+    if (!name) { $('nc-ws-msg').textContent = '请填写名称'; return; }
+    var btn = this;
+    btn.disabled = true;
+    req('/api/workspaces', {
+      method: 'POST',
+      body: JSON.stringify({ name: name, purpose: $('nc-ws-purpose').value }),
+    }).then(function (r) {
+      btn.disabled = false;
+      if (!r.data.ok) { $('nc-ws-msg').textContent = r.data.error || '创建失败'; return; }
+      $('nc-ws-msg').textContent = '已创建：' + (r.data.workspace || {}).path;
+      $('nc-ws-name').value = '';
+      loadWorkspaces().then(function () {
+        var p = (r.data.workspace || {}).path;
+        $('nc-workspace').value = p;
+        updateWsHint();
+        $('nc-ws-msg').textContent = '已创建：' + p;
+      });
+    }).catch(function () {
+      btn.disabled = false;
+      $('nc-ws-msg').textContent = '网络异常';
+    });
+  });
+
+  $('nc-create').addEventListener('click', function () {
+    var btn = this;
+    var wsPath = $('nc-workspace').value;
+    var mv = $('nc-model').value;
+    var model = mv ? { providerId: mv.split('|')[0], modelId: mv.split('|').slice(1).join('|') } : null;
+    btn.disabled = true;
+    btn.textContent = '创建中…';
+    req('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        workspacePath: wsPath,
+        purpose: currentPurpose(),
+        mode: $('nc-mode').value,
+        model: model,
+        thoughtLevel: $('nc-thought').value || null,
+      }),
+    }).then(function (r) {
+      btn.disabled = false;
+      btn.textContent = '创建并开始';
+      if (!r.data.ok) { toast(r.data.error || '新建会话失败', 'err'); return; }
+      closeModal('newchat-modal');
+      newChat();
+      state.sessionId = r.data.sessionId;
+      if (model) {
+        var v = model.providerId + '|' + model.modelId;
+        var sel = $('model-select');
+        for (var i = 0; i < sel.options.length; i++) {
+          if (sel.options[i].value === v) { sel.value = v; break; }
+        }
+      }
+      $('mode-select').value = $('nc-mode').value;
+      updateModeDesc();
+      $('thought-select').value = $('nc-thought').value || $('thought-select').value;
+      $('chat-title').textContent = '新会话';
+      $('chat-meta').textContent = wsPath;
+      var ww = $('welcome-ws');
+      if (ww) ww.textContent = wsPath;
+      loadSessions(true).then(renderActive);
+      $('input').focus();
+      toast('会话已创建，可以开始对话了', 'ok');
+    }).catch(function () {
+      btn.disabled = false;
+      btn.textContent = '创建并开始';
+      toast('网络异常', 'err');
+    });
+  });
+
+  /* ============================================ 设置：框架 */
+
+  $('settings-btn').addEventListener('click', function () {
+    openModal('settings-modal');
+    // 每次打开都回到「官方配置」栏，免得上次停在自定义栏造成误解
+    state.provScope = 'official';
+    document.querySelectorAll('#prov-seg .seg-btn').forEach(function (b) {
+      b.classList.toggle('active', b.dataset.scope === 'official');
+    });
+    loadSecurity();
+    loadProviders();
+  });
+
+  document.querySelectorAll('.nav-item').forEach(function (b) {
+    b.addEventListener('click', function () {
+      document.querySelectorAll('.nav-item').forEach(function (x) {
+        x.classList.toggle('active', x === b);
+      });
+      var pane = b.dataset.pane;
+      ['general', 'security', 'models'].forEach(function (p) {
+        $('pane-' + p).classList.toggle('hidden', p !== pane);
+      });
+    });
+  });
+
+  /* ============================================ 设置：通用 */
+
+  function loadSecurity() {
+    return req('/api/settings/security').then(function (r) {
+      if (!r.data.ok) return;
+      var d = r.data;
+      $('set-key-input').value = d.key || '';
+      $('set-key-input').type = 'password';
+      $('set-auto-approve').checked = !!d.autoApprove;
+      $('set-max-attempts').value = d.maxAttempts;
+      $('set-ws-root').textContent = d.workspaceRoot || '/root';
+      if (d.defaultMode) $('set-default-mode').value = d.defaultMode;
+      $('settings-note').textContent = '当前来源 IP：' + (d.ip || '—') +
+        (d.isDefault ? '（正在使用默认密钥）' : '');
+      renderPermissions(d.permissions || []);
+    }).catch(function () {});
+  }
+
+  function renderPermissions(list) {
+    var box = $('perm-list');
+    if (!list.length) {
+      box.innerHTML = '<div class="perm-empty">还没有工具放行记录。</div>';
+      return;
+    }
+    box.innerHTML = list.slice().reverse().map(function (p) {
+      var allow = p.decision === 'allow';
+      return '<div class="perm-row"><code>' + esc(p.toolName || '—') + '</code>' +
+        '<span class="' + (allow ? 'ok' : 'no') + '">' + (allow ? '已放行' : '已拒绝') + '</span>' +
+        '<span>' + esc(p.riskLevel || '') + '</span></div>';
+    }).join('');
+  }
+
+  $('set-general-save').addEventListener('click', function () {
+    var btn = this;
+    btn.disabled = true;
+    req('/api/settings/misc', {
+      method: 'POST',
+      body: JSON.stringify({
+        autoApprove: $('set-auto-approve').checked,
+        maxAttempts: parseInt($('set-max-attempts').value, 10) || 5,
+        defaultMode: $('set-default-mode').value,
+      }),
+    }).then(function (r) {
+      btn.disabled = false;
+      if (!r.data.ok) { toast(r.data.error || '保存失败', 'err'); return; }
+      toast('已保存', 'ok');
+      syncMe();
+    }).catch(function () { btn.disabled = false; toast('网络异常', 'err'); });
+  });
+
+  /* ============================================ 设置：登录安全 */
+
+  $('set-key-eye').addEventListener('click', function () {
+    var el = $('set-key-input');
+    el.type = el.type === 'password' ? 'text' : 'password';
+  });
+
+  $('set-key-save').addEventListener('click', function () {
+    var key = $('set-key-input').value.trim();
+    if (key.length < 6) { $('set-key-msg').textContent = '密钥至少 6 位'; return; }
+    var btn = this;
+    btn.disabled = true;
+    req('/api/settings/key', { method: 'POST', body: JSON.stringify({ key: key }) })
+      .then(function (r) {
+        btn.disabled = false;
+        if (!r.data.ok) { $('set-key-msg').textContent = r.data.error || '更新失败'; return; }
+        $('set-key-msg').textContent = '已更新。下次登录请用新密钥。';
+        toast('登录密钥已更新', 'ok');
+        loadSecurity();
+      }).catch(function () { btn.disabled = false; $('set-key-msg').textContent = '网络异常'; });
+  });
+
+  $('set-key-default').addEventListener('click', function () {
+    $('set-key-input').value = 'admin123';
+    $('set-key-input').type = 'text';
+    $('set-key-msg').textContent = '已填入默认密钥 admin123，点「更新密钥」生效。';
+  });
+
+  /* ============================================ 设置：模型配置 */
+
+  function loadProviders(reveal) {
+    return req('/api/settings/providers' + (reveal ? '?reveal=1' : ''))
+      .then(function (r) {
+        if (!r.data.ok) return;
+        state.providers = r.data.providers || [];
+        state.provSecret = r.data;
+        renderProviders();
+        $('prov-note').textContent = '配置文件：' + (r.data.configPath || '');
+        return r.data;
+      }).catch(function () {});
+  }
+
+  function renderProviders() {
+    var scope = state.provScope;
+    var list = state.providers.filter(function (p) { return p.scope === scope; });
+    var box = $('prov-list');
+    box.innerHTML = '';
+
+    if (!list.length) {
+      var e = document.createElement('div');
+      e.className = 'prov-empty';
+      e.innerHTML = scope === 'official'
+        ? '官方配置里还没有厂商。<br>用 zcode 官方账号登录后，z.ai / 智谱 等官方入口会出现在这里。'
+        : '还没有添加第三方厂商。<br>点右上角「+ 新增第三方厂商」开始。';
+      box.appendChild(e);
+      return;
+    }
+
+    list.forEach(function (p) {
+      var card = document.createElement('div');
+      card.className = 'prov-card';
+
+      var head = document.createElement('div');
+      head.className = 'prov-card-head';
+      head.innerHTML = '<span class="prov-card-name">' + esc(p.name) + '</span>' +
+        '<span class="prov-card-id">' + esc(p.providerId) + '</span>' +
+        '<span class="prov-tag">' + esc(p.kind === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容') + '</span>';
+      if ((p.models || []).some(function (m) { return m.isMain; })) {
+        var mt = document.createElement('span');
+        mt.className = 'prov-tag main';
+        mt.textContent = '默认模型';
+        head.appendChild(mt);
+      }
+      card.appendChild(head);
+
+      var sub = document.createElement('div');
+      sub.className = 'prov-card-sub';
+      sub.textContent = 'Base URL：' + (p.baseURL || '（未填）') +
+        '\nAPI Key：' + (p.hasApiKey ? (p.apiKeyMasked || '已配置') : '（未配置）');
+      sub.style.whiteSpace = 'pre-line';
+      card.appendChild(sub);
+
+      var ms = document.createElement('div');
+      ms.className = 'prov-models';
+      (p.models || []).forEach(function (m) {
+        var c = document.createElement('span');
+        c.className = 'prov-model-chip';
+        c.textContent = (m.name || m.modelId) + (m.isMain ? ' ★' : '');
+        ms.appendChild(c);
+      });
+      card.appendChild(ms);
+
+      card.addEventListener('click', function () { openProvider(p.providerId); });
+      box.appendChild(card);
+    });
+  }
+
+  $('prov-seg').addEventListener('click', function (e) {
+    var b = e.target.closest ? e.target.closest('.seg-btn') : null;
+    if (!b) return;
+    state.provScope = b.dataset.scope;
+    var btns = this.querySelectorAll('.seg-btn');
+    for (var i = 0; i < btns.length; i++) btns[i].classList.toggle('active', btns[i] === b);
+    renderProviders();
+  });
+
+  $('prov-add').addEventListener('click', function () { openProvider(null); });
+
+  function modelRow(m) {
+    var row = document.createElement('div');
+    row.className = 'model-row';
+    row.innerHTML =
+      '<input class="w-id" placeholder="模型 ID，如 z-ai/glm-5.3-flash">' +
+      '<input class="w-name" placeholder="显示名称">' +
+      '<input class="w-num" placeholder="上下文" type="number" min="1">' +
+      '<input class="w-num" placeholder="最大输出" type="number" min="1">' +
+      '<button class="icon-btn del" type="button" title="移除">&#10005;</button>';
+    row.querySelector('.w-id').value = m.modelId || '';
+    row.querySelector('.w-name').value = m.name || '';
+    row.querySelector('.w-num').value = m.context || '';
+    var nums = row.querySelectorAll('.w-num');
+    if (nums[1]) nums[1].value = m.output || '';
+    row.querySelector('.del').addEventListener('click', function () {
+      if (row.parentNode) row.parentNode.removeChild(row);
+    });
+    return row;
+  }
+
+  function openProvider(pid) {
+    state.editingProvider = pid;
+    $('pv-title').textContent = pid ? '编辑厂商' : '新增第三方厂商';
+    $('pv-delete').classList.toggle('hidden', !pid);
+    $('pv-models').innerHTML = '';
+    $('pv-key').type = 'password';
+    $('pv-id').disabled = !!pid;
+
+    if (!pid) {
+      $('pv-id').value = '';
+      $('pv-name').value = '';
+      $('pv-kind').value = 'openai-compatible';
+      $('pv-base').value = '';
+      $('pv-key').value = '';
+      $('pv-models').appendChild(modelRow({}));
+      openModal('provider-modal');
+      return;
+    }
+
+    // 编辑：先拉一次带明文密钥的列表
+    req('/api/settings/providers?reveal=1').then(function (r) {
+      var p = (r.data.providers || []).filter(function (x) {
+        return x.providerId === pid;
+      })[0];
+      if (!p) { toast('厂商不存在', 'err'); return; }
+      $('pv-id').value = p.providerId;
+      $('pv-name').value = p.name || '';
+      $('pv-kind').value = p.kind || 'openai-compatible';
+      $('pv-base').value = p.baseURL || '';
+      $('pv-key').value = p.apiKey || '';
+      (p.models || []).forEach(function (m) {
+        $('pv-models').appendChild(modelRow(m));
+      });
+      if (!(p.models || []).length) $('pv-models').appendChild(modelRow({}));
+      openModal('provider-modal');
+    });
+  }
+
+  $('pv-key-eye').addEventListener('click', function () {
+    var el = $('pv-key');
+    el.type = el.type === 'password' ? 'text' : 'password';
+  });
+
+  $('pv-add-model').addEventListener('click', function () {
+    $('pv-models').appendChild(modelRow({}));
+  });
+
+  $('pv-save').addEventListener('click', function () {
+    var pid = $('pv-id').value.trim();
+    var base = $('pv-base').value.trim();
+    if (!pid) { toast('请填写厂商 ID', 'err'); return; }
+    if (!/^[A-Za-z0-9_\-]{1,40}$/.test(pid)) {
+      toast('厂商 ID 只能用字母数字下划线横线（1-40 位）', 'err');
+      return;
+    }
+    if (!base) { toast('请填写 Base URL', 'err'); return; }
+
+    var models = [];
+    var rows = $('pv-models').querySelectorAll('.model-row');
+    for (var i = 0; i < rows.length; i++) {
+      var id = rows[i].querySelector('.w-id').value.trim();
+      if (!id) continue;
+      var nums = rows[i].querySelectorAll('.w-num');
+      models.push({
+        modelId: id,
+        name: rows[i].querySelector('.w-name').value.trim() || id,
+        context: nums[0] ? nums[0].value : '',
+        output: nums[1] ? nums[1].value : '',
+      });
+    }
+    if (!models.length) { toast('至少填一个模型', 'err'); return; }
+
+    var payload = {
+      providerId: pid,
+      name: $('pv-name').value.trim() || pid,
+      kind: $('pv-kind').value,
+      baseURL: base,
+      models: models,
+    };
+    var key = $('pv-key').value;
+    if (key) payload.apiKey = key;
+
+    var btn = this;
+    btn.disabled = true;
+    btn.textContent = '保存中…';
+    req('/api/settings/providers', { method: 'POST', body: JSON.stringify(payload) })
+      .then(function (r) {
+        btn.disabled = false;
+        btn.textContent = '保存';
+        if (!r.data.ok) { toast(r.data.error || '保存失败', 'err'); return; }
+        toast('已保存，正在重载 zcode 配置…', 'ok');
+        closeModal('provider-modal');
+        setTimeout(function () {
+          loadProviders();
+          loadOptions(true);
+        }, 1200);
+      }).catch(function () {
+        btn.disabled = false;
+        btn.textContent = '保存';
+        toast('网络异常', 'err');
+      });
+  });
+
+  $('pv-delete').addEventListener('click', function () {
+    var pid = state.editingProvider;
+    if (!pid) return;
+    confirmBox('删除厂商', '确定要删除厂商「' + pid + '」吗？它下面的模型也会一起移除。', '删除')
+      .then(function (ok) {
+        if (!ok) return;
+        req('/api/settings/providers/' + encodeURIComponent(pid), { method: 'DELETE' })
+          .then(function (r) {
+            if (!r.data.ok) { toast(r.data.error || '删除失败', 'err'); return; }
+            toast('已删除', 'ok');
+            closeModal('provider-modal');
+            setTimeout(function () {
+              loadProviders();
+              loadOptions(true);
+            }, 1200);
+          }).catch(function () { toast('网络异常', 'err'); });
+      });
+  });
+
+  /* ============================================ 侧栏 / 顶栏交互 */
+
+  $('new-chat-btn').addEventListener('click', openNewChat);
+  $('refresh-btn').addEventListener('click', function () { loadSessions(false); });
+
+  $('collapse-btn').addEventListener('click', function () {
+    $('sidebar').classList.add('collapsed');
+    $('expand-btn').classList.remove('hidden');
+  });
+
+  $('expand-btn').addEventListener('click', function () {
+    $('sidebar').classList.remove('collapsed');
+    $('expand-btn').classList.add('hidden');
+  });
+
+  $('logout-btn').addEventListener('click', function () {
+    req('/api/logout', { method: 'POST' }).then(function () {
+      if (state.ws) { try { state.ws.close(); } catch (e) {} state.ws = null; }
+      state.sessionId = null;
+      clearMessages();
+      showLogin();
+      $('key-input').value = '';
+      $('key-input').focus();
+    });
+  });
+
+  /* ============================================ 启动 */
+
+  function applyMe(d) {
+    if (!d) return;
+    if (d.ip) $('foot-info').textContent = d.ip;
+    if (d.modes && d.modes.length) state.modes = d.modes;
+    renderModeSelects();
+    if (d.defaultMode) {
+      $('mode-select').value = d.defaultMode;
+      $('set-default-mode').value = d.defaultMode;
+      updateModeDesc();
+    }
+  }
+
+  function syncMe() {
+    return req('/api/me').then(function (r) {
+      if (r.data && r.data.ok) applyMe(r.data);
+      return r.data;
+    });
+  }
+
+  req('/api/me').then(function (r) {
+    if (r.data && r.data.ok) {
+      applyMe(r.data);
+      showApp();
+    } else if (r.data && r.data.banned) {
+      showLogin(r.data.error || '此 IP 已被永久封禁');
+      $('login-btn').disabled = true;
+      $('login-btn').textContent = '已封禁';
+    } else {
+      $('key-input').focus();
+    }
+  }).catch(function () {
+    $('key-input').focus();
+  });
+
+})();

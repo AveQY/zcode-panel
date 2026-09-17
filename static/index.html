@@ -6,7 +6,7 @@
 <meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="referrer" content="no-referrer">
 <title>ZCode 对话控制台</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=20260917b">
 </head>
 <body>
 
@@ -519,6 +519,30 @@
       </div>
 
       <div class="form-row">
+        <div class="row-inline">
+          <span class="form-hint grow" id="pv-base-hint">
+            地址要和接口类型匹配：<b>OpenAI 兼容</b>填到 <code>…/v1</code>（智谱是
+            <code>/api/paas/v4</code>），<b>Anthropic</b> 填到 <code>…/api/anthropic</code>。
+            填错会报 404，不用猜 —— 点右边按钮拉一下列表就知道对不对。
+          </span>
+          <button class="ghost-btn slim" id="pv-fetch" type="button">获取模型列表</button>
+        </div>
+      </div>
+
+      <div class="form-row hidden" id="pv-fetched-wrap">
+        <label class="form-label">
+          端点返回的可用模型（勾选后加入下面的模型列表）
+          <span class="form-hint-inline" id="pv-fetched-note"></span>
+        </label>
+        <div id="pv-fetched" class="fetched-list"></div>
+        <div class="row-inline">
+          <button class="ghost-btn" id="pv-fetched-add" type="button">加入选中的模型</button>
+          <button class="ghost-btn" id="pv-fetched-all" type="button">全选 / 全不选</button>
+          <button class="ghost-btn" id="pv-fetched-close" type="button">收起</button>
+        </div>
+      </div>
+
+      <div class="form-row">
         <label class="form-label" for="pv-key">API Key</label>
         <div class="row-inline">
           <input id="pv-key" type="password" class="grow" autocomplete="off"
@@ -526,11 +550,14 @@
           <button class="icon-btn eye" id="pv-key-eye" type="button"
                   title="显示 / 隐藏">&#128065;</button>
         </div>
-        <div class="form-hint">默认遮蔽，点右侧眼睛可查看明文。</div>
+        <div class="form-hint">默认遮蔽，点右侧眼睛可查看明文。没填则沿用已保存的密钥。</div>
       </div>
 
       <div class="form-row">
-        <label class="form-label">模型列表</label>
+        <label class="form-label">
+          模型列表
+          <span class="form-hint-inline">每个模型都有「测试」按钮：真发一条最小请求验证能不能通</span>
+        </label>
         <div id="pv-models" class="model-rows"></div>
         <button id="pv-add-model" class="ghost-btn" type="button">+ 添加模型</button>
       </div>
@@ -564,6 +591,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20260917b"></script>
 </body>
 </html>

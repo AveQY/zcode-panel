@@ -95,6 +95,16 @@ TURN_IDLE_STATES = ("idle", "completed", "done", "stopped", "cancelled",
                     "canceled", "closed", "archived", "error", "failed")
 MAX_MESSAGE_CHARS = 20000
 
+# ---- 厂商连通性探测 --------------------------------------------------------
+# 「添加模型时先测一下」和「从端点拉可用模型列表」都走这里。
+# 关键坑：**不能只看 HTTP 状态码**。智谱这类厂商会把错误塞在 200 的响应体里
+# （例如 {"code":500,"msg":"404 NOT_FOUND"}），只看状态码就会把失败当成功。
+PROBE_TIMEOUT = 30             # 首次探测超时（跨境链路慢，给足）
+PROBE_RETRY_TIMEOUT = 12       # 后续候选地址快速失败，别让「测试」按钮转一分钟
+PROBE_MAX_TRIES = 4            # 最多试几个候选地址
+PROBE_MAX_MODELS = 300         # 拉模型列表时最多返回多少个
+PROBE_BODY_MAX = 4000          # 回显给前端的响应体上限
+
 # ---- 模型定时 --------------------------------------------------------------
 # 定时切换**不动 zcode 的全局配置，也不重启 app-server**（重启会掐断所有在跑的会话）。
 # 只做两件事：对活着的会话调 session/setModel；把定时模型作为「覆盖项」记在内存里，
@@ -1248,9 +1258,26 @@ class TurnManager:
         # app-server 早就把它卸掉了，也会被误判成「还激活」。闲置会话再发消息
         # 就会直接报 Session is not active。
         self.active = set()
+        # 用户改会话设置时，如果会话正在跑（不能打断），就先把改动记在这里，
+        # 等这一轮结束、下一次发消息时由 apply_settings 落下去。
+        self.pending_settings = {}   # session_id -> {"mode","model","thoughtLevel"}
 
     def is_running(self, session_id):
         return session_id in self.running
+
+    def pending_of(self, session_id):
+        return self.pending_settings.get(session_id) or {}
+
+    def remember_pending(self, session_id, mode=None, model=None, thought_level=None):
+        """记下「这轮跑完再生效」的设置。不打断正在执行的轮次。"""
+        p = self.pending_settings.setdefault(session_id, {})
+        if mode:
+            p["mode"] = mode
+        if model:
+            p["model"] = model
+        if thought_level:
+            p["thoughtLevel"] = thought_level
+        return p
 
     async def apply_settings(self, session_id, mode=None, model=None, thought_level=None,
                              force=False):
@@ -1258,7 +1285,17 @@ class TurnManager:
 
         force=False 时会被「模型定时」的覆盖项劫持 —— 定时生效期间，无论前端选了
         什么模型，所有会话都必须用定时指定的那个。调度器自己下发时传 force=True。
+
+        执行中改过的设置攒在 pending_settings 里，这里统一取出落地（显式传入的优先），
+        所以「跑着的时候换了模型」下一轮一定会用上，不会因为 desired 已记账而被跳过。
         """
+        pen = self.pending_settings.pop(session_id, None) or {}
+        if not mode:
+            mode = pen.get("mode")
+        if not model:
+            model = pen.get("model")
+        if not thought_level:
+            thought_level = pen.get("thoughtLevel")
         want = self.desired.get(session_id) or {}
         eff_model = model
         if not force and scheduler is not None:
@@ -2251,6 +2288,412 @@ def build_provider_entry(data, existing=None):
     return entry
 
 
+# ---------------------------------------------------------------- 厂商连通性探测
+#
+# 用户最常见的两种错配：
+#   ① kind=openai-compatible 却把 Base URL 填成 Anthropic 端点（或反之）→ 路径 404
+#   ② 模型 ID 抄错（大小写/后缀）→ 厂商说「模型不存在」
+# 两者都表现为「加完模型一发消息就报错」，且报错文本厂商各写各的，很难看懂。
+# 所以这里主动把两者都试出来：路径按候选表依次打，命中就用它，
+# 并把「应该把 Base URL 改成哪个」直接告诉用户。
+
+def _norm_base(url):
+    return str(url or "").strip().rstrip("/")
+
+
+# 常见厂商的官方地址。用途：当用户填的 Base URL 打不通时，用它去试「正确地址」，
+# 通不通都是事实，试不出来也没损失 —— 所以这里只收录确定无疑的几条。
+VENDOR_BASES = {
+    "open.bigmodel.cn": {"anthropic": "/api/anthropic",
+                         "openai-compatible": "/api/paas/v4"},
+    "api.moonshot.cn": {"openai-compatible": "/v1"},
+    "api.deepseek.com": {"openai-compatible": "/v1"},
+    "dashscope.aliyuncs.com": {"openai-compatible": "/compatible-mode/v1"},
+    "openrouter.ai": {"openai-compatible": "/api/v1"},
+}
+
+
+def probe_host(base):
+    try:
+        parts = str(base).split("//", 1)
+        return parts[1].split("/", 1)[0].split(":")[0].lower()
+    except Exception:
+        return ""
+
+
+def probe_origin(base):
+    try:
+        parts = str(base).split("//", 1)
+        return parts[0] + "//" + parts[1].split("/", 1)[0]
+    except Exception:
+        return ""
+
+
+def protocol_paths(kind, base):
+    """该接口类型下，Base URL 后面该接的路径（按可能性排序）。"""
+    b = _norm_base(base)
+    if kind == "anthropic":
+        first = "/messages" if b.endswith("/v1") else "/v1/messages"
+        return [first, "/v1/messages" if first == "/messages" else "/messages"]
+    return ["/chat/completions", "/v1/chat/completions"]
+
+
+def chat_path(kind, base):
+    return _norm_base(base) + protocol_paths(kind, base)[0]
+
+
+def probe_candidates(kind, base):
+    """按优先级给出要尝试的对话 URL。第一个是「按当前配置应该走的路径」。
+
+    后面的候选用来兜底两类常见错误：Base URL 路径写错（已知厂商地址）、
+    接口类型选错（OpenAI 兼容 / Anthropic 互串）。命中哪个就等于告诉用户该改什么。
+    """
+    b = _norm_base(base)
+    if not b:
+        return []
+    other = "anthropic" if kind != "anthropic" else "openai-compatible"
+    origin, host = probe_origin(b), probe_host(b)
+    alias = VENDOR_BASES.get(host) or {}
+    out = [b + protocol_paths(kind, b)[0]]
+    if alias.get(kind):
+        out.append(chat_path(kind, origin + alias[kind]))
+    out.append(b + protocol_paths(kind, b)[1])
+    if alias.get(other):
+        out.append(chat_path(other, origin + alias[other]))
+    out.append(b + protocol_paths(other, b)[0])
+    seen, uniq = set(), []
+    for u in out:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+    return uniq
+
+
+def probe_base_from_models(url):
+    """从「模型列表」的 URL 反推 Base URL。
+
+    只剥 `/models`，**不要动 `/v1`** —— 对 OpenAI 兼容端点来说 `/v1` 属于 Base URL
+    （`https://api.x/v1` + `/chat/completions`），多剥一层就会给出错的建议。
+    """
+    u = _norm_base(url)
+    if u.endswith("/models"):
+        return u[: -len("/models")]
+    return u
+
+
+def probe_base_for(kind, url):
+    """从实际命中的 URL 反推 Base URL（用于「一键修正」）。"""
+    u = _norm_base(url)
+    if kind == "anthropic":
+        for tail in ("/v1/messages", "/messages"):
+            if u.endswith(tail):
+                return u[: -len(tail)]
+        return u
+    for tail in ("/v1/chat/completions", "/chat/completions"):
+        if u.endswith(tail):
+            return u[: -len(tail)] or u
+    return u
+
+
+PROBE_ERR_HINTS = [
+    (("404 not_found", "not found", "no such", "不存在的请求"),
+     "接口路径不对：这个 Base URL 上不存在该接口。"
+     "OpenAI 兼容类型要填到 …/v1（例如 https://open.bigmodel.cn/api/paas/v4），"
+     "Anthropic 类型要填到 …/api/anthropic。"),
+    (("令牌", "unauthorized", "invalid api key", "authentication", "401", "403"),
+     "API Key 不对或已失效，检查是否复制完整、有没有多余空格。"),
+    (("余额", "资源包", "insufficient", "quota", "billing", "欠费", "1113"),
+     "账号余额不足或没有可用资源包 —— Key 是好的，需要到厂商后台充值/购买资源包。"),
+    (("rate limit", "too many", "限流", "429"),
+     "被厂商限流了，稍等一会再试。"),
+    (("model", "模型"),
+     "厂商不认这个模型 ID。点「获取模型列表」看它实际支持哪些，别手抄。"),
+]
+
+
+def probe_hint(msg, status=0):
+    text = ("%s %s" % (status or "", msg or "")).lower()
+    for keys, hint in PROBE_ERR_HINTS:
+        for k in keys:
+            if k in text:
+                return hint
+    return ""
+
+
+def _probe_pick_text(kind, j):
+    """从成功响应里抠出一小段模型回复，用来证明「真的通了」。"""
+    try:
+        if kind == "anthropic":
+            for part in (j.get("content") or []):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    return str(part.get("text") or "")[:200]
+            return ""
+        msg = ((j.get("choices") or [{}])[0] or {}).get("message") or {}
+        c = msg.get("content")
+        if isinstance(c, list):      # 有些网关返回 [{type:text,text:...}]
+            return "".join(str(x.get("text") or "") for x in c if isinstance(x, dict))[:200]
+        return str(c or "")[:200]
+    except Exception:
+        return ""
+
+
+def probe_verdict(kind, status, text):
+    """判定探测结果。返回 (ok, detail, category)。
+
+    ⚠️ 先看响应体再看状态码：智谱把错误塞在 HTTP 200 里，只信状态码会误判成功。
+    """
+    body = (text or "").strip()
+    try:
+        j = json.loads(body)
+    except Exception:
+        j = None
+
+    if isinstance(j, dict):
+        # 1) 厂商自定义的 {code, msg, success} 包裹
+        code = j.get("code")
+        if j.get("success") is False or (code not in (None, 0, "0")):
+            raw = str(j.get("msg") or j.get("message") or "")
+            if code not in (None, 0, "0"):
+                raw = ("[%s] %s" % (code, raw)).strip()
+            return False, raw or "厂商返回失败", "provider_business"
+        # 2) OpenAI / Anthropic 标准错误体
+        err = j.get("error")
+        if isinstance(err, dict) and err:
+            raw = str(err.get("message") or err.get("code") or "")
+            return False, raw or "厂商返回错误", "provider_business"
+        if isinstance(err, str) and err:
+            return False, err, "provider_business"
+        # 3) 成功判据
+        if kind == "anthropic":
+            if j.get("content") or j.get("type") == "message":
+                return True, _probe_pick_text(kind, j), "ok"
+        elif j.get("choices") is not None:
+            return True, _probe_pick_text(kind, j), "ok"
+        if j.get("data") and isinstance(j.get("data"), list) and kind != "anthropic":
+            return True, body[:200], "ok"
+
+    if status and 200 <= status < 300:
+        # 2xx 但不是能识别的结构：能连上、能鉴权，按「通」算，把原文回显让用户判断
+        return True, body[:200], "ok"
+    return False, body[:300] or ("HTTP %s" % status), "http_%s" % status
+
+
+async def probe_http(url, body=None, headers=None, timeout=None):
+    """发一个探测请求。返回 dict(status/ok/text/error/url)。"""
+    import aiohttp
+    if not re.match(r"^https?://", url or "", re.I):
+        return {"ok": False, "status": 0, "url": url,
+                "error": "Base URL 必须以 http:// 或 https:// 开头"}
+    to = aiohttp.ClientTimeout(total=timeout or PROBE_TIMEOUT)
+    t0 = time.time()
+    try:
+        # trust_env=True：机房若配了 HTTP_PROXY 也能透传（本机当前没配）
+        async with aiohttp.ClientSession(timeout=to, trust_env=True) as sess:
+            async with sess.request("POST" if body is not None else "GET", url,
+                                    json=body, headers=headers) as resp:
+                raw = await resp.text()
+                return {"ok": True, "status": resp.status, "text": raw[:PROBE_BODY_MAX],
+                        "url": url, "latencyMs": int((time.time() - t0) * 1000)}
+    except asyncio.TimeoutError:
+        return {"ok": False, "status": 0, "url": url, "timeout": True,
+                "latencyMs": int((time.time() - t0) * 1000),
+                "error": "请求超时（%d 秒）—— 网络到不了这个地址" % (timeout or PROBE_TIMEOUT)}
+    except Exception as exc:
+        return {"ok": False, "status": 0, "url": url,
+                "latencyMs": int((time.time() - t0) * 1000),
+                "error": "%s: %s" % (type(exc).__name__, exc)}
+
+
+def probe_headers(kind, api_key, extra=None):
+    h = {"Content-Type": "application/json"}
+    for k, v in (extra or {}).items():
+        h[str(k)] = str(v)
+    if api_key:
+        if kind == "anthropic":
+            # 智谱的 anthropic 端点只认 Authorization（实测），Anthropic 官方认 x-api-key，
+            # 两个都带上，谁认哪个都行。
+            h["x-api-key"] = api_key
+            h["Authorization"] = "Bearer " + api_key
+            h.setdefault("anthropic-version", "2023-06-01")
+        else:
+            h["Authorization"] = "Bearer " + api_key
+    return h
+
+
+def probe_body(kind, model_id):
+    if kind == "anthropic":
+        return {"model": model_id, "max_tokens": 16,
+                "messages": [{"role": "user", "content": "只回复两个字：收到"}]}
+    return {"model": model_id, "max_tokens": 16, "stream": False,
+            "messages": [{"role": "user", "content": "只回复两个字：收到"}]}
+
+
+def resolve_probe_conf(data):
+    """把请求体 + 已存配置合成为一份探测用的配置。
+
+    前端不必为了让「测试」按钮能跑而反复粘贴 Key：不传 apiKey 就用已存的。
+    """
+    kind = data.get("kind") or "openai-compatible"
+    if kind not in ("openai-compatible", "anthropic"):
+        kind = "openai-compatible"
+    base = _norm_base(data.get("baseURL"))
+    key = str(data.get("apiKey") or "").strip()
+    headers = data.get("headers") if isinstance(data.get("headers"), dict) else None
+    pid = str(data.get("providerId") or "").strip()
+    if pid and PROVIDER_ID_RE.match(pid):
+        p = (read_zcode_config().get("provider") or {}).get(pid) or {}
+        opts = p.get("options") or {}
+        if not base:
+            base = _norm_base(opts.get("baseURL"))
+        if not key:
+            key = opts.get("apiKey") or ""
+        if headers is None:
+            headers = p.get("headers") or {}
+        if not data.get("kind") and p.get("kind"):
+            kind = p["kind"]
+    return {"kind": kind, "baseURL": base, "apiKey": key, "headers": headers or {}}
+
+
+async def probe_chat(kind, base, key, model_id, headers=None):
+    """打一次最小对话请求。返回：通不通、走的是哪个 URL、以及「该把 Base URL 改成什么」。
+
+    结论分三层，因为用户的坑常常是叠着的：
+      ① 路径不通（404）→ 直接告诉他要改成哪个 Base URL
+      ② 路径通但厂商报别的错（Key 不对 / 余额不足 / 模型名不对）→ 先把路径结论给出，
+         再附上厂商原话与归类建议，避免他改完路径又卡在第二层
+      ③ 全通 → 回一小段模型回复作为证据
+    """
+    if not base:
+        return {"ok": False, "error": "还没填 Base URL", "hint": "Base URL 必填"}
+    if not model_id:
+        return {"ok": False, "error": "还没填模型 ID",
+                "hint": "先填模型 ID，或点「获取模型列表」按厂商实际支持的名字选"}
+    h = probe_headers(kind, key, headers)
+    body = probe_body(kind, model_id)
+    cands = probe_candidates(kind, base)[:PROBE_MAX_TRIES]
+    tried, best = [], None
+    for i, url in enumerate(cands):
+        # 首次探测给足时间（跨境链路慢），后续候选快速失败，别让「测试」按钮转一分钟
+        to = PROBE_TIMEOUT if i == 0 else PROBE_RETRY_TIMEOUT
+        r = await probe_http(url, body=body, headers=h, timeout=to)
+        if not r.get("ok"):
+            tried.append({"url": url, "status": 0, "error": (r.get("error") or "")[:160]})
+            best = {"url": url, "status": 0, "error": r.get("error"),
+                    "timeout": bool(r.get("timeout")), "category": "network",
+                    "hint": probe_hint(r.get("error") or "", 0), "path404": False}
+            continue    # 网络层没到：换下一个地址也许能通
+        ok, detail, cat = probe_verdict(kind, r.get("status"), r.get("text"))
+        tried.append({"url": url, "status": r.get("status"), "ok": ok,
+                      "detail": (detail or "")[:160]})
+        if ok:
+            good = probe_base_for(kind, url)
+            out = {"ok": True, "url": url, "status": r.get("status"),
+                   "latencyMs": r.get("latencyMs"), "reply": detail,
+                   "category": "ok", "tried": tried}
+            if _norm_base(good) != _norm_base(base):
+                out["suggestBaseURL"] = good
+                out["suggestKind"] = ("anthropic" if url.endswith("/messages")
+                                      else "openai-compatible")
+                out["hint"] = ("当前填的 Base URL 路径不对，改成 %s 就通了" % good)
+            return out
+        is_404 = ("404" in str(detail)) or ("not_found" in str(detail).lower()) \
+            or r.get("status") in (404, 405, 501)
+        best = {"url": url, "status": r.get("status"), "error": detail,
+                "category": cat, "latencyMs": r.get("latencyMs"),
+                "hint": probe_hint(detail, r.get("status")), "path404": is_404}
+        if not is_404:
+            break       # 路径是通的，问题在别处：再换路径没意义
+
+    out = dict(best or {"ok": False, "error": "探测失败"})
+    out["ok"] = False
+    out["tried"] = tried
+    used_base = probe_base_for(kind, out.get("url") or "")
+    if out.get("url") and _norm_base(used_base) != _norm_base(base):
+        out["suggestBaseURL"] = used_base
+        out["suggestKind"] = ("anthropic" if str(out["url"]).endswith("/messages")
+                              else "openai-compatible")
+        if not out.get("path404"):
+            # 用「另一个地址」能打到厂商 → 路径结论是确定的，剩下的是第二层问题
+            out["pathOk"] = True
+            out["hint"] = ("Base URL 应该填 %s（这个地址能打到厂商，你现在填的打不到）。"
+                           "换成它之后，剩下的问题才轮到：%s"
+                           % (used_base, out.get("hint") or out.get("error") or "未知"))
+        else:
+            out["hint"] = ("试过的地址全部返回 404：Base URL 路径写错了。"
+                           "OpenAI 兼容要填到 …/v1，Anthropic 要填到 …/api/anthropic。")
+    return out
+
+
+async def probe_model_list(kind, base, key, headers=None):
+    """从端点拉可用模型（GET {base}/models）。"""
+    if not base:
+        return {"ok": False, "error": "还没填 Base URL"}
+    h = dict(probe_headers(kind, key, headers))
+    h.pop("Content-Type", None)
+    b = _norm_base(base)
+    origin, host = probe_origin(b), probe_host(b)
+    alias = VENDOR_BASES.get(host) or {}
+    alias_bases = set(_norm_base(origin + p) for p in alias.values())
+    urls = [b + "/models"]
+    if not b.endswith("/v1"):
+        urls.append(b + "/v1/models")
+    for path in alias.values():          # 厂商自己的地址（两种协议都试，模型列表通常挂在 OpenAI 侧）
+        urls.append(_norm_base(origin + path) + "/models")
+    seen, uniq = set(), []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            uniq.append(u)
+
+    tried, last = [], None
+    for i, url in enumerate(uniq[:PROBE_MAX_TRIES]):
+        r = await probe_http(url, headers=h,
+                             timeout=PROBE_TIMEOUT if i == 0 else PROBE_RETRY_TIMEOUT)
+        if not r.get("ok"):
+            last = {"ok": False, "url": url, "status": 0, "error": r.get("error"),
+                    "hint": probe_hint(r.get("error") or "", 0)}
+            tried.append({"url": url, "error": (r.get("error") or "")[:160]})
+            continue
+        status, text = r.get("status"), r.get("text") or ""
+        try:
+            j = json.loads(text)
+        except Exception:
+            j = None
+        items = []
+        if isinstance(j, dict):
+            seq = j.get("data") if isinstance(j.get("data"), list) else None
+            if seq is None and isinstance(j.get("models"), list):
+                seq = j["models"]
+            if seq is None and isinstance(j.get("model"), list):
+                seq = j["model"]
+            for it in (seq or []):
+                if isinstance(it, str):
+                    items.append({"id": it, "name": it})
+                elif isinstance(it, dict):
+                    mid = it.get("id") or it.get("model") or it.get("name")
+                    if mid:
+                        items.append({"id": str(mid),
+                                      "name": str(it.get("name") or mid)})
+        if items:
+            out = {"ok": True, "url": url, "status": status, "count": len(items),
+                   "models": items[:PROBE_MAX_MODELS],
+                   "truncated": len(items) > PROBE_MAX_MODELS, "tried": tried}
+            good = probe_base_from_models(url)
+            first = tried[0] if tried else {}
+            # 只有「确实是另一个地址才行」时才建议改 Base URL，
+            # 免得把好的配置说成要改（例如 /v1 本来就是 Base URL 的一部分）。
+            if _norm_base(good) != b and (good in alias_bases
+                                          or first.get("status") in (0, 404, 405, 501)):
+                out["suggestBaseURL"] = good
+                out["hint"] = "模型列表是在 %s 上拿到的，Base URL 可能要改成它" % good
+            return out
+        last = {"ok": False, "url": url, "status": status,
+                "error": (text or "")[:300] or "响应里没有模型列表",
+                "hint": probe_hint(text or "", status)}
+        tried.append({"url": url, "status": status})
+    return last or {"ok": False, "error": "拉取失败", "tried": tried}
+
+
 # ---------------------------------------------------------------- 请求辅助
 
 def client_ip(request):
@@ -2849,6 +3292,10 @@ async def handle_sessions(request):
         sid = s.get("sessionId")
         ws = s.get("workspace") or {}
         running = runner.is_running(sid) if runner else False
+        # 每个会话各用各的模型：优先 app-server 报的，它还没报就退回面板记的
+        model = s.get("model") or ((runner.desired.get(sid) or {}).get("model")
+                                   if runner else None)
+        pending = (runner.pending_of(sid) or {}).get("model") if runner else None
         out.append({
             "id": sid,
             "title": s.get("title") or "(无标题)",
@@ -2858,7 +3305,8 @@ async def handle_sessions(request):
             "updated": s.get("updatedAt"),
             "status": "running" if running else (s.get("status") or "idle"),
             "mode": s.get("mode"),
-            "model": s.get("model"),
+            "model": model,
+            "pendingModel": pending,
             "kind": s.get("sessionKind") or "interactive",
             "archived": False,
         })
@@ -2995,16 +3443,34 @@ async def handle_session_delete(request):
     return web.json_response({"ok": True})
 
 
+def model_known(provider_id, model_id):
+    """模型是否在「选择器能看到的列表」里。provider 查不到时放行（registry 可能还没跟上）。"""
+    try:
+        found = False
+        for p in build_registry()["providers"]:
+            if p.get("providerId") != provider_id:
+                continue
+            found = True
+            for m in (p.get("models") or []):
+                if isinstance(m, dict) and m.get("modelId") == model_id:
+                    return True
+        return not found
+    except Exception:
+        return True
+
+
 async def handle_session_settings(request):
-    """改会话的模式 / 模型 / 思考等级。"""
+    """改**这个会话自己**的模式 / 模型 / 思考等级。
+
+    每个会话可以各用各的模型。关键约束：执行中不许打断 —— 所以如果它正在跑，
+    改动先记成「待生效」，这一轮照旧跑完，下一轮自动用新设置（不中断、不丢消息）。
+    """
     blocked = guard(request)
     if blocked:
         return blocked
     sid = request.match_info["sid"]
     if not SESSION_ID_RE.match(sid):
         return json_error("非法的会话 ID", 400)
-    if runner.is_running(sid):
-        return json_error("会话正在执行中，请稍候再改", 409)
     data = await body_json(request)
     mode = data.get("mode")
     model = data.get("model")
@@ -3013,12 +3479,43 @@ async def handle_session_settings(request):
         return json_error("非法模式")
     if isinstance(model, dict):
         model = {"providerId": model.get("providerId"), "modelId": model.get("modelId")}
+        if not (model.get("providerId") and model.get("modelId")):
+            model = None
+    if model and not model_known(model["providerId"], model["modelId"]):
+        return json_error("模型 %s/%s 不在配置里，请到「模型配置」里添加或先测试一下"
+                          % (model["providerId"], model["modelId"]))
+    if not any([mode, model, tl]):
+        return json_error("没有要修改的设置")
+
+    # 执行中：只记账，不打断
+    if runner.is_running(sid):
+        runner.remember_pending(sid, mode=mode, model=model, thought_level=tl)
+        log(f"会话 {sid} 正在执行，设置改动已登记（本轮跑完后生效）")
+        return web.json_response({
+            "ok": True, "applied": False, "pending": True,
+            "model": model, "mode": mode, "thoughtLevel": tl,
+            "notice": "该会话正在执行，改动已记下：这一轮跑完后自动生效，不会打断它",
+        })
+
+    err = None
+    applied = False
     try:
         await runner.resume(sid)
         await runner.apply_settings(sid, mode=mode, model=model, thought_level=tl)
+        applied = True
     except Exception as exc:
-        return json_error(f"设置失败: {exc}", 502)
-    return web.json_response({"ok": True})
+        err = str(exc)
+        log(f"会话 {sid} 设置下发失败（已登记待生效）: {exc}")
+
+    if not applied:
+        # app-server 此刻不接受（会话被卸掉 / 正好在忙）：记账，下一轮发消息时补上
+        runner.remember_pending(sid, mode=mode, model=model, thought_level=tl)
+        return web.json_response({
+            "ok": True, "applied": False, "pending": True, "model": model,
+            "notice": "已记下，下次发消息时自动生效（原因：%s）" % (err or "会话未激活"),
+        })
+    return web.json_response({"ok": True, "applied": True, "pending": False,
+                              "model": model, "mode": mode, "thoughtLevel": tl})
 
 
 # ---------------------------------------------------------------- 路由：设置
@@ -3257,6 +3754,45 @@ async def handle_active_model(request):
     await zc.restart("默认模型变更")
     log(f"默认模型设为 {full}")
     return json_response_ok(main=full)
+
+
+async def handle_provider_test(request):
+    """「测试」按钮：真发一次最小对话请求，把通/不通和原因说清楚。
+
+    注意这里**不改配置、不重启 app-server** —— 测完可以直接改 Base URL 再测，
+    不会打扰正在跑的会话。
+    """
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    data = await body_json(request)
+    conf = resolve_probe_conf(data)
+    res = await probe_chat(conf["kind"], conf["baseURL"], conf["apiKey"],
+                           str(data.get("modelId") or "").strip(), conf["headers"])
+    log("测试模型 %s（%s）：%s"
+        % (data.get("modelId") or "?", conf["baseURL"], "通" if res.get("ok") else "不通"))
+    return web.json_response({"ok": True, "result": res, "config": {
+        "kind": conf["kind"], "baseURL": conf["baseURL"],
+        "hasApiKey": bool(conf["apiKey"]),
+    }})
+
+
+async def handle_provider_models(request):
+    """从端点拉可用模型列表（GET {base}/models），省得手抄模型 ID。"""
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    data = await body_json(request)
+    conf = resolve_probe_conf(data)
+    res = await probe_model_list(conf["kind"], conf["baseURL"], conf["apiKey"],
+                                 conf["headers"])
+    log("拉取模型列表（%s）：%s"
+        % (conf["baseURL"], ("%d 个" % res.get("count")) if res.get("ok")
+           else ("失败 %s" % (res.get("error") or ""))))
+    return web.json_response({"ok": True, "result": res, "config": {
+        "kind": conf["kind"], "baseURL": conf["baseURL"],
+        "hasApiKey": bool(conf["apiKey"]),
+    }})
 
 
 # ---------------------------------------------------------------- 路由：模型定时
@@ -3699,6 +4235,8 @@ def make_app():
     app.router.add_post("/api/settings/providers/{pid}/models", handle_model_upsert)
     app.router.add_delete("/api/settings/providers/{pid}/models/{mid}", handle_model_delete)
     app.router.add_post("/api/settings/active-model", handle_active_model)
+    app.router.add_post("/api/settings/provider-test", handle_provider_test)
+    app.router.add_post("/api/settings/provider-models", handle_provider_models)
 
     app.router.add_get("/api/schedules", handle_schedules)
     app.router.add_post("/api/schedules", handle_schedules)

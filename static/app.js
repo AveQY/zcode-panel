@@ -946,6 +946,13 @@
     return (s && s.title) || '会话';
   }
 
+  // 模型 ID 常常带厂商前缀（z-ai/glm-5.3-flash），侧栏只显示末段省地方
+  function shortModel(mid) {
+    var s = String(mid || '');
+    var i = s.lastIndexOf('/');
+    return i >= 0 ? s.slice(i + 1) : s;
+  }
+
   function markRunning(sid, on) {
     if (!sid) return;
     if (on) {
@@ -1006,11 +1013,52 @@
 
   function setStatus(text) { $('status-text').textContent = text || ''; }
 
+  // 上一次「生效过」的模型选择。切换失败时用它把界面退回去，不让选择器说谎。
+  var lastModelValue = '';
+
   function currentModelValue() {
     var v = $('model-select').value;
     if (!v) return null;
     var p = v.split('|');
     return { providerId: p[0], modelId: p.slice(1).join('|') };
+  }
+
+  // 每个会话各用各的模型：改选择器立刻下发给「当前这个会话」。
+  // 会话正在执行时不打断它 —— 服务端会把改动登记成下一轮生效。
+  function applySessionModel(sel) {
+    if (!state.sessionId) {
+      toast('请先新建会话', 'err');
+      return;
+    }
+    var mv = currentModelValue();
+    if (!mv) { toast('没有可用的模型', 'err'); return; }
+    var label = sel.options[sel.selectedIndex]
+      ? sel.options[sel.selectedIndex].textContent : mv.modelId;
+    sel.disabled = true;
+    req('/api/sessions/' + encodeURIComponent(state.sessionId) + '/settings', {
+      method: 'POST',
+      body: JSON.stringify({ model: mv }),
+    }).then(function (r) {
+      sel.disabled = false;
+      if (r.status === 401) { showLogin('登录已过期，请重新输入密钥'); return; }
+      if (!r.data.ok) {
+        toast(r.data.error || '切换模型失败', 'err');
+        if (lastModelValue) sel.value = lastModelValue;
+        renderModelSelects();
+        return;
+      }
+      lastModelValue = sel.value;
+      if (r.data.pending) {
+        toast('已记下：这个会话本轮跑完后用「' + label + '」', 'ok');
+      } else {
+        toast('本会话已切到「' + label + '」', 'ok');
+      }
+      loadSessions(true);
+    }).catch(function () {
+      sel.disabled = false;
+      toast('网络异常', 'err');
+      if (lastModelValue) sel.value = lastModelValue;
+    });
   }
 
   function send() {
@@ -1124,6 +1172,7 @@
     var keep1 = sel1.value;
     sel1.innerHTML = opts || '<option value="">（没有可用模型）</option>';
     if (keep1 && !sel1.value) sel1.value = keep1;
+    lastModelValue = sel1.value;
 
     var sel2 = $('nc-model');
     var keep2 = sel2.value;
@@ -1223,6 +1272,8 @@
   }
 
   $('mode-select').addEventListener('change', updateModeDesc);
+  // 改了模型就只影响当前这个会话（不重启 app-server、不影响别的会话）
+  $('model-select').addEventListener('change', function () { applySessionModel(this); });
   $('nc-mode').addEventListener('change', function () {
     $('nc-mode-desc').textContent = modeDesc(this.value);
   });
@@ -1406,6 +1457,25 @@
     whenEl.textContent = when;
     sub.appendChild(whenEl);
     if (!s.archived) {
+      // 每个会话各用各的模型，侧栏直接标出来，不用逐个点开看。
+      // 这个会话没单独设过模型时显示「跟随默认」，语义上才准确。
+      var pick = s.pendingModel || s.model;
+      var mid = pick && pick.modelId;
+      var isDefault = false;
+      if (!mid) {
+        var cm = (state.options && state.options.currentModel) || {};
+        if (cm.modelId) { pick = cm; mid = cm.modelId; isDefault = true; }
+      }
+      if (mid) {
+        var mt = document.createElement('span');
+        mt.className = 'model-tag' + (s.pendingModel ? ' pending'
+          : (isDefault ? ' default' : ''));
+        mt.textContent = shortModel(mid);
+        mt.title = (s.pendingModel ? '下一轮起使用：'
+          : (isDefault ? '跟随默认模型：' : '本会话模型：')) +
+          ((pick.providerId || '') + '/' + mid);
+        sub.appendChild(mt);
+      }
       // 后台还在跑的会话要一眼看得出来（不只在打开它的那个标签页里）
       var tag = document.createElement('span');
       tag.className = 'run-tag';
@@ -1599,6 +1669,13 @@
         if (sel.options[i].value === v) { sel.value = v; break; }
       }
     }
+    // 切进来的会话可能带着「下一轮才生效」的模型，也提示一下
+    var pm = s.pendingModel;
+    if (pm && pm.modelId) {
+      setStatus('本会话模型：' + shortModel((s.model || {}).modelId || '—') +
+                '，下一轮起用 ' + shortModel(pm.modelId));
+    }
+    lastModelValue = $('model-select').value;
   }
 
   function renderHistoryMessage(m) {
@@ -2188,6 +2265,8 @@
   $('prov-add').addEventListener('click', function () { openProvider(null); });
 
   function modelRow(m) {
+    var box = document.createElement('div');
+    box.className = 'model-item';
     var row = document.createElement('div');
     row.className = 'model-row';
     row.innerHTML =
@@ -2195,17 +2274,225 @@
       '<input class="w-name" placeholder="显示名称">' +
       '<input class="w-num" placeholder="上下文" type="number" min="1">' +
       '<input class="w-num" placeholder="最大输出" type="number" min="1">' +
+      '<button class="mini-btn probe" type="button" ' +
+      'title="用这个模型发一条最小请求，验证厂商能不能通">测试</button>' +
       '<button class="icon-btn del" type="button" title="移除">&#10005;</button>';
     row.querySelector('.w-id').value = m.modelId || '';
     row.querySelector('.w-name').value = m.name || '';
     row.querySelector('.w-num').value = m.context || '';
     var nums = row.querySelectorAll('.w-num');
     if (nums[1]) nums[1].value = m.output || '';
-    row.querySelector('.del').addEventListener('click', function () {
-      if (row.parentNode) row.parentNode.removeChild(row);
+
+    var msg = document.createElement('div');
+    msg.className = 'probe-msg hidden';
+
+    row.querySelector('.probe').addEventListener('click', function () {
+      probeModel(box, row.querySelector('.w-id').value.trim(), this);
     });
-    return row;
+    row.querySelector('.del').addEventListener('click', function () {
+      if (box.parentNode) box.parentNode.removeChild(box);
+    });
+
+    box.appendChild(row);
+    box.appendChild(msg);
+    return box;
   }
+
+  /* ============================================ 设置：厂商连通性（测试 / 拉模型） */
+
+  function pvCtx(extra) {
+    var out = {
+      kind: $('pv-kind').value,
+      baseURL: $('pv-base').value.trim(),
+      providerId: state.editingProvider || undefined,
+    };
+    var key = $('pv-key').value;
+    if (key) out.apiKey = key;          // 没填就交给服务端沿用已保存的密钥
+    if (extra) for (var k in extra) out[k] = extra[k];
+    return out;
+  }
+
+  function applyBaseFix(url, kind) {
+    if (!url) return;
+    $('pv-base').value = url;
+    if (kind) $('pv-kind').value = kind;
+  }
+
+  function renderProbeResult(msg, res, base) {
+    var html = '';
+    if (res.ok) {
+      msg.className = 'probe-msg good';
+      html = '✅ 通了' + (res.latencyMs != null ? ' · ' + res.latencyMs + 'ms' : '') +
+        '<br><span class="probe-url">POST ' + esc(res.url || '') + '</span>';
+      if (res.reply) html += '<br>模型回复：<b>' + esc(res.reply) + '</b>';
+      if (res.suggestBaseURL) {
+        html += '<br>⚠ ' + esc(res.hint || '') +
+          ' <button class="mini-btn fix" type="button" data-fix="' +
+          esc(res.suggestBaseURL) + '" data-fixkind="' + esc(res.suggestKind || '') +
+          '">一键填入</button>';
+      }
+    } else {
+      msg.className = 'probe-msg bad';
+      html = '❌ ' + esc(res.error || '失败') +
+        (res.status ? ' <span class="probe-url">(HTTP ' + esc(res.status) + ')</span>' : '');
+      if (res.hint) html += '<br>👉 ' + esc(res.hint);
+      if (res.suggestBaseURL) {
+        html += '<br><button class="mini-btn fix" type="button" data-fix="' +
+          esc(res.suggestBaseURL) + '" data-fixkind="' + esc(res.suggestKind || '') +
+          '">把 Base URL 改成 ' + esc(res.suggestBaseURL) + '</button>';
+      }
+      if ((res.tried || []).length > 1) {
+        html += '<details class="probe-detail"><summary>试过的地址（' +
+          res.tried.length + ' 个）</summary><div>' +
+          res.tried.map(function (t) {
+            // 光看状态码会被骗：智谱那种「200 里塞 404」的情况必须把响应体也显示出来
+            var tag = t.status ? ('HTTP ' + t.status) : '';
+            var d = t.detail || t.error || (t.ok ? '成功' : '无响应');
+            return esc(t.url) + ' → ' + esc(tag + (tag && d ? ' · ' : '') + d);
+          }).join('<br>') + '</div></details>';
+      }
+    }
+    msg.innerHTML = html;
+    var b = msg.querySelector('[data-fix]');
+    if (b) b.addEventListener('click', function () {
+      applyBaseFix(this.getAttribute('data-fix'), this.getAttribute('data-fixkind'));
+      toast('已填入建议的 Base URL，再点一次「测试」确认', 'ok');
+    });
+  }
+
+  function probeModel(box, modelId, btn) {
+    var msg = box.querySelector('.probe-msg');
+    var base = $('pv-base').value.trim();
+    if (!base) { toast('先填 Base URL', 'err'); return; }
+    if (!modelId) { toast('先填模型 ID，或点「获取模型列表」挑一个', 'err'); return; }
+    // 模型没保存进配置前，服务端只能靠这里传的 kind/base/key 去探
+    var old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '测试中…';
+    msg.className = 'probe-msg';
+    msg.textContent = '正在请求 ' + base + ' …（跨境链路可能要十几秒）';
+    req('/api/settings/provider-test', {
+      method: 'POST',
+      body: JSON.stringify(pvCtx({ modelId: modelId })),
+    }).then(function (r) {
+      btn.disabled = false;
+      btn.textContent = old;
+      if (!r.data.ok) {
+        msg.className = 'probe-msg bad';
+        msg.textContent = r.data.error || '测试请求失败';
+        return;
+      }
+      renderProbeResult(msg, r.data.result || {}, base);
+    }).catch(function () {
+      btn.disabled = false;
+      btn.textContent = old;
+      msg.className = 'probe-msg bad';
+      msg.textContent = '网络异常（面板到浏览器这一跳断了？）';
+    });
+  }
+
+  function renderFetched(res) {
+    var box = $('pv-fetched');
+    var wrap = $('pv-fetched-wrap');
+    box.innerHTML = '';
+    (res.models || []).forEach(function (m) {
+      var lab = document.createElement('label');
+      lab.className = 'fetched-item';
+      lab.innerHTML = '<input type="checkbox" value="' + esc(m.id) + '"' +
+        ' data-name="' + esc(m.name || m.id) + '">' +
+        '<span class="fetched-id">' + esc(m.id) + '</span>' +
+        (m.name && m.name !== m.id
+          ? '<span class="fetched-name">' + esc(m.name) + '</span>' : '');
+      box.appendChild(lab);
+    });
+    $('pv-fetched-note').textContent = '共 ' + (res.count || 0) + ' 个 · 来自 ' +
+      (res.url || '') + (res.truncated ? '（已截断显示）' : '');
+    wrap.classList.remove('hidden');
+    // 拉到的地址跟填的不一样：直接提示要不要改
+    if (res.suggestBaseURL) {
+      toast('模型列表是在 ' + res.suggestBaseURL + ' 上拿到的，建议把 Base URL 改成它', 'ok');
+    }
+  }
+
+  function fetchModels(btn) {
+    var base = $('pv-base').value.trim();
+    if (!base) { toast('先填 Base URL', 'err'); return; }
+    var old = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '拉取中…';
+    req('/api/settings/provider-models', {
+      method: 'POST',
+      body: JSON.stringify(pvCtx()),
+    }).then(function (r) {
+      btn.disabled = false;
+      btn.textContent = old;
+      var res = (r.data || {}).result || {};
+      if (!res.ok) {
+        var t = '拉取失败：' + (res.error || '未知错误');
+        if (res.hint) t += ' —— ' + res.hint;
+        toast(t, 'err');
+        if (res.suggestBaseURL) {
+          confirmBox('换个 Base URL 试试？',
+                     '拉取失败，但探测发现这个地址可用：\n' + res.suggestBaseURL +
+                     '\n\n要不要填进去再拉一次？', '填入并重试')
+            .then(function (ok) {
+              if (!ok) return;
+              applyBaseFix(res.suggestBaseURL);
+              fetchModels(btn);
+            });
+        }
+        return;
+      }
+      renderFetched(res);
+      toast('拉到 ' + (res.count || 0) + ' 个模型，勾选后点「加入选中的模型」', 'ok');
+    }).catch(function () {
+      btn.disabled = false;
+      btn.textContent = old;
+      toast('网络异常', 'err');
+    });
+  }
+
+  function existingModelIds() {
+    var out = {};
+    var rows = $('pv-models').querySelectorAll('.model-row');
+    for (var i = 0; i < rows.length; i++) {
+      var v = rows[i].querySelector('.w-id').value.trim();
+      if (v) out[v] = true;
+    }
+    return out;
+  }
+
+  $('pv-fetch').addEventListener('click', function () { fetchModels(this); });
+
+  $('pv-fetched-all').addEventListener('click', function () {
+    var boxes = $('pv-fetched').querySelectorAll('input[type=checkbox]');
+    var anyOff = false;
+    for (var i = 0; i < boxes.length; i++) if (!boxes[i].checked) anyOff = true;
+    for (var j = 0; j < boxes.length; j++) boxes[j].checked = anyOff;
+  });
+
+  $('pv-fetched-close').addEventListener('click', function () {
+    $('pv-fetched-wrap').classList.add('hidden');
+  });
+
+  $('pv-fetched-add').addEventListener('click', function () {
+    var boxes = $('pv-fetched').querySelectorAll('input[type=checkbox]');
+    var mine = existingModelIds();
+    var added = 0;
+    for (var i = 0; i < boxes.length; i++) {
+      if (!boxes[i].checked) continue;
+      var id = boxes[i].value;
+      if (!id || mine[id]) continue;
+      mine[id] = true;
+      $('pv-models').appendChild(modelRow({
+        modelId: id,
+        name: boxes[i].getAttribute('data-name') || id,
+      }));
+      added++;
+    }
+    toast(added ? ('已加入 ' + added + ' 个模型，记得点「保存」') : '没有新增（都已存在或未勾选）',
+          added ? 'ok' : 'err');
+  });
 
   function openProvider(pid) {
     state.editingProvider = pid;
@@ -2214,6 +2501,10 @@
     $('pv-models').innerHTML = '';
     $('pv-key').type = 'password';
     $('pv-id').disabled = !!pid;
+    // 每次开弹窗都收起上一次拉到的模型列表，避免串场
+    $('pv-fetched').innerHTML = '';
+    $('pv-fetched-note').textContent = '';
+    $('pv-fetched-wrap').classList.add('hidden');
 
     if (!pid) {
       $('pv-id').value = '';

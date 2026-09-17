@@ -205,6 +205,21 @@ input, textarea, select {
   width: 6px; height: 6px; border-radius: 50%; background: var(--amber);
   animation: runPulse 1.15s ease-in-out infinite;
 }
+
+/* 侧栏标出「这个会话用的是哪个模型」：多会话各用各的模型时一眼可辨 */
+.model-tag {
+  flex: 0 1 auto; min-width: 0; max-width: 132px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono); font-size: 10.5px;
+  padding: 1px 6px; border-radius: 10px;
+  background: var(--accent-soft); color: var(--accent);
+  border: 1px solid var(--accent-border);
+}
+.model-tag.pending { background: var(--amber-soft); color: var(--amber); border-color: #f0dca0; }
+/* 没单独设过模型的会话：跟随全局默认，弱化显示 */
+.model-tag.default {
+  background: var(--sidebar-hover); color: var(--text-mute); border-color: var(--border);
+}
 @keyframes runPulse {
   0%, 100% { opacity: 0.25; transform: scale(0.75); }
   50% { opacity: 1; transform: scale(1.15); }
@@ -864,6 +879,54 @@ select { cursor: pointer; }
 .model-row .w-num { flex: 1; min-width: 72px; }
 .model-row .del { flex-shrink: 0; color: var(--text-mute); }
 .model-row .del:hover { color: var(--red); background: var(--red-soft); }
+
+/* ---------- 厂商弹窗：测试模型 / 拉取模型列表 ---------- */
+.model-item { display: flex; flex-direction: column; gap: 6px; }
+.model-row .probe { flex-shrink: 0; }
+
+.mini-btn {
+  padding: 5px 10px; font-size: 12px; line-height: 1.2;
+  border: 1px solid var(--border); border-radius: 7px;
+  background: #fff; color: var(--text-dim); white-space: nowrap;
+}
+.mini-btn:hover { border-color: var(--accent-border); color: var(--accent); background: var(--accent-soft); }
+.mini-btn:disabled { opacity: .55; cursor: default; }
+.mini-btn[data-fix] { margin-top: 2px; }
+
+.probe-msg {
+  font-size: 12px; line-height: 1.7; border-radius: 8px; padding: 7px 10px;
+  background: var(--code-bg); border: 1px solid var(--border-soft);
+  color: var(--text-dim); word-break: break-word;
+}
+.probe-msg.good { background: var(--green-soft); border-color: #bfe3c8; color: var(--green); }
+.probe-msg.bad { background: var(--red-soft); border-color: #f5c2c7; color: var(--red); }
+.probe-msg .probe-url { font-family: var(--mono); font-size: 11px; opacity: .8; }
+
+.probe-detail { margin-top: 5px; }
+.probe-detail > summary { cursor: pointer; font-size: 11.5px; opacity: .85; }
+.probe-detail > div {
+  margin-top: 4px; font-family: var(--mono); font-size: 11px;
+  background: #fff; border: 1px solid var(--border-soft); border-radius: 6px;
+  padding: 6px 8px; max-height: 140px; overflow: auto; color: var(--text-dim);
+}
+
+.fetched-list {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  max-height: 190px; overflow: auto;
+  padding: 9px; border: 1px solid var(--border-soft); border-radius: 9px;
+  background: var(--sidebar); margin-bottom: 9px;
+}
+.fetched-item {
+  display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  padding: 4px 9px; border: 1px solid var(--border); border-radius: 20px;
+  background: #fff; font-size: 12px;
+}
+.fetched-item:hover { border-color: var(--accent-border); background: var(--accent-soft); }
+.fetched-item .fetched-id { font-family: var(--mono); font-size: 11.5px; }
+.fetched-item .fetched-name { color: var(--text-mute); font-size: 11px; }
+
+.form-hint-inline { font-size: 11.5px; color: var(--text-mute); font-weight: 400; margin-left: 4px; }
+.ghost-btn.slim { padding: 5px 10px; font-size: 12px; }
 
 /* ---------- 侧栏：工作区分组 ---------- */
 

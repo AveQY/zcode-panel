@@ -23,7 +23,43 @@
     editingProvider: null,
     cur: null,                  // 当前正在流式渲染的助手消息
     confirmResolve: null,
+    // --- WebSocket 保活与自动重连 ---
+    wsEnabled: false,           // 已进入控制台才允许连接/重连（未登录时不重连，避免 401 空转）
+    wsAttempt: 0,               // 连续重连次数，用于退避
+    wsTimer: null,              // 重连定时器
+    wsPingTimer: null,          // 应用层心跳
+    wsIdleTimer: null,          // 无入站帧看门狗
+    wsLastInbound: 0,           // 最后一次收到任何帧的时间
+    wsManualClose: false,       // 主动关闭（登出）时不重连
+    wsResumeTimer: null,        // 重连后等待 resumed 的兜底定时器
+    pendingSend: null,          // 断线期间暂存的消息，重连后自动补发
+    // --- 工作区 ---
+    wsRoot: '/root',            // 工作区根目录（来自 /api/workspaces）
+    wsCollapsed: {},            // 折叠状态：{工作区路径: true}
+    wsEditing: null,            // 正在编辑的工作区
+    wsOnDone: null,             // 工作区弹窗完成后的回调
+    // --- 使用统计 ---
+    usage: null,
+    usageRange: 'today',
   };
+
+  var WS_COLLAPSE_KEY = 'zwc_ws_collapsed';
+
+  try {
+    state.wsCollapsed = JSON.parse(localStorage.getItem(WS_COLLAPSE_KEY) || '{}') || {};
+  } catch (e) {
+    state.wsCollapsed = {};
+  }
+
+  function saveWsCollapsed() {
+    try { localStorage.setItem(WS_COLLAPSE_KEY, JSON.stringify(state.wsCollapsed)); } catch (e) {}
+  }
+
+  // 服务端 handle_ws 已支持 {"type":"ping"} -> {"type":"pong"}，用它做应用层保活。
+  // 移动网络下 NAT 会静默回收空闲映射，TCP 层收不到 FIN，所以必须有主动心跳。
+  var WS_PING_INTERVAL = 20000;   // 20s 一次
+  var WS_IDLE_LIMIT = 50000;      // 50s 无任何入站帧即判定链路已死
+  var WS_IDLE_CHECK = 10000;
 
   /* ============================================ 基础工具 */
 
@@ -83,6 +119,40 @@
     if (diff < 604800000) return Math.floor(diff / 86400000) + ' 天前';
     var d = new Date(ms);
     return (d.getMonth() + 1) + '/' + d.getDate();
+  }
+
+  /* ============================================ 数字格式化 */
+
+  // token 用量按 k / m / b 缩写（1000 进制）
+  function fmtTokens(n) {
+    n = Number(n) || 0;
+    if (n < 1000) return String(n);
+    var units = [['b', 1e9], ['m', 1e6], ['k', 1e3]];
+    for (var i = 0; i < units.length; i++) {
+      var base = units[i][1];
+      if (n >= base) {
+        var v = n / base;
+        var s = v >= 100 ? v.toFixed(0) : (v >= 10 ? v.toFixed(1) : v.toFixed(2));
+        if (s.indexOf('.') >= 0) s = s.replace(/0+$/, '').replace(/\.$/, '');
+        return s + units[i][0];
+      }
+    }
+    return String(n);
+  }
+
+  // 精确值加千分位，用于 tooltip 与统计表
+  function fmtNum(n) {
+    n = Math.round(Number(n) || 0);
+    return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  }
+
+  function fmtDuration(ms) {
+    ms = Number(ms) || 0;
+    if (ms < 1000) return ms + 'ms';
+    var s = ms / 1000;
+    if (s < 60) return s.toFixed(1) + 's';
+    var m = Math.floor(s / 60);
+    return m + 'm' + Math.round(s - m * 60) + 's';
   }
 
   function scrollToBottom(force) {
@@ -163,10 +233,15 @@
   function showApp() {
     $('login-view').classList.add('hidden');
     $('app-view').classList.remove('hidden');
-    loadSessions(true);
     startListTimer();
+    state.wsEnabled = true;
     connectWs();
     loadOptions();
+    loadUsage('today');
+    // 会话列表要按工作区分组，所以先拿到工作区清单再渲染列表
+    loadWorkspaces().then(function () {
+      loadSessions(true);
+    });
     if (window.innerWidth <= 720) {
       $('sidebar').classList.add('collapsed');
       $('expand-btn').classList.remove('hidden');
@@ -218,32 +293,186 @@
       });
   });
 
-  /* ============================================ WebSocket */
+  /* ============================================ WebSocket（保活 + 自动重连） */
+
+  function wsUrl() {
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return proto + '//' + location.host + '/ws';
+  }
+
+  function wsOpen() {
+    return !!(state.ws && state.ws.readyState === WebSocket.OPEN);
+  }
 
   function connectWs() {
-    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var sock = new WebSocket(proto + '//' + location.host + '/ws');
+    if (!state.wsEnabled) return;
+    if (state.ws) {
+      try { state.ws.close(); } catch (e) {}
+      state.ws = null;
+    }
+    state.wsManualClose = false;
+
+    var sock;
+    try {
+      sock = new WebSocket(wsUrl());
+    } catch (e) {
+      scheduleReconnect();
+      return;
+    }
     state.ws = sock;
 
-    sock.onopen = function () { if (state.ws === sock) setStatus(''); };
+    sock.onopen = function () {
+      if (state.ws !== sock) return;
+      state.wsAttempt = 0;
+      state.wsLastInbound = Date.now();
+      startWsKeepalive();
+      onWsReady();
+    };
 
     sock.onmessage = function (ev) {
       if (state.ws !== sock) return;
+      state.wsLastInbound = Date.now();   // 任何帧（含 pong）都算链路活着
       var data;
       try { data = JSON.parse(ev.data); } catch (e) { return; }
       handleEvent(data);
     };
 
     sock.onclose = function () {
-      if (state.ws !== sock) return;
+      if (state.ws !== sock) return;      // 已被新连接取代，忽略旧连接的关闭
       state.ws = null;
-      if (state.sending) {
-        setSending(false);
-        toast('连接已断开，请刷新页面', 'err');
-      }
+      stopWsKeepalive();
+      if (state.wsManualClose) return;
+      scheduleReconnect();
     };
 
     sock.onerror = function () {};
+  }
+
+  function startWsKeepalive() {
+    stopWsKeepalive();
+    state.wsPingTimer = setInterval(function () {
+      wsSend({ type: 'ping' });
+    }, WS_PING_INTERVAL);
+    state.wsIdleTimer = setInterval(function () {
+      // 切到后台时浏览器会把定时器节流到分钟级，此时不能据此判定断线，
+      // 否则手机锁屏/切 App 回来会看到一次无谓的重连。
+      if (document.hidden) { state.wsLastInbound = Date.now(); return; }
+      if (!state.wsLastInbound) return;
+      if (Date.now() - state.wsLastInbound > WS_IDLE_LIMIT) forceReconnect();
+    }, WS_IDLE_CHECK);
+  }
+
+  function stopWsKeepalive() {
+    clearInterval(state.wsPingTimer); state.wsPingTimer = null;
+    clearInterval(state.wsIdleTimer); state.wsIdleTimer = null;
+  }
+
+  function forceReconnect() {
+    if (!state.wsEnabled) return;
+    var sock = state.ws;
+    if (sock) { try { sock.close(); } catch (e) {} }
+    state.ws = null;
+    stopWsKeepalive();
+    // 半开连接不一定触发 onclose，这里直接排程，避免永久卡死
+    scheduleReconnect();
+  }
+
+  function scheduleReconnect() {
+    if (!state.wsEnabled || state.wsTimer || state.wsManualClose) return;
+    state.wsAttempt += 1;
+    // 连续失败多次后确认一次登录态：会话令牌过期时不该无限重连
+    if (state.wsAttempt === 5) {
+      req('/api/me').then(function (r) {
+        if (!r.data || !r.data.ok) {
+          state.wsEnabled = false;
+          state.wsManualClose = true;
+          if (state.wsTimer) { clearTimeout(state.wsTimer); state.wsTimer = null; }
+          clearMessages();
+          showLogin('登录状态已失效，请重新输入密钥');
+        }
+      }).catch(function () {});
+    }
+    var delay = Math.min(800 * Math.pow(1.7, state.wsAttempt - 1), 15000);
+    delay = Math.round(delay * (0.85 + Math.random() * 0.3));
+    setStatus('连接中断，' + Math.max(1, Math.round(delay / 1000)) + ' 秒后自动重连…');
+    state.wsTimer = setTimeout(function () {
+      state.wsTimer = null;
+      connectWs();
+    }, delay);
+  }
+
+  // 回到前台立刻自检：断线就马上重连，不必等看门狗周期
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden || !state.wsEnabled) return;
+    if (!state.ws) {
+      scheduleReconnect();
+      return;
+    }
+    if (state.ws.readyState !== WebSocket.OPEN) {
+      forceReconnect();
+      return;
+    }
+    state.wsLastInbound = Date.now();
+  });
+
+  function onWsReady() {
+    // 断线期间用户发过消息：直接补发，不走 watch（那一轮还没开始，回放会串内容）
+    if (state.pendingSend) {
+      setStatus('已重新连接，正在提交…');
+      flushPendingSend();
+      return;
+    }
+    // 生成过程中掉线：丢掉半截气泡，靠服务端回放把本轮续上
+    if (state.sessionId && state.sending) {
+      resetLiveBubble();
+      wsSend({ type: 'watch', sessionId: state.sessionId });
+      setStatus('连接已恢复，正在恢复输出…');
+      clearTimeout(state.wsResumeTimer);
+      state.wsResumeTimer = setTimeout(reconcileAfterReconnect, 6000);
+      return;
+    }
+    setStatus('');
+    if (state.sessionId) loadSessions(true);
+  }
+
+  // 清掉正在流式渲染的半截气泡，让回放的事件重新生成它
+  function resetLiveBubble() {
+    var cur = state.cur;
+    if (!cur) return;
+    if (cur.row && cur.row.parentNode) cur.row.parentNode.removeChild(cur.row);
+    if (cur.mid) state.messageMap.delete(cur.mid);
+    state.cur = null;
+  }
+
+  // 重连后 6 秒内没等到 resumed：说明那一轮其实已经跑完，用历史接口对齐并收尾
+  function reconcileAfterReconnect() {
+    state.wsResumeTimer = null;
+    if (!state.sending || !state.sessionId) return;
+    var sid = state.sessionId;
+    req('/api/sessions/' + encodeURIComponent(sid) + '/messages').then(function (r) {
+      if (state.sessionId !== sid) return;
+      if (r.data && r.data.ok) {
+        clearMessages();
+        (r.data.messages || []).forEach(function (m) { renderHistoryMessage(m); });
+        clearCursors();
+        scrollToBottom(true);
+      }
+    }).catch(function () {}).then(function () {
+      if (state.sessionId !== sid) return;
+      removeThinking();
+      setSending(false);
+      setStatus('');
+    });
+  }
+
+  function flushPendingSend() {
+    var p = state.pendingSend;
+    if (!p || !wsOpen()) return;
+    state.pendingSend = null;
+    wsSend({
+      type: 'send', sessionId: p.sessionId, content: p.content,
+      mode: p.mode, model: p.model, thoughtLevel: p.thoughtLevel,
+    });
   }
 
   function wsSend(obj) {
@@ -296,6 +525,8 @@
         break;
 
       case 'resumed':
+        clearTimeout(state.wsResumeTimer);
+        state.wsResumeTimer = null;
         setStatus('正在恢复输出…');
         break;
 
@@ -581,8 +812,11 @@
       }
     });
     if (d && d.usage && d.usage.totalTokens) {
-      $('chat-meta').textContent = '本轮 ' + d.usage.totalTokens + ' tokens';
+      $('chat-meta').textContent = '本轮 ' + fmtTokens(d.usage.totalTokens) + ' tokens';
     }
+    // 一轮跑完刷新右上角的今日用量（用量行可能晚一两秒落库，再补一次）
+    loadUsage(null, true);
+    setTimeout(function () { loadUsage(null, true); }, 3000);
   }
 
   /* ============================================ 状态与发送 */
@@ -628,8 +862,22 @@
       openNewChat();
       return;
     }
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-      toast('连接已断开，请刷新页面', 'err');
+    if (!wsOpen()) {
+      // 断线不丢消息：先把消息落到界面，等重连成功后自动补发
+      appendUserMessage(text);
+      input.value = '';
+      input.style.height = 'auto';
+      setSending(true);
+      showThinking();
+      state.pendingSend = {
+        sessionId: state.sessionId,
+        content: text,
+        mode: $('mode-select').value,
+        model: currentModelValue(),
+        thoughtLevel: $('thought-select').value || null,
+      };
+      setStatus('连接中断，正在重连，恢复后自动发送…');
+      if (!state.ws) forceReconnect();
       return;
     }
 
@@ -660,7 +908,10 @@
 
   $('stop-btn').addEventListener('click', function () {
     if (!state.sending) return;
-    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+    if (!wsOpen()) {
+      toast('连接中断，正在重连，请稍候再停止', 'err');
+      return;
+    }
     this.disabled = true;
     this.textContent = '正在停止…';
     wsSend({ type: 'cancel', sessionId: state.sessionId });
@@ -776,8 +1027,10 @@
   }
 
   function updateModeDesc() {
-    var v = $('mode-select').value;
-    $('mode-desc').textContent = modeDesc(v);
+    var sel = $('mode-select');
+    var v = sel.value;
+    // 说明小字挪到 tooltip：右上角现在放今日用量，模式选择器也移到了输入框下方
+    sel.title = modeDesc(v) || '本会话的权限模式';
     var w = $('welcome-mode');
     if (w) {
       var modes = state.modes || [];
@@ -828,7 +1081,9 @@
     var box = $('session-list');
     box.innerHTML = '';
 
-    if (!list.length) {
+    var groups = groupByWorkspace(list);
+
+    if (!list.length && !groups.length) {
       var empty = document.createElement('div');
       empty.className = 'list-empty';
       empty.innerHTML = state.tab === 'archived'
@@ -838,56 +1093,158 @@
       return;
     }
 
-    list.forEach(function (s) {
-      var item = document.createElement('div');
-      item.className = 'session-item' + (s.id === state.sessionId ? ' active' : '');
-      item.dataset.sid = s.id;
-      item.title = s.title;
-
-      var main = document.createElement('div');
-      main.className = 'session-item-main';
-
-      var t = document.createElement('div');
-      t.className = 'session-item-title';
-      t.textContent = s.title || '(无标题)';
-      if (s.archived) {
-        var b = document.createElement('span');
-        b.className = 'badge-arch';
-        b.textContent = '已归档';
-        t.appendChild(b);
-      }
-
-      var sub = document.createElement('div');
-      sub.className = 'session-item-sub';
-      var when = s.archived ? relTime(s.archivedAt) : relTime(s.updated || s.created);
-      var wsName = (s.workspacePath || '').replace(/\/+$/, '').split('/').pop() || '';
-      sub.textContent = when + (wsName ? ' · ' + wsName : '') +
-        (s.status === 'running' ? ' · 执行中' : '');
-
-      main.appendChild(t);
-      main.appendChild(sub);
-      item.appendChild(main);
-
-      var more = document.createElement('button');
-      more.className = 'session-more';
-      more.type = 'button';
-      more.innerHTML = '&#8943;';
-      more.addEventListener('click', function (e) {
-        e.stopPropagation();
-        toggleSessionMenu(item, s);
-      });
-      item.appendChild(more);
-
-      item.addEventListener('click', function () { openSession(s.id); });
-      // 桌面端习惯：在左侧会话上右键直接打开同一套操作菜单。
-      // 不触发 openSession，避免用户只是想归档/删除时打断当前对话。
-      item.addEventListener('contextmenu', function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        showSessionMenu(item, s);
-      });
-      box.appendChild(item);
+    groups.forEach(function (g) {
+      box.appendChild(wsGroupEl(g));
     });
+  }
+
+  // 按工作区把会话分组。已知工作区即使还没有会话也列出来，
+  // 这样左侧就是一份完整的工作区清单（和 zcode 桌面端一致）。
+  function groupByWorkspace(list) {
+    var groups = [];
+    var index = {};
+
+    list.forEach(function (s) {
+      var key = s.workspacePath || '';
+      var g = index[key];
+      if (!g) {
+        g = index[key] = { key: key, path: key, name: wsNameOf(key), items: [], empty: false };
+        groups.push(g);
+      }
+      g.items.push(s);
+    });
+
+    if (state.tab !== 'archived') {
+      (state.workspaces || []).forEach(function (w) {
+        if (!w || !w.path || index[w.path]) return;
+        if (w.purpose === 'task') return;   // 一次性任务的目录不占工作区列表
+        var g = { key: w.path, path: w.path, name: w.name || wsNameOf(w.path),
+                  items: [], empty: true, ws: w };
+        index[w.path] = g;
+        groups.push(g);
+      });
+    }
+    return groups;
+  }
+
+  function wsNameOf(path) {
+    if (!path) return '未指定工作区';
+    var w = (state.workspaces || []).filter(function (x) { return x.path === path; })[0];
+    if (w && w.name) return w.name;
+    var p = String(path).replace(/\/+$/, '').split('/').pop();
+    return p || path;
+  }
+
+  function wsGroupEl(g) {
+    var wrap = document.createElement('div');
+    wrap.className = 'ws-group';
+
+    var collapsed = !!state.wsCollapsed[g.key];
+    var head = document.createElement('div');
+    head.className = 'ws-group-head' + (collapsed ? ' collapsed' : '');
+    head.title = g.path || g.name;
+
+    var caret = document.createElement('span');
+    caret.className = 'ws-caret';
+    caret.innerHTML = '&#9662;';
+    head.appendChild(caret);
+
+    var name = document.createElement('span');
+    name.className = 'ws-name';
+    name.textContent = g.name;
+    head.appendChild(name);
+
+    var cnt = document.createElement('span');
+    cnt.className = 'ws-count';
+    cnt.textContent = g.items.length;
+    head.appendChild(cnt);
+
+    var more = document.createElement('button');
+    more.type = 'button';
+    more.className = 'ws-more';
+    more.innerHTML = '&#8943;';
+    more.title = '管理工作区';
+    more.addEventListener('click', function (e) {
+      e.stopPropagation();
+      var w = g.ws || findWorkspace(g.path);
+      if (!w && g.path) {
+        w = { path: g.path, name: g.name, purpose: 'project', unregistered: true, dir: {} };
+      }
+      if (!w) { toast('请先刷新工作区列表', 'err'); return; }
+      openWsModal('edit', w);
+    });
+    head.appendChild(more);
+
+    head.addEventListener('click', function () {
+      state.wsCollapsed[g.key] = !state.wsCollapsed[g.key];
+      saveWsCollapsed();
+      head.classList.toggle('collapsed', !!state.wsCollapsed[g.key]);
+      body.classList.toggle('hidden', !!state.wsCollapsed[g.key]);
+    });
+
+    wrap.appendChild(head);
+
+    var body = document.createElement('div');
+    body.className = 'ws-group-body' + (collapsed ? ' hidden' : '');
+    if (!g.items.length) {
+      var e = document.createElement('div');
+      e.className = 'ws-group-empty';
+      e.textContent = '还没有会话';
+      body.appendChild(e);
+    } else {
+      g.items.forEach(function (s) { body.appendChild(sessionItemEl(s)); });
+    }
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  function sessionItemEl(s) {
+    var item = document.createElement('div');
+    item.className = 'session-item' + (s.id === state.sessionId ? ' active' : '');
+    item.dataset.sid = s.id;
+    item.title = s.title;
+
+    var main = document.createElement('div');
+    main.className = 'session-item-main';
+
+    var t = document.createElement('div');
+    t.className = 'session-item-title';
+    t.textContent = s.title || '(无标题)';
+    if (s.archived) {
+      var b = document.createElement('span');
+      b.className = 'badge-arch';
+      b.textContent = '已归档';
+      t.appendChild(b);
+    }
+
+    var sub = document.createElement('div');
+    sub.className = 'session-item-sub';
+    var when = s.archived ? relTime(s.archivedAt) : relTime(s.updated || s.created);
+    sub.textContent = when + (s.status === 'running' ? ' · 执行中' : '');
+
+    main.appendChild(t);
+    main.appendChild(sub);
+    item.appendChild(main);
+
+    var more = document.createElement('button');
+    more.className = 'session-more';
+    more.type = 'button';
+    more.innerHTML = '&#8943;';
+    more.addEventListener('click', function (e) {
+      e.stopPropagation();
+      toggleSessionMenu(item, s);
+    });
+    item.appendChild(more);
+
+    item.addEventListener('click', function () { openSession(s.id); });
+    // 桌面端习惯：在左侧会话上右键直接打开同一套操作菜单。
+    // 不触发 openSession，避免用户只是想归档/删除时打断当前对话。
+    item.addEventListener('contextmenu', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      showSessionMenu(item, s);
+    });
+    return item;
   }
 
   function closeSessionMenus() {
@@ -1143,9 +1500,6 @@
 
   function openNewChat() {
     if (state.sending) { toast('当前任务执行中，请稍候', 'err'); return; }
-    $('nc-new-ws-row').classList.add('hidden');
-    $('nc-ws-msg').textContent = '';
-    $('nc-ws-name').value = '';
     $('nc-mode').value = $('mode-select').value || 'build';
     $('nc-mode-desc').textContent = modeDesc($('nc-mode').value);
     loadWorkspaces().then(function () { openModal('newchat-modal'); });
@@ -1155,19 +1509,30 @@
     return req('/api/workspaces').then(function (r) {
       if (!r.data.ok) return;
       state.workspaces = r.data.workspaces || [];
+      if (r.data.root) state.wsRoot = r.data.root;
       var sel = $('nc-workspace');
+      var keep = sel.value;
       sel.innerHTML = state.workspaces.map(function (w) {
         return '<option value="' + esc(w.path) + '">' + esc(w.name) +
           '　' + esc(w.path) + (w.sessions ? '（' + w.sessions + '）' : '') + '</option>';
-      }).join('') || '<option value="/root">/root</option>';
+      }).join('') || '<option value="' + esc(state.wsRoot) + '">' + esc(state.wsRoot) + '</option>';
+      if (keep) {
+        for (var i = 0; i < sel.options.length; i++) {
+          if (sel.options[i].value === keep) { sel.value = keep; break; }
+        }
+      }
       updateWsHint();
       return state.workspaces;
     });
   }
 
+  function findWorkspace(path) {
+    return (state.workspaces || []).filter(function (x) { return x.path === path; })[0] || null;
+  }
+
   function updateWsHint() {
     var p = $('nc-workspace').value;
-    var w = state.workspaces.filter(function (x) { return x.path === p; })[0];
+    var w = findWorkspace(p);
     $('nc-ws-hint').textContent = w
       ? '用途：' + (w.purpose === 'task' ? '任务' : '项目') +
         '　已有 ' + (w.sessions || 0) + ' 个会话　路径：' + p
@@ -1193,35 +1558,186 @@
     c.addEventListener('click', function () { setPurpose(this.dataset.purpose); });
   });
 
-  $('nc-new-ws').addEventListener('click', function () {
-    var row = $('nc-new-ws-row');
-    row.classList.toggle('hidden');
-    if (!row.classList.contains('hidden')) $('nc-ws-name').focus();
-  });
+  /* ============================================ 工作区：新建 / 改名 / 删除 */
 
-  $('nc-ws-create').addEventListener('click', function () {
-    var name = $('nc-ws-name').value.trim();
-    if (!name) { $('nc-ws-msg').textContent = '请填写名称'; return; }
+  // 与后端 slug 规则保持一致，仅用于「目录」留空时给用户看结果预览
+  function wsSlug(name) {
+    var s = String(name || '');
+    s = s.replace(/[^0-9A-Za-z_\-\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]+/g, '-');
+    return s.replace(/^-+|-+$/g, '').toLowerCase();
+  }
+
+  function wsResolveDir(name, path) {
+    var root = (state.wsRoot || '/root').replace(/\/+$/, '');
+    var p = String(path || '').trim();
+    if (p) return p.charAt(0) === '/' ? p : root + '/' + p.replace(/^\/+/, '');
+    var slug = wsSlug(name);
+    return slug ? root + '/' + slug : root;
+  }
+
+  function updateWsPreview() {
+    var name = $('wsm-name').value.trim();
+    var raw = $('wsm-path').value.trim();
+    var el = $('wsm-preview');
+    if (!name && !raw) {
+      el.textContent = '填名称或目录后，这里会显示最终使用的目录';
+      return;
+    }
+    var dir = wsResolveDir(name, raw);
+    var known = findWorkspace(dir);
+    el.textContent = '将使用目录：' + dir + (known ? '（已存在的工作区，会更新它的名称）' : '');
+  }
+
+  function updatePurgeHint() {
+    var ws = state.wsEditing;
+    if (!ws) return;
+    var st = ws.dir || {};
+    if ($('wsm-purge').checked) {
+      $('wsm-danger-hint').textContent = st.exists
+        ? '将连同磁盘目录一起删除，目录内的文件无法恢复。'
+        : '目录不存在，勾选与不勾选结果一样。';
+    } else {
+      $('wsm-danger-hint').textContent = '不勾选时只从左侧列表移除，磁盘上的文件原样保留。';
+    }
+  }
+
+  function openWsModal(mode, ws, onDone) {
+    var isEdit = mode === 'edit' && !!ws;
+    state.wsEditing = isEdit ? ws : null;
+    state.wsOnDone = onDone || null;
+
+    $('wsm-title').textContent = isEdit ? '工作区设置' : '新建工作区';
+    $('wsm-name').value = isEdit ? (ws.name || '') : '';
+    $('wsm-path').value = isEdit ? (ws.path || '') : '';
+    $('wsm-purpose').value = (ws && ws.purpose) || 'project';
+    $('wsm-path').readOnly = isEdit;
+    $('wsm-purpose-row').classList.toggle('hidden', isEdit);
+    $('wsm-save').textContent = isEdit ? '保存名称' : '创建';
+    // 未登记的目录（别的途径建的会话带出来的）只能「保存名称」把它登记进来；
+    // 工作区根目录不允许移除，避免把 /root 从列表里弄掉。
+    var canDelete = isEdit && !ws.unregistered && !ws.isRoot;
+    $('wsm-delete').classList.toggle('hidden', !canDelete);
+    $('wsm-danger-row').classList.toggle('hidden', !(isEdit && !ws.unregistered));
+    $('wsm-danger-row').querySelector('.check-row').classList.toggle('hidden', !canDelete);
+    $('wsm-purge').checked = false;
+
+    if (canDelete) {
+      var st = ws.dir || {};
+      $('wsm-dir').textContent = ws.path;
+      $('wsm-entries').textContent = st.exists
+        ? (st.entries + (st.truncated ? '+' : '')) : '0';
+      updatePurgeHint();
+    } else if (isEdit && ws.isRoot) {
+      $('wsm-danger-hint').textContent = '这是工作区根目录，只能改名，不能移除。';
+    } else if (isEdit) {
+      $('wsm-danger-hint').textContent =
+        '这个目录还没登记进工作区列表（是别的途径建的会话带出来的），保存名称即可登记。';
+    }
+    updateWsPreview();
+    openModal('ws-modal');
+    setTimeout(function () { $('wsm-name').focus(); }, 30);
+  }
+
+  $('wsm-name').addEventListener('input', updateWsPreview);
+  $('wsm-path').addEventListener('input', updateWsPreview);
+  $('wsm-purge').addEventListener('change', updatePurgeHint);
+
+  $('wsm-save').addEventListener('click', function () {
+    var name = $('wsm-name').value.trim();
+    if (!name) { toast('请填写工作区名称', 'err'); return; }
     var btn = this;
+    var editing = state.wsEditing;
     btn.disabled = true;
-    req('/api/workspaces', {
-      method: 'POST',
-      body: JSON.stringify({ name: name, purpose: $('nc-ws-purpose').value }),
-    }).then(function (r) {
+
+    var p;
+    if (editing && !editing.unregistered) {
+      p = req('/api/workspaces/' + encodeURIComponent(editing.id), {
+        method: 'POST', body: JSON.stringify({ name: name }),
+      });
+    } else {
+      // 新建，或把「未登记的目录」按路径登记进来
+      p = req('/api/workspaces', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: name,
+          purpose: editing ? (editing.purpose || 'project') : $('wsm-purpose').value,
+          path: editing ? editing.path : $('wsm-path').value.trim(),
+        }),
+      });
+    }
+
+    p.then(function (r) {
       btn.disabled = false;
-      if (!r.data.ok) { $('nc-ws-msg').textContent = r.data.error || '创建失败'; return; }
-      $('nc-ws-msg').textContent = '已创建：' + (r.data.workspace || {}).path;
-      $('nc-ws-name').value = '';
+      if (!r.data.ok) { toast(r.data.error || '操作失败', 'err'); return; }
+      var w = r.data.workspace || {};
+      if (editing && !editing.unregistered) {
+        toast('已重命名为「' + w.name + '」', 'ok');
+      } else if (r.data.created) {
+        toast('已创建工作区「' + w.name + '」', 'ok');
+      } else {
+        toast('工作区已存在，已更新登记信息', 'ok');
+      }
+      closeModal('ws-modal');
       loadWorkspaces().then(function () {
-        var p = (r.data.workspace || {}).path;
-        $('nc-workspace').value = p;
-        updateWsHint();
-        $('nc-ws-msg').textContent = '已创建：' + p;
+        renderSessions(state.tab === 'archived' ? state.archived : state.sessions);
+        if (state.wsOnDone) state.wsOnDone(w);
+        state.wsOnDone = null;
       });
     }).catch(function () {
       btn.disabled = false;
-      $('nc-ws-msg').textContent = '网络异常';
+      toast('网络异常', 'err');
     });
+  });
+
+  $('wsm-delete').addEventListener('click', function () {
+    var ws = state.wsEditing;
+    if (!ws) return;
+    var purge = $('wsm-purge').checked;
+    var st = ws.dir || {};
+    var text = '确定要移除工作区「' + (ws.name || ws.path) + '」吗？\n';
+    if (purge) {
+      text += '磁盘目录 ' + ws.path + '（' + st.entries + (st.truncated ? '+' : '') +
+        ' 项）会被彻底删除，无法恢复。\n';
+    } else {
+      text += '只会从左侧列表移除，磁盘上的 ' + ws.path + ' 原样保留。\n';
+    }
+    if (ws.sessions) {
+      text += '该工作区下的 ' + ws.sessions + ' 个会话记录不会被一起删除。';
+    }
+    confirmBox(purge ? '删除工作区目录' : '移除工作区', text, purge ? '删除' : '移除')
+      .then(function (ok) {
+        if (!ok) return;
+        var url = '/api/workspaces/' + encodeURIComponent(ws.id) +
+          (purge ? '?purge=1&confirm=' + encodeURIComponent(ws.path) : '');
+        req(url, { method: 'DELETE' }).then(function (r) {
+          if (!r.data.ok) { toast(r.data.error || '删除失败', 'err'); return; }
+          toast(purge ? '工作区与磁盘目录已删除' : '已移出工作区列表', 'ok');
+          closeModal('ws-modal');
+          loadWorkspaces().then(function () {
+            loadSessions(true);
+          });
+        }).catch(function () { toast('网络异常', 'err'); });
+      });
+  });
+
+  $('ws-add-btn').addEventListener('click', function () { openWsModal('create'); });
+
+  $('nc-new-ws').addEventListener('click', function () {
+    openWsModal('create', null, function (w) {
+      var sel = $('nc-workspace');
+      if (w && w.path) {
+        for (var i = 0; i < sel.options.length; i++) {
+          if (sel.options[i].value === w.path) { sel.value = w.path; break; }
+        }
+      }
+      updateWsHint();
+    });
+  });
+
+  $('nc-edit-ws').addEventListener('click', function () {
+    var p = $('nc-workspace').value;
+    if (!p) return;
+    openWsModal('edit', findWorkspace(p));
   });
 
   $('nc-create').addEventListener('click', function () {
@@ -1273,6 +1789,20 @@
 
   /* ============================================ 设置：框架 */
 
+  var SETTINGS_PANES = ['general', 'security', 'models', 'usage'];
+
+  function showSettingsPane(name) {
+    if (SETTINGS_PANES.indexOf(name) < 0) name = 'general';
+    document.querySelectorAll('#settings-modal .nav-item').forEach(function (x) {
+      x.classList.toggle('active', x.dataset.pane === name);
+    });
+    SETTINGS_PANES.forEach(function (p) {
+      var el = $('pane-' + p);
+      if (el) el.classList.toggle('hidden', p !== name);
+    });
+    if (name === 'usage') loadUsage(state.usageRange, true);
+  }
+
   $('settings-btn').addEventListener('click', function () {
     openModal('settings-modal');
     // 每次打开都回到「官方配置」栏，免得上次停在自定义栏造成误解
@@ -1282,18 +1812,11 @@
     });
     loadSecurity();
     loadProviders();
+    loadUsage(state.usageRange);
   });
 
-  document.querySelectorAll('.nav-item').forEach(function (b) {
-    b.addEventListener('click', function () {
-      document.querySelectorAll('.nav-item').forEach(function (x) {
-        x.classList.toggle('active', x === b);
-      });
-      var pane = b.dataset.pane;
-      ['general', 'security', 'models'].forEach(function (p) {
-        $('pane-' + p).classList.toggle('hidden', p !== pane);
-      });
-    });
+  document.querySelectorAll('#settings-modal .nav-item').forEach(function (b) {
+    b.addEventListener('click', function () { showSettingsPane(b.dataset.pane); });
   });
 
   /* ============================================ 设置：通用 */
@@ -1596,6 +2119,132 @@
       });
   });
 
+  /* ============================================ 使用统计 */
+
+  var USAGE_RANGE_LABEL = { today: '今日', '7d': '近 7 天', '30d': '近 30 天', all: '全部' };
+
+  function loadUsage(range, force) {
+    if (range) state.usageRange = range;
+    var url = '/api/usage?range=' + encodeURIComponent(state.usageRange) +
+      (force ? '&fresh=1&_=' + Date.now() : '');
+    return req(url).then(function (r) {
+      if (!r.data.ok) {
+        if (force) toast(r.data.error || '读取用量失败', 'err');
+        return null;
+      }
+      state.usage = r.data;
+      renderUsageChip(r.data);
+      renderUsagePane(r.data);
+      return r.data;
+    }).catch(function () { return null; });
+  }
+
+  function renderUsageChip(d) {
+    var t = d.today || {};
+    var val = $('usage-chip-value');
+    if (val) val.textContent = fmtTokens(t.tokens || 0);
+    var chip = $('usage-chip');
+    if (chip) {
+      chip.title = '今日 token 用量 ' + fmtNum(t.tokens || 0) +
+        '\n输入 ' + fmtNum(t.inputTokens || 0) +
+        ' · 输出 ' + fmtNum(t.outputTokens || 0) +
+        (t.reasoningTokens ? ' · 思考 ' + fmtNum(t.reasoningTokens) : '') +
+        '\n模型请求 ' + (t.requests || 0) + ' 次 · 涉及 ' + (t.sessions || 0) + ' 个会话' +
+        '\n点击查看使用统计';
+    }
+  }
+
+  function renderUsagePane(d) {
+    var sum = d.summary || {};
+    var label = USAGE_RANGE_LABEL[d.range] || d.range;
+
+    var cards = [
+      { k: '总 token', v: fmtTokens(sum.tokens), sub: fmtNum(sum.tokens) },
+      { k: '输入', v: fmtTokens(sum.inputTokens), sub: fmtNum(sum.inputTokens) },
+      { k: '输出', v: fmtTokens(sum.outputTokens), sub: fmtNum(sum.outputTokens) },
+      { k: '思考', v: fmtTokens(sum.reasoningTokens), sub: fmtNum(sum.reasoningTokens) },
+      { k: '缓存读取', v: fmtTokens(sum.cacheReadTokens), sub: fmtNum(sum.cacheReadTokens) },
+      { k: '模型请求', v: fmtNum(sum.requests) + ' 次', sub: '平均 ' + fmtDuration(sum.avgDurationMs) },
+      { k: '会话数', v: fmtNum(sum.sessions) + ' 个', sub: '工具调用 ' + fmtNum(sum.toolExecutions || 0) + ' 次' },
+      { k: '失败/取消', v: fmtNum(sum.errors) + ' 次', sub: '总计耗时 ' + fmtDuration(sum.durationMs) },
+    ];
+    $('usage-cards').innerHTML = cards.map(function (c) {
+      return '<div class="usage-card"><span class="usage-card-k">' + esc(c.k) + '</span>' +
+        '<b class="usage-card-v">' + esc(c.v) + '</b>' +
+        '<span class="usage-card-sub">' + esc(c.sub) + '</span></div>';
+    }).join('');
+
+    renderUsageChart(d.series || []);
+    renderUsageModels(d.byModel || []);
+
+    var last = sum.lastAt ? new Date(sum.lastAt).toLocaleString() : '—';
+    var first = sum.firstAt ? new Date(sum.firstAt).toLocaleString() : '—';
+    $('usage-note').textContent = '统计区间：' + label +
+      '　累计（全部时间）：' + fmtTokens((d.all || {}).tokens) +
+      '　首次记录：' + first + '　最近一次：' + last;
+  }
+
+  function renderUsageChart(series) {
+    var box = $('usage-chart');
+    if (!series.length) { box.innerHTML = '<div class="usage-empty">暂无数据</div>'; return; }
+    var max = 0;
+    series.forEach(function (p) { if (p.tokens > max) max = p.tokens; });
+    var today = new Date();
+    var todayKey = today.getFullYear() + '-' + pad2(today.getMonth() + 1) + '-' + pad2(today.getDate());
+    var bars = series.map(function (p) {
+      var h = max > 0 ? Math.max(2, Math.round(p.tokens / max * 100)) : 2;
+      var dim = todayKey === p.date;
+      return '<div class="usage-bar' + (dim ? ' today' : '') + '" title="' +
+        esc(p.date) + '　' + fmtNum(p.tokens) + ' tokens（输入 ' + fmtNum(p.input) +
+        ' / 输出 ' + fmtNum(p.output) + '，' + p.requests + ' 次请求）">' +
+        '<span class="usage-bar-fill" style="height:' + h + '%"></span></div>';
+    }).join('');
+    var labels = series.map(function (p, i) {
+      // 只标首、尾和每隔一天，免得挤在一起
+      var show = i === series.length - 1 || i === 0 || i % 3 === 0;
+      return '<span>' + (show ? esc(p.date.slice(5)) : '') + '</span>';
+    }).join('');
+    box.innerHTML = '<div class="usage-bars">' + bars + '</div>' +
+      '<div class="usage-bar-labels">' + labels + '</div>' +
+      '<div class="usage-bar-max">峰值 ' + fmtTokens(max) + ' tokens</div>';
+  }
+
+  function renderUsageModels(list) {
+    var box = $('usage-models');
+    if (!list.length) { box.innerHTML = '<div class="usage-empty">这个区间还没有调用记录</div>'; return; }
+    var rows = list.map(function (m) {
+      return '<tr><td><code>' + esc(m.providerId) + '</code></td>' +
+        '<td>' + esc(m.modelId) + '</td>' +
+        '<td class="num"><b>' + fmtTokens(m.tokens) + '</b></td>' +
+        '<td class="num">' + fmtTokens(m.inputTokens) + '</td>' +
+        '<td class="num">' + fmtTokens(m.outputTokens) + '</td>' +
+        '<td class="num">' + (m.requests || 0) + '</td>' +
+        '<td class="num">' + (m.sessions || 0) + '</td></tr>';
+    }).join('');
+    box.innerHTML = '<table class="usage-tbl"><thead><tr>' +
+      '<th>厂商</th><th>模型</th><th class="num">总 token</th><th class="num">输入</th>' +
+      '<th class="num">输出</th><th class="num">请求</th><th class="num">会话</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table>';
+  }
+
+  $('usage-seg').addEventListener('click', function (e) {
+    var b = e.target.closest ? e.target.closest('.seg-btn') : null;
+    if (!b) return;
+    var btns = this.querySelectorAll('.seg-btn');
+    for (var i = 0; i < btns.length; i++) btns[i].classList.toggle('active', btns[i] === b);
+    loadUsage(b.dataset.range, true);
+  });
+
+  $('usage-refresh').addEventListener('click', function () { loadUsage(null, true); });
+
+  $('usage-chip').addEventListener('click', function () {
+    openModal('settings-modal');
+    showSettingsPane('usage');
+    loadSecurity();
+    loadProviders();
+    loadUsage(state.usageRange, true);
+  });
+
   /* ============================================ 侧栏 / 顶栏交互 */
 
   $('new-chat-btn').addEventListener('click', openNewChat);
@@ -1611,11 +2260,21 @@
     $('expand-btn').classList.add('hidden');
   });
 
-  $('logout-btn').addEventListener('click', function () {
+  $('set-logout-btn').addEventListener('click', function () {
     req('/api/logout', { method: 'POST' }).then(function () {
+      state.wsManualClose = true;
+      state.wsEnabled = false;
+      stopWsKeepalive();
+      clearTimeout(state.wsResumeTimer);
+      state.wsResumeTimer = null;
+      if (state.wsTimer) { clearTimeout(state.wsTimer); state.wsTimer = null; }
       if (state.ws) { try { state.ws.close(); } catch (e) {} state.ws = null; }
       state.sessionId = null;
       clearMessages();
+      // 退出登录时把还开着的弹窗一并关掉，否则会浮在登录页上面
+      closeModal('settings-modal');
+      closeModal('newchat-modal');
+      closeModal('ws-modal');
       showLogin();
       $('key-input').value = '';
       $('key-input').focus();

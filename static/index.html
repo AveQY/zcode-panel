@@ -47,6 +47,11 @@
       <button id="refresh-btn" class="icon-btn" title="刷新列表">&#8635;</button>
     </div>
 
+    <div class="ws-bar">
+      <span class="ws-bar-title">工作区</span>
+      <button id="ws-add-btn" class="icon-btn sm" title="新建工作区">&#43;</button>
+    </div>
+
     <div class="seg" id="session-seg">
       <button class="seg-btn active" data-tab="active">会话</button>
       <button class="seg-btn" data-tab="archived">归档</button>
@@ -59,7 +64,6 @@
         <span id="foot-info" class="foot-info"></span>
         <button id="settings-btn" class="text-btn" title="打开设置">&#9881; 设置</button>
       </div>
-      <button id="logout-btn" class="text-btn subtle">退出登录</button>
     </div>
   </aside>
 
@@ -71,11 +75,10 @@
         <span id="chat-meta" class="chat-meta"></span>
       </div>
       <div class="chat-actions">
-        <label class="sel-wrap" id="mode-wrap">
-          <span class="sel-label">模式</span>
-          <select id="mode-select"></select>
-          <span class="sel-desc" id="mode-desc"></span>
-        </label>
+        <button id="usage-chip" class="usage-chip" title="今日 token 用量，点击查看使用统计">
+          <span class="usage-chip-label">今日</span>
+          <b id="usage-chip-value">&mdash;</b>
+        </button>
       </div>
     </header>
 
@@ -114,6 +117,10 @@
           </label>
         </div>
         <div class="composer-right">
+          <label class="pick" title="本会话的权限模式">
+            <span>模式</span>
+            <select id="mode-select"></select>
+          </label>
           <span id="status-text"></span>
           <button id="stop-btn" class="text-btn danger hidden">停止生成</button>
         </div>
@@ -150,21 +157,9 @@
         <div class="row-inline">
           <select id="nc-workspace" class="grow"></select>
           <button id="nc-new-ws" class="ghost-btn" type="button">新建工作区</button>
+          <button id="nc-edit-ws" class="icon-btn" type="button" title="管理工作区">&#8943;</button>
         </div>
         <div class="form-hint" id="nc-ws-hint"></div>
-      </div>
-
-      <div class="form-row hidden" id="nc-new-ws-row">
-        <label class="form-label">新工作区</label>
-        <div class="row-inline">
-          <input id="nc-ws-name" type="text" placeholder="名称，例如 my-project" class="grow">
-          <select id="nc-ws-purpose" class="narrow">
-            <option value="project">项目</option>
-            <option value="task">任务</option>
-          </select>
-          <button id="nc-ws-create" class="primary-btn" type="button">创建</button>
-        </div>
-        <div class="form-hint" id="nc-ws-msg"></div>
       </div>
 
       <div class="form-row two-col">
@@ -191,6 +186,55 @@
   </div>
 </div>
 
+<!-- ============================ 工作区管理 ============================ -->
+<div id="ws-modal" class="modal hidden">
+  <div class="modal-mask" data-close="ws-modal"></div>
+  <div class="modal-card mid">
+    <div class="modal-head">
+      <h3 id="wsm-title">新建工作区</h3>
+      <button class="icon-btn" data-close="ws-modal">&#10005;</button>
+    </div>
+    <div class="modal-body">
+      <div class="form-row">
+        <label class="form-label" for="wsm-name">名称</label>
+        <input id="wsm-name" type="text" placeholder="例如 my-project"
+               autocomplete="off" spellcheck="false">
+        <div class="form-hint">侧栏分组和会话列表里显示的名字，可随时改。</div>
+      </div>
+
+      <div class="form-row" id="wsm-path-row">
+        <label class="form-label" for="wsm-path">目录</label>
+        <input id="wsm-path" type="text" placeholder="留空则按名称自动生成"
+               autocomplete="off" spellcheck="false">
+        <div class="form-hint" id="wsm-preview"></div>
+      </div>
+
+      <div class="form-row" id="wsm-purpose-row">
+        <label class="form-label" for="wsm-purpose">用途</label>
+        <select id="wsm-purpose" class="narrow">
+          <option value="project">项目</option>
+          <option value="task">任务</option>
+        </select>
+      </div>
+
+      <div class="form-row hidden" id="wsm-danger-row">
+        <label class="form-label">危险操作</label>
+        <label class="check-row">
+          <input type="checkbox" id="wsm-purge">
+          <span>同时删除磁盘目录 <code id="wsm-dir"></code>（<b id="wsm-entries">0</b> 项，<b>不可恢复</b>）</span>
+        </label>
+        <div class="form-hint" id="wsm-danger-hint"></div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="text-btn danger hidden" id="wsm-delete">删除工作区</button>
+      <span class="grow"></span>
+      <button class="ghost-btn" data-close="ws-modal">取消</button>
+      <button id="wsm-save" class="primary-btn">创建</button>
+    </div>
+  </div>
+</div>
+
 <!-- ============================ 设置 ============================ -->
 <div id="settings-modal" class="modal hidden">
   <div class="modal-mask" data-close="settings-modal"></div>
@@ -204,6 +248,7 @@
         <button class="nav-item active" data-pane="general">通用设置</button>
         <button class="nav-item" data-pane="security">登录安全</button>
         <button class="nav-item" data-pane="models">模型配置</button>
+        <button class="nav-item" data-pane="usage">使用统计</button>
         <div class="nav-sep"></div>
         <div class="nav-note" id="settings-note"></div>
       </nav>
@@ -271,6 +316,14 @@
           <button id="set-key-save" class="primary-btn">更新密钥</button>
         </div>
 
+        <div class="setting-item mt">
+          <div class="setting-text">
+            <b>退出登录</b>
+            <span>清除本机的登录凭证，回到密钥输入页。下次需要重新输入访问密钥。</span>
+          </div>
+          <button id="set-logout-btn" class="ghost-btn">退出登录</button>
+        </div>
+
         <h4 class="mt">最近的工具放行记录</h4>
         <div id="perm-list" class="perm-list"></div>
       </section>
@@ -284,6 +337,30 @@
         </div>
         <div id="prov-list" class="prov-list"></div>
         <div class="pane-note" id="prov-note"></div>
+      </section>
+
+      <section class="settings-pane hidden" id="pane-usage">
+        <div class="usage-head">
+          <h4>使用统计</h4>
+          <div class="seg" id="usage-seg">
+            <button class="seg-btn active" data-range="today">今日</button>
+            <button class="seg-btn" data-range="7d">近 7 天</button>
+            <button class="seg-btn" data-range="30d">近 30 天</button>
+            <button class="seg-btn" data-range="all">全部</button>
+          </div>
+          <button id="usage-refresh" class="icon-btn" title="刷新">&#8635;</button>
+        </div>
+        <div class="pane-note">数据来自 zcode 自己记录的 <code>model_usage</code> 表，只读汇总，不影响会话。</div>
+
+        <div id="usage-cards" class="usage-cards"></div>
+
+        <h4 class="mt">每日用量（最近 14 天）</h4>
+        <div id="usage-chart" class="usage-chart"></div>
+
+        <h4 class="mt">按模型</h4>
+        <div id="usage-models" class="usage-table"></div>
+
+        <div class="pane-note" id="usage-note"></div>
       </section>
     </div>
   </div>

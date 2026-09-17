@@ -31,6 +31,7 @@ import secrets
 import shutil
 import signal
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -286,6 +287,220 @@ def ensure_workspace_registered(path, purpose="project", name=None):
     items.append(it)
     save_workspaces(items)
     return it
+
+
+def workspace_dir_stat(path):
+    """工作区目录现状：是否存在、里面有多少条目（用于删除前提示）。"""
+    out = {"exists": False, "entries": 0, "truncated": False}
+    if not path:
+        return out
+    try:
+        if not os.path.isdir(path):
+            return out
+        out["exists"] = True
+        n = 0
+        with os.scandir(path) as it:
+            for _ in it:
+                n += 1
+                if n >= 500:
+                    out["truncated"] = True
+                    break
+        out["entries"] = n
+    except Exception:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------- 用量统计
+
+# zcode 把每次模型调用的用量写进 model_usage，这里只读汇总，不改动它的库。
+# 字段口径：
+#   computed_total_tokens 是 zcode 自己算的总量，优先用它；
+#   个别 provider 不报总量，回退 provider_total_tokens，再回退分项相加。
+#   started_at / completed_at 都是毫秒时间戳（和 session.time_created 一致）。
+USAGE_TOTAL_EXPR = ("COALESCE(NULLIF(computed_total_tokens, 0), "
+                    "NULLIF(provider_total_tokens, 0), "
+                    "input_tokens + output_tokens + reasoning_tokens)")
+
+USAGE_RANGE_DAYS = {"today": 1, "7d": 7, "30d": 30, "all": None}
+USAGE_SERIES_DAYS = 14            # 图表固定看最近 14 天
+_usage_cache = {}                 # range -> (ts, payload)
+_usage_lock = threading.Lock()
+USAGE_CACHE_TTL = 20
+
+
+def day_start_ms(ts=None):
+    """本地时区「当天 0 点」的毫秒时间戳（入参是秒，和 time.time() 一致）。"""
+    t = time.localtime(ts if ts is not None else time.time())
+    return int(time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1)) * 1000)
+
+
+def day_key(ms):
+    """毫秒时间戳 -> 本地日期字符串 YYYY-MM-DD。
+
+    注意 time.localtime 收的是**秒**，这里必须先除以 1000，
+    否则算出来的年份会跑到几万年之后，所有事件都落不进当天的桶里。
+    """
+    t = time.localtime((ms or 0) / 1000.0)
+    return "%04d-%02d-%02d" % (t.tm_year, t.tm_mon, t.tm_mday)
+
+
+def usage_rows(since_ms=None):
+    """读 model_usage 明细（只读）。表还不存在时返回空列表。"""
+    conn = db_connect()
+    try:
+        sql = ("SELECT session_id, turn_id, provider_id, model_id, mode, status, "
+               "started_at, completed_at, duration_ms, tool_call_count, "
+               "input_tokens, output_tokens, reasoning_tokens, "
+               "cache_creation_input_tokens, cache_read_input_tokens, "
+               + USAGE_TOTAL_EXPR + " AS total_tokens FROM model_usage")
+        if since_ms:
+            sql += " WHERE started_at >= %d" % int(since_ms)
+        return [dict(r) for r in conn.execute(sql)]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def usage_tool_rows(since_ms=None):
+    """读 tool_usage，只要次数与成败，用于「工具调用」指标。"""
+    conn = db_connect()
+    try:
+        sql = ("SELECT session_id, tool_name, status FROM tool_usage")
+        if since_ms:
+            sql += " WHERE started_at >= %d" % int(since_ms)
+        return [dict(r) for r in conn.execute(sql)]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _usage_blank():
+    return {"tokens": 0, "inputTokens": 0, "outputTokens": 0, "reasoningTokens": 0,
+            "cacheReadTokens": 0, "cacheCreationTokens": 0, "requests": 0,
+            "errors": 0, "toolCalls": 0, "durationMs": 0}
+
+
+def _usage_agg(rows):
+    agg = _usage_blank()
+    sessions = set()
+    for r in rows:
+        agg["tokens"] += r.get("total_tokens") or 0
+        agg["inputTokens"] += r.get("input_tokens") or 0
+        agg["outputTokens"] += r.get("output_tokens") or 0
+        agg["reasoningTokens"] += r.get("reasoning_tokens") or 0
+        agg["cacheReadTokens"] += r.get("cache_read_input_tokens") or 0
+        agg["cacheCreationTokens"] += r.get("cache_creation_input_tokens") or 0
+        agg["durationMs"] += r.get("duration_ms") or 0
+        agg["toolCalls"] += r.get("tool_call_count") or 0
+        agg["requests"] += 1
+        if r.get("status") in ("error", "cancelled"):
+            agg["errors"] += 1
+        if r.get("session_id"):
+            sessions.add(r["session_id"])
+    agg["sessions"] = len(sessions)
+    agg["avgDurationMs"] = int(agg["durationMs"] / agg["requests"]) if agg["requests"] else 0
+    return agg
+
+
+def _usage_group(rows, key_fn):
+    groups = {}
+    for r in rows:
+        k = key_fn(r)
+        g = groups.get(k)
+        if g is None:
+            g = groups[k] = dict(_usage_blank(), sessions=set())
+        g["tokens"] += r.get("total_tokens") or 0
+        g["inputTokens"] += r.get("input_tokens") or 0
+        g["outputTokens"] += r.get("output_tokens") or 0
+        g["reasoningTokens"] += r.get("reasoning_tokens") or 0
+        g["cacheReadTokens"] += r.get("cache_read_input_tokens") or 0
+        g["cacheCreationTokens"] += r.get("cache_creation_input_tokens") or 0
+        g["requests"] += 1
+        if r.get("session_id"):
+            g["sessions"].add(r["session_id"])
+    out = []
+    for (pid, mid), g in groups.items():
+        item = {k: v for k, v in g.items() if k != "sessions"}
+        item["sessions"] = len(g["sessions"])
+        item["providerId"] = pid
+        item["modelId"] = mid
+        out.append(item)
+    out.sort(key=lambda x: -x["tokens"])
+    return out
+
+
+def build_usage_payload(range_key="today"):
+    days = USAGE_RANGE_DAYS.get(range_key, 1)
+    today0 = day_start_ms()
+    since = None if days is None else today0 - (days - 1) * 86400000
+
+    rows = usage_rows(since)
+    tools = usage_tool_rows(since)
+    summary = _usage_agg(rows)
+    summary["toolExecutions"] = len(tools)
+
+    today_rows = [r for r in rows if (r.get("started_at") or 0) >= today0]
+    today_tools = [t for t in tools]
+    today = _usage_agg(today_rows)
+    today["toolExecutions"] = len(today_tools)
+
+    for r in rows:
+        ts = r.get("started_at") or 0
+        if ts and (summary.get("firstAt") is None or ts < summary["firstAt"]):
+            summary["firstAt"] = ts
+        if ts and (summary.get("lastAt") is None or ts > summary["lastAt"]):
+            summary["lastAt"] = ts
+
+    # 近 14 天序列（不论当前选的是哪个区间，图表都要有一条连续的线）
+    series_start = today0 - (USAGE_SERIES_DAYS - 1) * 86400000
+    buckets = {}
+    for i in range(USAGE_SERIES_DAYS):
+        key = day_key(series_start + i * 86400000)
+        buckets[key] = {"date": key, "tokens": 0, "input": 0, "output": 0, "requests": 0}
+    for r in usage_rows(series_start):
+        ts = r.get("started_at") or 0
+        if not ts:
+            continue
+        b = buckets.get(day_key(ts))
+        if b is None:
+            continue
+        b["tokens"] += r.get("total_tokens") or 0
+        b["input"] += r.get("input_tokens") or 0
+        b["output"] += r.get("output_tokens") or 0
+        b["requests"] += 1
+
+    by_model = _usage_group(rows, lambda r: (r.get("provider_id") or "?", r.get("model_id") or "?"))
+
+    total_all = _usage_agg(usage_rows(None))
+    total_all["toolExecutions"] = len(usage_tool_rows(None))
+
+    return {
+        "range": range_key,
+        "now": int(time.time() * 1000),
+        "dayStart": today0,
+        "today": today,
+        "summary": summary,
+        "all": total_all,
+        "series": [buckets[k] for k in sorted(buckets.keys())],
+        "byModel": by_model[:20],
+    }
+
+
+def render_usage(request_range):
+    """带 20 秒缓存地构造用量数据，避免右上角角标频繁轮询时反复扫库。"""
+    key = request_range if request_range in USAGE_RANGE_DAYS else "today"
+    now = time.time()
+    with _usage_lock:
+        hit = _usage_cache.get(key)
+        if hit and now - hit[0] < USAGE_CACHE_TTL:
+            return hit[1]
+    payload = build_usage_payload(key)
+    with _usage_lock:
+        _usage_cache[key] = (time.time(), payload)
+    return payload
 
 
 # ---------------------------------------------------------------- SQLite（历史与归档）
@@ -1548,6 +1763,22 @@ async def handle_options(request):
     return web.json_response(data)
 
 
+async def handle_usage(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    key = request.query.get("range") or "today"
+    if key not in USAGE_RANGE_DAYS:
+        key = "today"
+    force = request.query.get("fresh") == "1"
+    try:
+        data = build_usage_payload(key) if force else render_usage(key)
+    except Exception as exc:
+        log(f"读取用量统计失败: {exc}")
+        return json_error(f"读取用量统计失败: {exc}", 502)
+    return web.json_response({"ok": True, **data})
+
+
 # ---------------------------------------------------------------- 路由：工作区
 
 async def handle_workspaces(request):
@@ -1565,10 +1796,13 @@ async def handle_workspaces(request):
     except Exception as exc:
         log(f"统计工作区会话数失败: {exc}")
 
-    root = config.get("workspace_root", "/root")
+    root = os.path.abspath(config.get("workspace_root", "/root"))
     out = []
     for it in items:
-        out.append({**it, "sessions": counts.get(it["path"], 0)})
+        path = it.get("path") or ""
+        out.append({**it, "sessions": counts.get(path, 0),
+                    "dir": workspace_dir_stat(path),
+                    "isRoot": os.path.abspath(path) == root})
     # 把有会话但没登记过的目录也带出来（比如别人手工建的会话）
     known = {it["path"] for it in items}
     for p, n in counts.items():
@@ -1581,6 +1815,8 @@ async def handle_workspaces(request):
                 "createdAt": None,
                 "sessions": n,
                 "unregistered": True,
+                "dir": workspace_dir_stat(p),
+                "isRoot": os.path.abspath(p) == root,
             })
     out.sort(key=lambda x: (-(x.get("sessions") or 0), x.get("name") or ""))
     return web.json_response({"ok": True, "workspaces": out, "root": root})
@@ -1603,39 +1839,137 @@ async def handle_workspace_create(request):
 
     root = config.get("workspace_root", "/root")
     if raw_path:
-        path = os.path.abspath(os.path.join(root, raw_path) if not raw_path.startswith("/") else raw_path)
+        # 给了路径就**原样使用**（只做安全校验），不再按名称生成目录名。
+        # 之前的实现一律走 slug，用户填「/root/my proj」会被改写成
+        # /root/-root-my-proj，建出来跟想建的不是一回事。
+        path = os.path.abspath(raw_path if raw_path.startswith("/")
+                               else os.path.join(root, raw_path))
+        if not name:
+            name = os.path.basename(path.rstrip("/")) or path
     else:
-        slug = re.sub(r"[^\w\-]+", "-", name, flags=re.UNICODE).strip("-").lower() or "workspace"
+        if not name or not WORKSPACE_NAME_RE.match(name):
+            return json_error("名称不合法（1-60 个字符，可用中英文、数字、空格、点、横线、下划线）")
+        slug = re.sub(r"[^\w\-]+", "-", name, flags=re.UNICODE).strip("-").lower()
+        if not slug:
+            return json_error("名称里没有可用作目录名的字符，请在「目录」里直接指定路径")
         path = os.path.abspath(os.path.join(root, slug))
+
+    if not name or not WORKSPACE_NAME_RE.match(name):
+        return json_error("名称不合法（1-60 个字符，可用中英文、数字、空格、点、横线、下划线）")
 
     # 只允许在工作区根目录下，避免越权访问系统目录
     if not (path == root or path.startswith(root.rstrip("/") + "/")):
         return json_error(f"路径必须位于 {root} 之下")
+    if path == root:
+        return json_error("工作区根目录已经存在，无需创建")
 
     if os.path.exists(path) and not os.path.isdir(path):
-        return json_error("该路径已存在且不是目录")
+        return json_error("该路径已存在且不是文件（同名文件占用了这个路径）")
     if create_dir and not os.path.exists(path):
         try:
             os.makedirs(path, exist_ok=True)
         except Exception as exc:
             return json_error(f"创建目录失败: {exc}")
 
-    it = ensure_workspace_registered(path, purpose, name)
-    log(f"新建工作区: {name} ({purpose}) -> {path}")
-    return web.json_response({"ok": True, "workspace": it})
+    items = load_workspaces()
+    existed = next((x for x in items if os.path.abspath(x.get("path") or "") == path), None)
+    if existed:
+        # 已登记过也要按这次填的名称/用途更新，否则「建完名字不是我要的」
+        changed = (existed.get("name") != name or existed.get("purpose") != purpose)
+        if changed:
+            existed["name"] = name
+            existed["purpose"] = purpose
+            save_workspaces(items)
+        it = existed
+        log(f"工作区已存在，{'已更新登记' if changed else '沿用原登记'}: {name} -> {path}")
+    else:
+        it = {"id": "ws_" + hashlib.sha1(path.encode()).hexdigest()[:12],
+              "name": name, "path": path, "purpose": purpose,
+              "createdAt": int(time.time() * 1000)}
+        items.append(it)
+        save_workspaces(items)
+        log(f"新建工作区: {name} ({purpose}) -> {path}")
+        # 新工作区在 app-server 里还没有 provider registry。不推的话，
+        # 在里面开会话会被判定「模型不可用」。启动时也会推，这里补一次让它立刻可用。
+        asyncio.create_task(push_registry("新建工作区", [path]))
+
+    return web.json_response({"ok": True, "workspace": it, "created": not existed,
+                              "dir": workspace_dir_stat(path)})
 
 
-async def handle_workspace_delete(request):
+async def handle_workspace_update(request):
+    """改工作区的显示名（不动磁盘目录）。"""
     blocked = guard(request)
     if blocked:
         return blocked
     wid = request.match_info["wid"]
+    data = await body_json(request)
+    name = str(data.get("name") or "").strip()
+    if not name or not WORKSPACE_NAME_RE.match(name):
+        return json_error("名称不合法（1-60 个字符，可用中英文、数字、空格、点、横线、下划线）")
+
     items = load_workspaces()
-    keep = [x for x in items if x.get("id") != wid]
-    if len(keep) == len(items):
+    it = next((x for x in items if x.get("id") == wid), None)
+    if it is None:
         return json_error("工作区不存在", 404)
+    old = it.get("name")
+    it["name"] = name
+    save_workspaces(items)
+    log(f"重命名工作区: {old} -> {name}（{it.get('path')}）")
+    return web.json_response({"ok": True, "workspace": it})
+
+
+async def handle_workspace_delete(request):
+    """移出工作区列表。purge=1 时**连磁盘目录一起删**，必须带 confirm=<路径> 二次确认。"""
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    wid = request.match_info["wid"]
+    purge = request.query.get("purge") == "1"
+    root = os.path.abspath(config.get("workspace_root", "/root"))
+
+    items = load_workspaces()
+    it = next((x for x in items if x.get("id") == wid), None)
+    if it is None:
+        return json_error("工作区不存在", 404)
+
+    path = os.path.abspath(it.get("path") or "")
+    if path == root:
+        return json_error("工作区根目录不能移除")
+    if not (path.startswith(root.rstrip("/") + "/")):
+        return json_error(f"只能操作 {root} 之下的目录")
+
+    purged = False
+    if purge:
+        # 删除目录是不可逆操作：必须显式带上要删的路径作为确认，避免误调用
+        if request.query.get("confirm") != path:
+            return json_error("删除目录需要二次确认参数")
+        if not os.path.isdir(path):
+            return json_error("目录不存在，无需删除")
+        try:
+            shutil.rmtree(path)
+            purged = True
+        except Exception as exc:
+            return json_error(f"删除目录失败: {exc}")
+
+    keep = [x for x in items if x.get("id") != wid]
     save_workspaces(keep)
-    return web.json_response({"ok": True})
+    log(f"移除工作区: {it.get('name')} ({path})" +
+        ("，并已删除磁盘目录" if purged else "，磁盘目录保留"))
+
+    # 目录没了，但会话记录还在库里，这里顺带告诉前端还剩多少条
+    left = 0
+    try:
+        conn = db_connect()
+        try:
+            left = conn.execute("SELECT COUNT(*) FROM session WHERE directory = ?",
+                                (path,)).fetchone()[0]
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return web.json_response({"ok": True, "path": path, "purged": purged,
+                              "sessionsLeft": left})
 
 
 # ---------------------------------------------------------------- 路由：会话
@@ -2034,7 +2368,9 @@ async def handle_ws(request):
     if not is_authed(request):
         return web.Response(status=401, text="unauthorized")
 
-    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=4 * 1024 * 1024)
+    # heartbeat 从 30s 放宽到 60s：移动网络下 30s 内没收到 pong 就断连过于激进，
+    # 前端另有 20s 应用层心跳 + 50s 无入站帧看门狗，检测死连接不依赖这里。
+    ws = web.WebSocketResponse(heartbeat=60, max_msg_size=4 * 1024 * 1024)
     await ws.prepare(request)
 
     watched = set()      # 本连接订阅的 sessionId
@@ -2205,9 +2541,11 @@ def make_app():
     app.router.add_post("/api/logout", handle_logout)
     app.router.add_get("/api/me", handle_me)
     app.router.add_get("/api/options", handle_options)
+    app.router.add_get("/api/usage", handle_usage)
 
     app.router.add_get("/api/workspaces", handle_workspaces)
     app.router.add_post("/api/workspaces", handle_workspace_create)
+    app.router.add_post("/api/workspaces/{wid}", handle_workspace_update)
     app.router.add_delete("/api/workspaces/{wid}", handle_workspace_delete)
 
     app.router.add_get("/api/sessions", handle_sessions)

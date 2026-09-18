@@ -32,6 +32,7 @@ import secrets
 import shutil
 import signal
 import sqlite3
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -730,6 +731,94 @@ def delete_session(session_id):
         return n
     finally:
         conn.close()
+
+
+# ---- 会话删除的「彻底清扫」--------------------------------------------------
+# 巡检触发器的绑定文件：zt_auto_fetch.py 启动时把目标会话写死在这里，
+# 删除绑定会话时联动摘掉 crontab 里的巡检行，避免「会话删了定时任务还在」。
+ZT_FETCH_TARGET = DATA_DIR / "zt_fetch_target.json"
+ZT_FETCH_TAG = "# zentao-auto-fetch"       # crontab 两行巡检的识别标记
+ZT_FETCH_PENDING = "/tmp/zt_auto_fetch.pending"
+
+
+def remove_fetch_crontab():
+    """把巡检触发的 cron 行（识别标记 ZT_FETCH_TAG）从 root crontab 里摘掉。"""
+    try:
+        cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True,
+                             timeout=10)
+        lines = (cur.stdout or "").splitlines()
+    except Exception as exc:
+        log(f"巡检 cron 读取失败（跳过摘除）: {exc}")
+        return 0
+    kept = [ln for ln in lines if ZT_FETCH_TAG not in ln]
+    removed = len(lines) - len(kept)
+    if removed <= 0:
+        return 0
+    try:
+        body = "\n".join(kept) + ("\n" if kept else "")
+        subprocess.run(["crontab", "-"], input=body, text=True, check=True,
+                       timeout=10)
+        log(f"已摘除巡检 cron {removed} 行")
+    except Exception as exc:
+        log(f"巡检 cron 摘除失败: {exc}")
+        return 0
+    return removed
+
+
+def cleanup_session_sidecars(session_id):
+    """删除会话后的彻底清扫：zc 磁盘遗留物 + 面板状态 + 联动的巡检定时任务。
+
+    zc 在自己的数据目录里有 DB 之外的每会话文件（rollout/model-io-<sid>.jsonl、
+    exec/<sid>/、artifacts/<sid>/），表里没有 session_id 列，数据库清扫扫不到，
+    必须按文件名/目录名清。
+    """
+    removed = {"files": 0, "cron": 0}
+    cli_dir = Path("/root/.zcode/cli")
+    # 1) zc 磁盘遗留物
+    try:
+        for f in (cli_dir / "rollout").glob(f"*{session_id}*"):
+            f.unlink(missing_ok=True)
+            removed["files"] += 1
+        for sub in ("exec", "artifacts"):
+            d = cli_dir / sub / session_id
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+                removed["files"] += 1
+    except Exception as exc:
+        log(f"会话 {session_id} 磁盘遗留物清理失败: {exc}")
+    # 2) 面板自己的状态
+    try:
+        runner.auto_run.pop(session_id, None)
+        save_auto_run(runner)
+    except Exception:
+        pass
+    try:
+        global schedules
+        n0 = len(schedules)
+        schedules = [s for s in schedules if s.get("id") != session_id]
+        if len(schedules) != n0:
+            save_schedules()
+    except Exception:
+        pass
+    try:
+        if BAN_PATH.exists():
+            banned = json.loads(BAN_PATH.read_text(encoding="utf-8"))
+            if isinstance(banned, dict) and banned.pop(session_id, None) is not None:
+                BAN_PATH.write_text(json.dumps(banned, ensure_ascii=False, indent=1),
+                                    encoding="utf-8")
+    except Exception:
+        pass
+    # 3) 联动的巡检定时任务：绑定的是这个会话 → 解绑 + 摘 cron
+    try:
+        if ZT_FETCH_TARGET.exists():
+            tgt = json.loads(ZT_FETCH_TARGET.read_text(encoding="utf-8"))
+            if tgt.get("sessionId") == session_id:
+                ZT_FETCH_TARGET.unlink(missing_ok=True)
+                Path(ZT_FETCH_PENDING).unlink(missing_ok=True)
+                removed["cron"] = remove_fetch_crontab()
+    except Exception as exc:
+        log(f"巡检定时任务解绑失败: {exc}")
+    return removed
 
 
 def session_title(session_id):
@@ -3647,9 +3736,13 @@ async def handle_session_delete(request):
         return blocked
     n = delete_session(sid)
     feed.feeds.pop(sid, None)
+    sidecar = cleanup_session_sidecars(sid)
     await zc.restart("会话已删除")
-    log(f"删除会话: {sid}（rowcount={n}）")
-    return web.json_response({"ok": True})
+    log(f"删除会话: {sid}（rowcount={n}，磁盘遗留 {sidecar['files']} 项，"
+        f"巡检 cron 摘除 {sidecar['cron']} 行）")
+    return web.json_response({"ok": True, "rowcount": n,
+                              "sidecarFiles": sidecar["files"],
+                              "cronRemoved": sidecar["cron"]})
 
 
 def model_known(provider_id, model_id):

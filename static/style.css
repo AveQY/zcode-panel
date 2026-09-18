@@ -878,17 +878,16 @@ select { cursor: pointer; }
 
 .model-rows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 10px; }
 .model-row {
-  display: flex; gap: 7px; align-items: center;
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1.4fr) minmax(70px, .9fr) minmax(70px, .9fr) auto auto;
+  gap: 7px; align-items: center;
   padding: 9px;
   border: 1px solid var(--border-soft);
   border-radius: 9px;
   background: var(--sidebar);
 }
-.model-row input { padding: 6px 9px; font-size: 12.5px; background: #fff; }
-.model-row .w-id { flex: 2; }
-.model-row .w-name { flex: 2; }
-.model-row .w-num { flex: 1; min-width: 72px; }
-.model-row .del { flex-shrink: 0; color: var(--text-mute); }
+.model-row input { width: 100%; min-width: 0; padding: 6px 9px; font-size: 12.5px; background: #fff; }
+.model-row .del { color: var(--text-mute); }
 .model-row .del:hover { color: var(--red); background: var(--red-soft); }
 
 /* ---------- 厂商弹窗：测试模型 / 拉取模型列表 ---------- */
@@ -1183,3 +1182,10 @@ select.locked, select:disabled.locked { background: var(--sidebar); color: var(-
   user-select: none;
 }
 .load-older:hover { color: var(--accent, #4a7dff); text-decoration: underline; }
+
+/* ---------- 窄屏：厂商弹窗模型行两行排布，避免挤压 ---------- */
+@media (max-width: 720px) {
+  .model-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .model-row .w-id { grid-column: 1 / -1; }
+  .model-row .probe, .model-row .del { justify-self: end; }
+}

@@ -6,6 +6,7 @@
     kind=openai-compatible + Base URL=…/api/anthropic → 厂商在 HTTP 200 里回 404 NOT_FOUND
 """
 import asyncio
+LOOP = asyncio.new_event_loop()
 import importlib.util
 import os
 import sys
@@ -117,7 +118,7 @@ app.probe_http = fake_http({
     "https://open.bigmodel.cn/api/paas/v4/chat/completions":
         (200, '{"error":{"code":"1113","message":"余额不足或无可用资源包,请充值。"}}'),
 })
-res = asyncio.get_event_loop().run_until_complete(
+res = LOOP.run_until_complete(
     app.probe_chat("openai-compatible", "https://open.bigmodel.cn/api/anthropic",
                    "sk-x", "GLM-5.3-Flash"))
 check("结论：不通", res["ok"], False)
@@ -134,7 +135,7 @@ app.probe_http = fake_http({
     "https://open.bigmodel.cn/api/paas/v4/chat/completions":
         (200, '{"choices":[{"message":{"content":"收到"}}]}'),
 })
-res = asyncio.get_event_loop().run_until_complete(
+res = LOOP.run_until_complete(
     app.probe_chat("openai-compatible", "https://open.bigmodel.cn/api/paas/v4",
                    "sk-x", "glm-5.3-flash"))
 check("改对后：通", res["ok"], True)
@@ -147,7 +148,7 @@ app.probe_http = fake_http({
     "https://open.bigmodel.cn/api/paas/v4/chat/completions":
         (401, '{"error":{"message":"令牌已过期或验证不正确"}}'),
 })
-res = asyncio.get_event_loop().run_until_complete(
+res = LOOP.run_until_complete(
     app.probe_chat("openai-compatible", "https://open.bigmodel.cn/api/paas/v4",
                    "bad", "glm-5.3-flash"))
 check("Key 错：不通", res["ok"], False)
@@ -165,7 +166,7 @@ async def dead(url, body=None, headers=None, timeout=None):
 
 
 app.probe_http = dead
-res = asyncio.get_event_loop().run_until_complete(
+res = LOOP.run_until_complete(
     app.probe_chat("openai-compatible", "https://api.aweqy.top/v1", "sk", "m"))
 check("网络不通：不通", res["ok"], False)
 has("网络不通：提示网络", "网络", res.get("error") or res.get("hint"))
@@ -179,7 +180,7 @@ app.probe_http = fake_http({
         (200, '{"data":[{"id":"glm-5.3-flash","name":"GLM-5.3-Flash"},'
               '{"id":"glm-4-flash"}]}'),
 })
-res = asyncio.get_event_loop().run_until_complete(
+res = LOOP.run_until_complete(
     app.probe_model_list("openai-compatible", "https://open.bigmodel.cn/api/anthropic",
                          "sk-x"))
 check("拉到列表", res["ok"], True)
@@ -194,7 +195,7 @@ app.probe_http = fake_http({
         (200, '{"object":"list","data":[{"id":"z-ai/glm-5.3-flash"},'
               '{"id":"deepseek-v4-flash"}]}'),
 })
-res = asyncio.get_event_loop().run_until_complete(
+res = LOOP.run_until_complete(
     app.probe_model_list("openai-compatible", "https://api.aweqy.top/v1", "sk-x"))
 check("自建网关也能拉", res["models"][0]["id"], "z-ai/glm-5.3-flash")
 check("  配置本来就对 -> 不提示改地址", "suggestBaseURL" in res, False)
@@ -230,7 +231,7 @@ check("执行中：desired 未被提前写脏（否则下一轮会被跳过）",
 
 # 下一轮发消息时落地
 tm.running.pop(SID, None)
-asyncio.get_event_loop().run_until_complete(tm.apply_settings(SID, model=None))
+LOOP.run_until_complete(tm.apply_settings(SID, model=None))
 check("下一轮：setModel 被发出", app.zc.calls[-1][0], "session/setModel")
 check("下一轮：用的是待生效的模型", app.zc.calls[-1][1]["model"], M1)
 check("下一轮：desired 已更新", tm.desired[SID]["model"], M1)
@@ -238,13 +239,13 @@ check("下一轮：pending 已清空", tm.pending_of(SID), {})
 
 # 显式传入优先于 pending，且 pending 不该残留
 tm.remember_pending(SID, model=M1)
-asyncio.get_event_loop().run_until_complete(tm.apply_settings(SID, model=M2))
+LOOP.run_until_complete(tm.apply_settings(SID, model=M2))
 check("显式传入优先", app.zc.calls[-1][1]["model"], M2)
 check("pending 已消费", tm.pending_of(SID), {})
 
 # 没有变化时不重复下发
 n = len(app.zc.calls)
-asyncio.get_event_loop().run_until_complete(tm.apply_settings(SID, model=M2))
+LOOP.run_until_complete(tm.apply_settings(SID, model=M2))
 check("同值不重复下发", len(app.zc.calls), n)
 
 print()

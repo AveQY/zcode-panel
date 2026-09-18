@@ -22,6 +22,7 @@ ZCode 对话控制台 —— 后端
 """
 
 import asyncio
+import gzip as _gzip
 import hashlib
 import hmac
 import json
@@ -576,16 +577,28 @@ def db_write():
     return conn
 
 
-def load_messages(session_id):
-    """还原一个会话的完整对话（读 zcode 自己的库）。"""
+def load_messages(session_id, limit=None, before=None):
+    """还原一个会话的对话（读 zcode 自己的库）。
+
+    limit: 只取最近 limit 条；before: 只取 sequence < before 的更早一段。
+    两者配合实现「默认最近 50 条 + 上滑加载更早消息」的分页，避免长会话
+    一次性全量拉库导致打开慢、内存涨。
+    """
     conn = db_connect()
     try:
         cur = conn.cursor()
-        cur.execute(
-            "SELECT id, data, sequence, time_created FROM message WHERE session_id = ? ORDER BY sequence",
-            (session_id,),
-        )
-        rows = cur.fetchall()
+        sql = "SELECT id, data, sequence, time_created FROM message WHERE session_id = ?"
+        params = [session_id]
+        if before is not None:
+            sql += " AND sequence < ?"
+            params.append(before)
+        sql += " ORDER BY sequence DESC"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        cur.execute(sql, params)
+        # 倒序取再反转，等价于时间正序的「最后 limit 条」
+        rows = list(cur.fetchall())[::-1]
         out = []
         for r in rows:
             try:
@@ -607,11 +620,24 @@ def load_messages(session_id):
                 "id": r["id"],
                 "role": meta.get("role", "unknown"),
                 "time": r["time_created"],
+                "seq": r["sequence"],
                 "model": model,
                 "error": meta.get("error"),
                 "parts": parts,
             })
         return out
+    finally:
+        conn.close()
+
+
+def session_msg_stats(session_id):
+    """会话消息总数与最小 sequence（分页判断 hasMore 用）。"""
+    conn = db_connect()
+    try:
+        r = conn.execute(
+            "SELECT COUNT(*) AS n, MIN(sequence) AS mn FROM message WHERE session_id = ?",
+            (session_id,)).fetchone()
+        return int(r["n"] or 0), (int(r["mn"]) if r["mn"] is not None else None)
     finally:
         conn.close()
 
@@ -3532,7 +3558,22 @@ async def handle_session_messages(request):
     row = session_row(sid)
     if not row:
         return json_error("会话不存在", 404)
-    msgs = load_messages(sid)
+
+    # 分页参数：默认最近 50 条；?before=<seq> 取更早一页（上滑加载）
+    q = request.query
+    try:
+        limit = min(max(int(q.get("limit", "50")), 1), 500)
+    except (TypeError, ValueError):
+        limit = 50
+    before = q.get("before")
+    if before is not None and before.isdigit():
+        before = int(before)
+    else:
+        before = None
+
+    msgs = load_messages(sid, limit=limit, before=before)
+    total, min_seq = session_msg_stats(sid)
+    has_more = bool(msgs and min_seq is not None and msgs[0]["seq"] > min_seq)
     f = feed.get(sid)
     return web.json_response({
         "ok": True,
@@ -3541,6 +3582,9 @@ async def handle_session_messages(request):
         "workspacePath": row.get("directory") or "",
         "archived": bool(row.get("time_archived")),
         "messages": msgs,
+        "total": total,
+        "hasMore": has_more,
+        "oldestSeq": (msgs[0]["seq"] if msgs else None),
         "live": bool(f and f.turn_active),
         "usage": (f.usage if f else None),
     })
@@ -4400,8 +4444,39 @@ async def on_cleanup(app):
         await zc.stop()
 
 
+# ---------------------------------------------------------------- 性能：gzip + 静态缓存
+
+PERF_GZIP_MIN = 1024  # 小于 1KB 不压缩，收益抵不过 CPU 开销
+
+
+@web.middleware
+async def perf_middleware(request, handler):
+    """对较大的 JSON/文本响应做 gzip（历史消息动辄几百 KB，压缩后传输明显变快）。"""
+    resp = await handler(request)
+    if (isinstance(resp, web.Response) and resp.body is not None
+            and len(resp.body) >= PERF_GZIP_MIN
+            and not resp.headers.get("Content-Encoding")):
+        if "gzip" in (request.headers.get("Accept-Encoding") or "").lower():
+            resp.body = _gzip.compress(bytes(resp.body), 5)
+            resp.headers["Content-Encoding"] = "gzip"
+            resp.headers["Content-Length"] = str(len(resp.body))
+            resp.headers.add("Vary", "Accept-Encoding")
+    return resp
+
+
+async def _on_prepare_cache(request, response):
+    """静态资源带 ?v= 版本号，可放心缓存；首页禁缓存保证更新可见。"""
+    p = request.path
+    if p.startswith("/static/"):
+        response.headers.setdefault("Cache-Control", "public, max-age=43200")
+    elif p == "/":
+        response.headers.setdefault("Cache-Control", "no-cache")
+
+
 def make_app():
-    app = web.Application(client_max_size=8 * 1024 * 1024)
+    app = web.Application(client_max_size=8 * 1024 * 1024,
+                          middlewares=[perf_middleware])
+    app.on_response_prepare.append(_on_prepare_cache)
     app.router.add_get("/", handle_index)
     app.router.add_get("/healthz", handle_health)
     app.router.add_post("/api/login", handle_login)

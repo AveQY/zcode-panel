@@ -23,6 +23,8 @@
     provScope: 'official',      // official | custom（默认停在「官方配置」，与 HTML 里 active 的按钮一致）
     editingProvider: null,
     cur: null,                  // 当前正在流式渲染的助手消息
+    msgPage: { hasMore: false, oldestSeq: null, loading: false,
+               total: 0, rendered: 0 },   // 历史消息分页：最近50条 + 上滑加载更早
     confirmResolve: null,
     // --- WebSocket 保活与自动重连 ---
     wsEnabled: false,           // 已进入控制台才允许连接/重连（未登录时不重连，避免 401 空转）
@@ -682,6 +684,64 @@
     box.innerHTML = '';
     state.messageMap.clear();
     state.cur = null;
+    state.msgPage = { hasMore: false, oldestSeq: null, loading: false,
+                      total: 0, rendered: 0 };
+  }
+
+  /* ---------- 历史消息分页：最近 50 条，滚到顶部继续加载更早 ---------- */
+
+  function olderLoaderEl() { return document.querySelector('#messages .load-older'); }
+
+  function updateOlderLoader() {
+    var box = $('messages');
+    var p = state.msgPage;
+    var el = olderLoaderEl();
+    if (!p.hasMore || p.oldestSeq == null || !state.sessionId) {
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+      return;
+    }
+    var rest = Math.max(0, p.total - p.rendered);
+    if (!el) {
+      el = document.createElement('div');
+      el.className = 'load-older';
+      el.addEventListener('click', function () { loadOlderMessages(); });
+      box.insertBefore(el, box.firstChild);
+    }
+    el.textContent = '加载更早的消息（还有 ' + rest + ' 条）';
+  }
+
+  function loadOlderMessages() {
+    var p = state.msgPage;
+    var box = $('messages');
+    if (!p.hasMore || p.loading || p.oldestSeq == null || !state.sessionId) return;
+    var sid = state.sessionId;
+    p.loading = true;
+    var prevH = box.scrollHeight, prevTop = box.scrollTop;
+    var el = olderLoaderEl();
+    if (el) { el.textContent = '加载中…'; }
+    req('/api/sessions/' + encodeURIComponent(sid) +
+        '/messages?limit=50&before=' + p.oldestSeq).then(function (r) {
+      p.loading = false;
+      if (state.sessionId !== sid) return;
+      if (!r.data.ok) {
+        toast(r.data.error || '加载更早消息失败', 'err');
+        updateOlderLoader();
+        return;
+      }
+      var msgs = r.data.messages || [];
+      // msgs 是时间正序；逐条“插到最上面”必须从新到旧遍历，否则整页顺序颠倒
+      for (var i = msgs.length - 1; i >= 0; i--) renderHistoryMessage(msgs[i], true);
+      p.rendered += msgs.length;
+      p.hasMore = !!r.data.hasMore;
+      p.oldestSeq = (msgs.length ? msgs[0].seq : null);
+      if (!p.hasMore && el) { el = olderLoaderEl(); if (el && el.parentNode) el.parentNode.removeChild(el); }
+      // 插入后补偿滚动位置，让视口停在与之前相同的消息上，而不是跳到底部
+      box.scrollTop = box.scrollHeight - prevH + prevTop;
+      updateOlderLoader();
+    }).catch(function () {
+      p.loading = false;
+      if (state.sessionId === sid) updateOlderLoader();
+    });
   }
 
   function hideWelcome() {
@@ -893,7 +953,7 @@
     try { return JSON.stringify(input, null, 2); } catch (e) { return String(input); }
   }
 
-  function appendUserMessage(text) {
+  function appendUserMessage(text, prepend) {
     hideWelcome();
     var box = $('messages');
     var row = document.createElement('div');
@@ -902,8 +962,8 @@
     bubble.className = 'bubble-user';
     bubble.textContent = text;
     row.appendChild(bubble);
-    box.appendChild(row);
-    scrollToBottom(true);
+    if (prepend) box.insertBefore(row, box.firstChild);
+    else { box.appendChild(row); scrollToBottom(true); }
   }
 
   function clearCursors() {
@@ -1660,7 +1720,7 @@
     $('chat-title').textContent = '加载中…';
     $('chat-meta').textContent = '';
 
-    req('/api/sessions/' + encodeURIComponent(sid) + '/messages').then(function (r) {
+    req('/api/sessions/' + encodeURIComponent(sid) + '/messages?limit=50').then(function (r) {
       // 期间用户又切到别的会话了：这份结果已经不属于当前视图，直接丢弃，
       // 否则快速来回切会让上一个会话的内容渲染进来。
       if (state.sessionId !== sid) return;
@@ -1671,11 +1731,17 @@
       }
       var msgs = r.data.messages || [];
       msgs.forEach(function (m) { renderHistoryMessage(m); });
+      state.msgPage.rendered = msgs.length;
+      state.msgPage.total = r.data.total || msgs.length;
+      state.msgPage.hasMore = !!r.data.hasMore;
+      state.msgPage.oldestSeq = (msgs.length ? msgs[0].seq : null);
       clearCursors();
       scrollToBottom(true);
+      updateOlderLoader();
 
       $('chat-title').textContent = r.data.title || '会话';
-      $('chat-meta').textContent = (r.data.workspacePath || '') + ' · ' + msgs.length + ' 条';
+      $('chat-meta').textContent = (r.data.workspacePath || '') + ' · 最近 ' +
+        msgs.length + ' / 共 ' + state.msgPage.total + ' 条';
 
       // 把会话自己的模式/模型同步到选择器
       var s = state.sessions.filter(function (x) { return x.id === sid; })[0];
@@ -1723,11 +1789,11 @@
     lastModelValue = $('model-select').value;
   }
 
-  function renderHistoryMessage(m) {
+  function renderHistoryMessage(m, prepend) {
     if (m.role === 'user') {
       var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
         .map(function (p) { return p.text || ''; }).join('');
-      if (texts) appendUserMessage(texts);
+      if (texts) appendUserMessage(texts, prepend);
       return;
     }
     if (m.role !== 'assistant') return;
@@ -1740,7 +1806,8 @@
     row.className = 'row';
     row.innerHTML = '<div class="assistant"><div class="avatar">Z</div>' +
       '<div class="assistant-body"></div></div>';
-    box.appendChild(row);
+    if (prepend) box.insertBefore(row, box.firstChild);
+    else box.appendChild(row);
     var entry = { mid: mid, role: 'assistant', row: row,
                   body: row.querySelector('.assistant-body'), mdEl: null, raw: '' };
     state.messageMap.set(mid, entry);
@@ -3203,6 +3270,14 @@
   });
 
   /* ============================================ 启动 */
+
+  // 滚到接近顶部时自动加载更早的历史消息（配合顶部的手动点击入口）
+  $('messages').addEventListener('scroll', function () {
+    var p = state.msgPage;
+    if (!p.hasMore || p.loading) return;
+    var box = $('messages');
+    if (box.scrollTop <= 60) loadOlderMessages();
+  });
 
   function applyMe(d) {
     if (!d) return;

@@ -1172,3 +1172,14 @@ select.locked, select:disabled.locked { background: var(--sidebar); color: var(-
   .sched-banner { flex-wrap: wrap; }
   .sched-row-ops { gap: 5px; }
 }
+
+/* ---------- 历史消息分页：顶部「加载更早」入口 ---------- */
+.load-older {
+  text-align: center;
+  padding: 10px 0 6px;
+  font-size: 12.5px;
+  color: var(--muted, #8a93a6);
+  cursor: pointer;
+  user-select: none;
+}
+.load-older:hover { color: var(--accent, #4a7dff); text-decoration: underline; }

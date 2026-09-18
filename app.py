@@ -1534,6 +1534,15 @@ class TurnManager:
     def is_running(self, session_id):
         return session_id in self.running
 
+    def forget(self, session_id):
+        """会话被删除后，清掉管理器里挂在这个会话上的全部内存状态。"""
+        self.running.pop(session_id, None)
+        self.desired.pop(session_id, None)
+        self.pending_settings.pop(session_id, None)
+        self.auto_run.pop(session_id, None)
+        self.last_sent.pop(session_id, None)
+        self.active.discard(session_id)
+
     def pending_of(self, session_id):
         return self.pending_settings.get(session_id) or {}
 
@@ -3731,16 +3740,27 @@ async def handle_session_delete(request):
         return json_error("非法的会话 ID", 400)
     if runner.is_running(sid):
         return json_error("会话正在执行中，请先停止", 409)
-    blocked = restart_guard(sid)
-    if blocked:
-        return blocked
+    # 异步删除：不再整座重启 app-server（那会打断其他会话的任务）。
+    # 实测（2026-09-18）：先对目标会话调 session/close —— app-server 只卸载它自己，
+    # 返回 {"closed": true} 后该会话即从内存列表消失；随后直接删库行不会复活。
+    # 其他会话无论在不在跑都不受影响。close 失败也照删（会话多半已被闲置卸载，
+    # 报 "not active"）；万一内存里仍有残影，也只影响面板之外的底层视图，下次
+    # 任何原因的重启自然收敛。
+    close_info = {"closed": False}
+    try:
+        r = await zc.call("session/close", {"sessionId": sid}, timeout=20)
+        close_info["closed"] = bool((r or {}).get("closed"))
+    except Exception as exc:
+        close_info["error"] = str(exc)[:120]
+        log(f"session/close({sid}) 失败（继续删库）: {close_info['error']}")
     n = delete_session(sid)
     feed.feeds.pop(sid, None)
+    runner.forget(sid)
     sidecar = cleanup_session_sidecars(sid)
-    await zc.restart("会话已删除")
-    log(f"删除会话: {sid}（rowcount={n}，磁盘遗留 {sidecar['files']} 项，"
-        f"巡检 cron 摘除 {sidecar['cron']} 行）")
-    return web.json_response({"ok": True, "rowcount": n,
+    log(f"删除会话: {sid}（rowcount={n}，close={close_info.get('closed')}，"
+        f"磁盘遗留 {sidecar['files']} 项，巡检 cron 摘除 {sidecar['cron']} 行）")
+    return web.json_response({"ok": True, "rowcount": n, "closed": close_info.get("closed", False),
+                              "closeError": close_info.get("error"),
                               "sidecarFiles": sidecar["files"],
                               "cronRemoved": sidecar["cron"]})
 

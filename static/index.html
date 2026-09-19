@@ -2,11 +2,11 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="referrer" content="no-referrer">
 <title>ZCode 对话控制台</title>
-<link rel="stylesheet" href="/static/style.css?v=20260919a">
+<link rel="stylesheet" href="/static/style.css?v=20260919b">
 </head>
 <body>
 
@@ -35,6 +35,9 @@
 
 <!-- ============================ 主体 ============================ -->
 <div id="app-view" class="app-view hidden">
+
+  <!-- 移动端抽屉遮罩：侧栏浮层打开时挡住聊天区，点它收起抽屉（桌面端隐藏） -->
+  <div id="sidebar-mask" class="sidebar-mask hidden"></div>
 
   <aside id="sidebar" class="sidebar">
     <div class="sidebar-head">
@@ -595,6 +598,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js?v=20260919a"></script>
+<script src="/static/app.js?v=20260919b"></script>
 </body>
 </html>

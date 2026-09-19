@@ -270,10 +270,7 @@
     loadWorkspaces().then(function () {
       loadSessions(true).then(restoreLastSession);
     });
-    if (window.innerWidth <= 720) {
-      $('sidebar').classList.add('collapsed');
-      $('expand-btn').classList.remove('hidden');
-    }
+    if (isMobileLayout()) setSidebarOpen(false);
   }
 
   /* ============================================ 登录 */
@@ -1193,8 +1190,13 @@
     wsSend({ type: 'cancel', sessionId: state.sessionId });
   });
 
+  var MQ_COARSE = window.matchMedia ? window.matchMedia('(pointer: coarse)') : null;
+  if (MQ_COARSE && MQ_COARSE.matches) {
+    $('input').placeholder = '输入消息…（点右侧按钮发送）';
+  }
   $('input').addEventListener('keydown', function (e) {
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+    // 软键盘上 Enter 只换行，发送交给发送按钮；物理键盘仍保留 Enter 直发
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && !(MQ_COARSE && MQ_COARSE.matches)) {
       e.preventDefault();
       send();
     }
@@ -1770,10 +1772,7 @@
         markRunning(sid, false);
         setStatus('');
       }
-      if (window.innerWidth <= 720) {
-        $('sidebar').classList.add('collapsed');
-        $('expand-btn').classList.remove('hidden');
-      }
+      if (isMobileLayout()) setSidebarOpen(false);
     });
   }
 
@@ -3249,15 +3248,51 @@
   $('new-chat-btn').addEventListener('click', openNewChat);
   $('refresh-btn').addEventListener('click', function () { loadSessions(false); });
 
-  $('collapse-btn').addEventListener('click', function () {
-    $('sidebar').classList.add('collapsed');
-    $('expand-btn').classList.remove('hidden');
-  });
+  // ---- 移动端抽屉：≤720px 时侧栏是浮层，遮罩用来点空白处收起 ----
+  var MQ_MOBILE = window.matchMedia ? window.matchMedia('(max-width: 720px)') : null;
 
-  $('expand-btn').addEventListener('click', function () {
-    $('sidebar').classList.remove('collapsed');
-    $('expand-btn').classList.add('hidden');
-  });
+  function isMobileLayout() { return MQ_MOBILE ? MQ_MOBILE.matches : window.innerWidth <= 720; }
+
+  function setSidebarOpen(open) {
+    $('sidebar').classList.toggle('collapsed', !open);
+    $('expand-btn').classList.toggle('hidden', open);
+    var mask = $('sidebar-mask');
+    if (mask) mask.classList.toggle('hidden', !(open && isMobileLayout()));
+  }
+
+  // 软键盘弹出时（iOS 不会缩放布局视口）把 visualViewport 的实际高度写进
+  // --vvh，让 .app-view 跟着收缩，输入框始终留在键盘上方而不是被盖住。
+  if (window.visualViewport) {
+    var vvSync = function () {
+      document.documentElement.style.setProperty('--vvh',
+        window.visualViewport.height + 'px');
+    };
+    window.visualViewport.addEventListener('resize', vvSync);
+    window.visualViewport.addEventListener('scroll', vvSync);
+    vvSync();
+  }
+
+  // 窗口跨过 720px 断点（旋转屏幕 / 拉伸窗口）时同步两侧的布局状态：
+  // 到窄屏收起抽屉，回宽屏恢复常驻侧栏并清掉遮罩和展开按钮。
+  function bindMobileQuery(mq) {
+    if (!mq) return;
+    var onChange = function (e) {
+      if (e.matches) setSidebarOpen(false);
+      else setSidebarOpen(true);
+    };
+    if (mq.addEventListener) mq.addEventListener('change', onChange);
+    else if (mq.addListener) mq.addListener(onChange);
+  }
+  bindMobileQuery(MQ_MOBILE);
+
+  $('collapse-btn').addEventListener('click', function () { setSidebarOpen(false); });
+
+  $('expand-btn').addEventListener('click', function () { setSidebarOpen(true); });
+
+  var sidebarMask = $('sidebar-mask');
+  if (sidebarMask) {
+    sidebarMask.addEventListener('click', function () { setSidebarOpen(false); });
+  }
 
   $('set-logout-btn').addEventListener('click', function () {
     req('/api/logout', { method: 'POST' }).then(function () {

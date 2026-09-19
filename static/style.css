@@ -538,21 +538,6 @@ details.fold > summary:hover { background: var(--sidebar-hover); }
 .toast.err { background: #b42318; }
 .toast.ok { background: #12703a; }
 
-/* ---------------- 移动端 ---------------- */
-
-@media (max-width: 720px) {
-  .sidebar {
-    position: absolute; top: 0; bottom: 0; left: 0; z-index: 30;
-    width: 80%; max-width: 300px;
-    box-shadow: 2px 0 16px rgba(16, 24, 40, 0.1);
-  }
-  .sidebar.collapsed { margin-left: 0; transform: translateX(-100%); width: 80%; }
-  .row { padding: 0 14px 16px; }
-  .bubble-user { max-width: 88%; }
-  .composer { padding: 8px 14px 14px; }
-  .chat-head { padding: 10px 12px; }
-}
-
 /* ============================================================
    v2 新增：设置弹窗 / 模型配置 / 新建会话 / 分段控件
    ============================================================ */
@@ -1157,10 +1142,10 @@ select.locked, select:disabled.locked { background: var(--sidebar); color: var(-
 .sched-banner-text .sched-pend { color: var(--amber); font-weight: 600; }
 
 @media (max-width: 720px) {
-  .modal-card.wide { height: 88vh; max-width: 100%; }
-  .settings-nav { width: 112px; }
-  .settings-pane { padding: 16px 14px 20px; }
+  /* 弹窗 / 设置布局的移动端规则已合并到文件上方的主移动端块，
+     这里只保留与上方不冲突的表单与列表细节 */
   .setting-item { flex-direction: column; align-items: flex-start; }
+  .setting-item > select, .setting-item > input { width: 100%; }
   .form-row.two-col { flex-direction: column; gap: 14px; }
   .purpose-grid { flex-direction: column; }
   .composer-picks { gap: 8px; }
@@ -1188,4 +1173,99 @@ select.locked, select:disabled.locked { background: var(--sidebar); color: var(-
   .model-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .model-row .w-id { grid-column: 1 / -1; }
   .model-row .probe, .model-row .del { justify-self: end; }
+}
+
+/* ---------------- 移动端 ---------------- */
+
+/* 移动端抽屉遮罩：只在窄屏、抽屉打开时由 JS 揭开 */
+.sidebar-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 25;
+  background: rgba(16, 24, 40, 0.4);
+}
+
+@media (max-width: 720px) {
+  html, body { height: 100dvh; }
+  /* 软键盘弹出时 visualViewport 变矮，JS 把实际高度写进 --vvh，
+     让整个应用跟着收缩、输入框始终留在键盘上方 */
+  .app-view { position: relative; height: 100%; height: var(--vvh, 100dvh); }
+
+  .sidebar {
+    position: absolute; top: 0; bottom: 0; left: 0; z-index: 30;
+    width: 82%; max-width: 320px;
+    box-shadow: 2px 0 16px rgba(16, 24, 40, 0.14);
+    transition: transform 0.2s ease, width 0.18s ease;
+  }
+  .sidebar.collapsed { margin-left: 0; transform: translateX(-102%); width: 82%; }
+
+  .row { padding: 0 14px 16px; }
+  .bubble-user { max-width: 88%; }
+  .composer { padding: 8px 12px calc(12px + env(safe-area-inset-bottom)); }
+  .chat-head { padding: 10px 12px; padding-top: calc(10px + env(safe-area-inset-top)); }
+  .messages { padding: 14px 0 8px; scroll-behavior: auto; overscroll-behavior-y: contain; }
+
+  /* iOS 聚焦字号 < 16px 会自动放大页面：触屏上一律给到 16px */
+  input, textarea, select { font-size: 16px; }
+  .pick select { max-width: 38vw; }
+  #input { font-size: 16px; max-height: 160px; }
+
+  /* 触控目标放大到不硌手的尺寸 */
+  .icon-btn { width: 36px; height: 36px; }
+  .send-btn { width: 38px; height: 38px; }
+  .session-item { padding: 11px 40px 11px 12px; }
+  .session-more { top: 11px; right: 8px; width: 30px; height: 30px; }
+  .session-menu button { padding: 11px 12px; font-size: 13.5px; }
+  .seg-btn { padding: 9px 10px; font-size: 13px; }
+  .ws-group-head { padding: 8px 8px 8px 6px; }
+  .day-picker span { width: 36px; height: 36px; }
+  .primary-btn, .ghost-btn { padding: 11px 16px; }
+  .primary-btn.wide { padding: 13px; }
+  .text-btn { padding: 8px 11px; }
+  .login-card { padding: 24px 20px 20px; }
+
+  /* 弹窗：窄屏上铺满可用空间，正文滚动 */
+  .modal { padding: 10px; }
+  .modal-card { max-height: 94dvh; }
+  .modal-card.small, .modal-card.mid { max-width: 100%; }
+  .modal-card.wide { height: 94dvh; }
+  .modal-body { padding: 14px; }
+  .modal-head { padding: 13px 14px; }
+  .modal-foot { padding: 11px 14px; flex-wrap: wrap; }
+
+  /* 设置弹窗：侧导航改为顶部横滑标签 */
+  .settings-body { flex-direction: column; }
+  .settings-nav {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding: 8px 10px;
+    overflow-x: auto;
+    flex-shrink: 0;
+    scrollbar-width: none;
+  }
+  .settings-nav::-webkit-scrollbar { display: none; }
+  .nav-item { width: auto; white-space: nowrap; margin-bottom: 0; padding: 8px 13px; }
+  .nav-sep, .nav-note { display: none; }
+  .settings-pane { padding: 16px 14px 22px; }
+
+  .toast { bottom: calc(20px + env(safe-area-inset-bottom)); }
+  .usage-chip-label { display: none; }
+}
+
+/* 更窄的屏：标题右侧的时长等次要信息让位 */
+@media (max-width: 420px) {
+  .chat-meta { display: none; }
+  .composer-picks { gap: 7px; }
+  .composer-right { gap: 7px; }
+}
+
+/* 触屏设备没有 hover：会话「⋯」和工作区「⋯」不能再靠悬停现身，
+   否则手机上永远无法归档 / 删除会话、管理工作区 */
+@media (hover: none) {
+  .session-more { display: flex; }
+  .ws-more { opacity: 1; }
 }

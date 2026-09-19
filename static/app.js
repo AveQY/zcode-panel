@@ -1680,7 +1680,7 @@
       });
   }
 
-  function deleteSession(sid) {
+  function deleteSession(sid, force) {
     var title = (state.sessions.concat(state.archived).filter(function (x) {
       return x.id === sid;
     })[0] || {}).title || sid;
@@ -1688,10 +1688,21 @@
       '确定要彻底删除「' + title + '」吗？\n它的全部消息记录会从数据库里删掉，无法恢复。',
       '彻底删除').then(function (ok) {
       if (!ok) return;
-      req('/api/sessions/' + encodeURIComponent(sid), { method: 'DELETE' })
+      req('/api/sessions/' + encodeURIComponent(sid) + (force ? '?force=1' : ''),
+          { method: 'DELETE' })
         .then(function (r) {
+          // 会话正在跑：后端挡了一道（409）。问一次「停止并删除」，确认后带
+          // force 重发——面板会先停掉这一轮、摘掉联动的巡检定时任务，再彻底删除。
+          if (r.status === 409 && !force) {
+            confirmBox('会话正在执行',
+              '「' + title + '」正在执行任务。\n先停止它再彻底删除，关联的定时任务也会一起删除。',
+              '停止并删除').then(function (ok2) {
+              if (ok2) deleteSession(sid, true);
+            });
+            return;
+          }
           if (!r.data.ok) { toast(r.data.error || '删除失败', 'err'); return; }
-          toast('已删除', 'ok');
+          toast(force && r.data.stopped ? '已停止并删除' : '已删除', 'ok');
           if (state.sessionId === sid) newChat();
           loadSessions(true);
         }).catch(function () { toast('网络异常', 'err'); });

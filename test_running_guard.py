@@ -11,6 +11,8 @@ import os
 import sys
 import types
 
+from pathlib import Path
+
 # ---- aiohttp 桩 ----
 aiohttp = types.ModuleType("aiohttp")
 
@@ -287,6 +289,92 @@ app.zc = zcd4
 res = run(app.handle_session_delete(FakeReq("sess_tgt1234567890")))
 check("其他会话在跑 -> 删除照样放行（不再 409）", res["status"], 200)
 check("整个过程零重启", zcd4.restarts, 0)
+
+
+print()
+print("=== 8. 停止并删除（force）：跑着的会话也要能删掉 ===")
+
+import tempfile as _tempfile
+_tmpdir = _tempfile.mkdtemp(prefix="zt_guard_test_")
+_real_target, _real_pending = app.ZT_FETCH_TARGET, app.ZT_FETCH_PENDING
+app.ZT_FETCH_TARGET = Path(_tmpdir) / "zt_fetch_target.json"
+app.ZT_FETCH_PENDING = str(Path(_tmpdir) / "zt_auto_fetch.pending")
+app.remove_fetch_crontab = lambda: 3      # 桩掉真正的 crontab 写操作
+
+
+class FakeReqF(FakeReq):
+    """带 query / body 的请求桩：force 走 query 或 body 都要认。"""
+
+    def __init__(self, sid, query=None, body=None):
+        FakeReq.__init__(self, sid)
+        self._q = query or {}
+        self._b = body or {}
+
+    @property
+    def query(self):
+        return self._q
+
+    async def json(self):
+        return self._b
+
+
+class FakeRunnerF(FakeRunner2):
+    def __init__(self, running=()):
+        FakeRunner2.__init__(self, running)
+        self.cancelled = []
+
+    async def cancel(self, session_id, strict=False):
+        self.cancelled.append((session_id, strict))
+        # 和真实 TurnManager.cancel 一样：发 session/stop
+        await app.zc.call("session/stop", {"sessionId": session_id}, timeout=30)
+        return True
+
+
+# 带巡检绑定的会话（桩路径）：force 删除要在停止前先解绑 + 摘 cron
+app.ZT_FETCH_TARGET.write_text(
+    '{"sessionId": "sess_bound1234567890"}', encoding="utf-8")
+app.runner = FakeRunnerF(running=("sess_bound1234567890",))
+zcd5 = FakeZcDel({"closed": True})
+app.zc = zcd5
+res = run(app.handle_session_delete(FakeReqF("sess_bound1234567890", query={"force": "1"})))
+check("跑着的会话 + force=1 -> 200 删除成功", res["status"], 200)
+check("先停止（cancel strict 模式）", app.runner.cancelled, [("sess_bound1234567890", True)])
+check("session/stop 是第一个协议调用，close 在其后",
+      zcd5.calls[0] == "session/stop" and "session/close" in zcd5.calls, True)
+check("响应带 stopped 标记", (res["payload"] or {}).get("stopped"), True)
+check("巡检绑定文件被解绑", app.ZT_FETCH_TARGET.exists(), False)
+check("响应带巡检 cron 摘除数", (res["payload"] or {}).get("cronRemoved"), 3)
+
+# body {"force": true} 一样要认
+app.ZT_FETCH_TARGET.unlink(missing_ok=True)
+app.runner = FakeRunnerF(running=("sess_bodyforce12345678",))
+zcd6 = FakeZcDel({"closed": True})
+app.zc = zcd6
+res = run(app.handle_session_delete(FakeReqF("sess_bodyforce12345678", body={"force": True})))
+check("body force=true -> 也是停止并删除", res["status"], 200)
+check("cancel 被调用", app.runner.cancelled, [("sess_bodyforce12345678", True)])
+
+# force + 停了但 app-server 一直不收尾：等满上限也要照删（删除是显式意图）
+app.DELETE_STOP_WAIT_MAX, _wait_saved = 0.2, app.DELETE_STOP_WAIT_MAX
+app.DELETE_STOP_WAIT_INTERVAL, _int_saved = 0.05, app.DELETE_STOP_WAIT_INTERVAL
+app.runner = FakeRunnerF(running=("sess_stuck1234567890",))
+zcd7 = FakeZcDel(sessions(("sess_stuck1234567890", "running")))
+app.zc = zcd7
+res = run(app.handle_session_delete(FakeReqF("sess_stuck1234567890", query={"force": "1"})))
+check("收尾超时 -> 照删不误（不再把用户挡死）", res["status"], 200)
+check("超时路径同样先停止过", app.runner.cancelled, [("sess_stuck1234567890", True)])
+app.DELETE_STOP_WAIT_MAX, app.DELETE_STOP_WAIT_INTERVAL = _wait_saved, _int_saved
+
+# unbind_fetch_cron 本身：没绑定 / 绑了别人 / 绑定目标三种情况
+app.ZT_FETCH_TARGET.unlink(missing_ok=True)
+check("没有绑定文件 -> 返回 0", app.unbind_fetch_cron("sess_any1234567890"), 0)
+app.ZT_FETCH_TARGET.write_text(
+    '{"sessionId": "sess_other1234567890"}', encoding="utf-8")
+check("绑定的是别的会话 -> 不动，返回 0", app.unbind_fetch_cron("sess_any1234567890"), 0)
+check("绑定文件还在", app.ZT_FETCH_TARGET.exists(), True)
+check("绑定的正是它 -> 解绑并返回摘除行数", app.unbind_fetch_cron("sess_other1234567890"), 3)
+check("解绑后绑定文件消失", app.ZT_FETCH_TARGET.exists(), False)
+app.ZT_FETCH_TARGET, app.ZT_FETCH_PENDING = _real_target, _real_pending
 
 
 print()

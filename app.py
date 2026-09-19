@@ -765,6 +765,24 @@ def remove_fetch_crontab():
     return removed
 
 
+def unbind_fetch_cron(session_id):
+    """解绑巡检触发器：绑定的是这个会话时，清绑定文件 + pending 标记，并摘掉 crontab 巡检行。
+
+    幂等：没绑定或已解绑时什么都不做。删除会话走「停止并删除」时要在**停止之前**
+    先调一次——否则删除窗口内巡检 cron 可能把会话重新拉起来，跟删库打架。
+    """
+    try:
+        if ZT_FETCH_TARGET.exists():
+            tgt = json.loads(ZT_FETCH_TARGET.read_text(encoding="utf-8"))
+            if tgt.get("sessionId") == session_id:
+                ZT_FETCH_TARGET.unlink(missing_ok=True)
+                Path(ZT_FETCH_PENDING).unlink(missing_ok=True)
+                return remove_fetch_crontab()
+    except Exception as exc:
+        log(f"巡检定时任务解绑失败: {exc}")
+    return 0
+
+
 def cleanup_session_sidecars(session_id):
     """删除会话后的彻底清扫：zc 磁盘遗留物 + 面板状态 + 联动的巡检定时任务。
 
@@ -809,15 +827,7 @@ def cleanup_session_sidecars(session_id):
     except Exception:
         pass
     # 3) 联动的巡检定时任务：绑定的是这个会话 → 解绑 + 摘 cron
-    try:
-        if ZT_FETCH_TARGET.exists():
-            tgt = json.loads(ZT_FETCH_TARGET.read_text(encoding="utf-8"))
-            if tgt.get("sessionId") == session_id:
-                ZT_FETCH_TARGET.unlink(missing_ok=True)
-                Path(ZT_FETCH_PENDING).unlink(missing_ok=True)
-                removed["cron"] = remove_fetch_crontab()
-    except Exception as exc:
-        log(f"巡检定时任务解绑失败: {exc}")
+    removed["cron"] = unbind_fetch_cron(session_id)
     return removed
 
 
@@ -3731,6 +3741,30 @@ async def handle_session_archive(request):
     return web.json_response({"ok": True, "archived": archived, "rowcount": n})
 
 
+DELETE_STOP_WAIT_MAX = 20.0        # 「停止并删除」等 app-server 收尾的上限（秒）
+DELETE_STOP_WAIT_INTERVAL = 1.0    # 收尾轮询间隔（秒）
+
+
+async def delete_force_requested(request):
+    """DELETE /api/sessions/{sid} 的 force 参数：query ?force=1/true 或 body {"force": true}。
+
+    force 只用于一件事：目标会话正在跑时，允许「先停止这一轮、再彻底删除」。
+    没带 force 的删除仍然 409 挡下——那是防止误触的保护，不放宽。
+    """
+    q = getattr(request, "query", None)
+    if q is not None:
+        try:
+            if str(q.get("force", "")).strip().lower() in ("1", "true", "yes"):
+                return True
+        except Exception:
+            pass
+    try:
+        data = await body_json(request)
+        return bool(data.get("force"))
+    except Exception:
+        return False
+
+
 async def handle_session_delete(request):
     blocked = guard(request)
     if blocked:
@@ -3738,14 +3772,40 @@ async def handle_session_delete(request):
     sid = request.match_info["sid"]
     if not SESSION_ID_RE.match(sid):
         return json_error("非法的会话 ID", 400)
-    if runner.is_running(sid):
-        return json_error("会话正在执行中，请先停止", 409)
+    force = await delete_force_requested(request)
+    running = runner.is_running(sid)
+    if running and not force:
+        return json_error("会话正在执行中。请先点「停止」，或选择「停止并删除」。", 409)
     # 异步删除：不再整座重启 app-server（那会打断其他会话的任务）。
     # 实测（2026-09-18）：先对目标会话调 session/close —— app-server 只卸载它自己，
     # 返回 {"closed": true} 后该会话即从内存列表消失；随后直接删库行不会复活。
     # 其他会话无论在不在跑都不受影响。close 失败也照删（会话多半已被闲置卸载，
     # 报 "not active"）；万一内存里仍有残影，也只影响面板之外的底层视图，下次
     # 任何原因的重启自然收敛。
+    stopped = False
+    cron_removed_early = 0
+    if running:
+        # 停止并删除（force）：先摘巡检联动（绑定的是它时），防止删除窗口内
+        # 被 cron 的下一拍重新拉起来跟删库打架；再停这一轮，等 app-server
+        # 真正收尾（session/stop 不保证中断已发出的工具调用）。等不掉也照删——
+        # 删除是显式意图，残影最多影响面板之外的底层视图，重启自然收敛。
+        cron_removed_early = unbind_fetch_cron(sid)
+        try:
+            await runner.cancel(sid, strict=True)
+            stopped = True
+        except Exception as exc:
+            log(f"停止会话失败（继续删除）{sid}: {exc}")
+        deadline = time.monotonic() + DELETE_STOP_WAIT_MAX
+        while True:
+            try:
+                if await remote_turn_state(sid) != "active":
+                    break
+            except Exception:
+                break
+            if time.monotonic() >= deadline:
+                log(f"会话 {sid} 停止后 {DELETE_STOP_WAIT_MAX:.0f}s 仍未收尾，超时继续删除")
+                break
+            await asyncio.sleep(DELETE_STOP_WAIT_INTERVAL)
     close_info = {"closed": False}
     try:
         r = await zc.call("session/close", {"sessionId": sid}, timeout=20)
@@ -3757,12 +3817,15 @@ async def handle_session_delete(request):
     feed.feeds.pop(sid, None)
     runner.forget(sid)
     sidecar = cleanup_session_sidecars(sid)
-    log(f"删除会话: {sid}（rowcount={n}，close={close_info.get('closed')}，"
-        f"磁盘遗留 {sidecar['files']} 项，巡检 cron 摘除 {sidecar['cron']} 行）")
+    # 提前解绑那次若已摘掉 cron 行，清扫里的二次解绑因幂等返回 0，两处相加不重复计
+    cron_removed = sidecar["cron"] + cron_removed_early
+    log(f"删除会话: {sid}（rowcount={n}，close={close_info.get('closed')}，stopped={stopped}，"
+        f"磁盘遗留 {sidecar['files']} 项，巡检 cron 摘除 {cron_removed} 行）")
     return web.json_response({"ok": True, "rowcount": n, "closed": close_info.get("closed", False),
+                              "stopped": stopped,
                               "closeError": close_info.get("error"),
                               "sidecarFiles": sidecar["files"],
-                              "cronRemoved": sidecar["cron"]})
+                              "cronRemoved": cron_removed})
 
 
 def model_known(provider_id, model_id):

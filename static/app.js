@@ -1251,6 +1251,11 @@
     if (!o) return;
     var models = o.models || [];
     var cur = o.currentModel || {};
+    // 模型目录刷新时不能把当前会话的模型重置成全局默认模型。
+    var active = (state.sessions || []).filter(function (s) {
+      return s.id === state.sessionId;
+    })[0];
+    if (active && active.model && active.model.modelId) cur = active.model;
 
     var opts = models.map(function (m) {
       var v = (m.providerId || '') + '|' + (m.modelId || '');
@@ -1778,9 +1783,22 @@
       $('chat-meta').textContent = (r.data.workspacePath || '') + ' · 最近 ' +
         msgs.length + ' / 共 ' + state.msgPage.total + ' 条';
 
-      // 把会话自己的模式/模型同步到选择器
+      // 把会话自己的模式/模型同步到选择器。老会话在 session/list 里
+      // 可能没有模型字段，此时从最近一条助手消息恢复，避免沿用上一个会话。
       var s = state.sessions.filter(function (x) { return x.id === sid; })[0];
-      if (s) applySessionSettings(s);
+      if (s) {
+        var sm = s.model;
+        if (!(sm && sm.modelId)) {
+          for (var mi = msgs.length - 1; mi >= 0; mi--) {
+            if (msgs[mi].role !== 'assistant' || !msgs[mi].model) continue;
+            sm = ((state.options || {}).models || []).filter(function (m) {
+              return m.modelId === msgs[mi].model;
+            })[0];
+            if (sm) break;
+          }
+        }
+        applySessionSettings(s, sm);
+      }
 
       // 用服务端状态校准「它还在不在跑」：网页关着的时候它可能已经跑完了。
       // 还在跑就把事件流接回来，服务端会把本轮已产生的事件重放一遍，
@@ -1798,18 +1816,29 @@
     });
   }
 
-  function applySessionSettings(s) {
+  function applySessionSettings(s, fallbackModel) {
     if (s.mode) {
       $('mode-select').value = s.mode;
       updateModeDesc();
     }
     setAutoRunUI(!!s.autoRun);
-    var m = s.model;
-    if (m && m.providerId && m.modelId) {
+    var m = fallbackModel || s.model;
+    if (!(m && m.providerId && m.modelId)) {
+      m = (state.options && state.options.currentModel) || {};
+    }
+    if (m.providerId && m.modelId) {
       var v = m.providerId + '|' + m.modelId;
       var sel = $('model-select');
+      var found = false;
       for (var i = 0; i < sel.options.length; i++) {
-        if (sel.options[i].value === v) { sel.value = v; break; }
+        if (sel.options[i].value === v) { sel.value = v; found = true; break; }
+      }
+      if (!found) {
+        var fallback = document.createElement('option');
+        fallback.value = v;
+        fallback.textContent = shortModel(m.modelId) + '（当前使用，目录中不可用）';
+        sel.appendChild(fallback);
+        sel.value = v;
       }
     }
     // 切进来的会话可能带着「下一轮才生效」的模型，也提示一下

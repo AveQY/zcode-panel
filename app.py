@@ -842,6 +842,38 @@ def load_messages(session_id, limit=None, before=None):
         conn.close()
 
 
+def last_session_model(session_id):
+    """会话列表没带模型时，从最后一条助手消息恢复实际使用模型。"""
+    if not session_id:
+        return None
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT data FROM message WHERE session_id = ? "
+            "AND json_extract(data, '$.role') = 'assistant' "
+            "ORDER BY sequence DESC LIMIT 20",
+            (session_id,),
+        ).fetchall()
+        for row in rows:
+            try:
+                meta = json.loads(row["data"] or "{}")
+            except Exception:
+                continue
+            mid = meta.get("modelID")
+            if not mid and isinstance(meta.get("model"), dict):
+                mid = meta["model"].get("modelID") or meta["model"].get("modelId")
+            if not mid:
+                continue
+            pid = meta.get("providerID") or meta.get("providerId")
+            if not pid and isinstance(meta.get("model"), dict):
+                pid = (meta["model"].get("providerID") or
+                       meta["model"].get("providerId"))
+            return {"providerId": pid or "", "modelId": mid}
+        return None
+    finally:
+        conn.close()
+
+
 def session_msg_stats(session_id):
     """会话消息总数与最小 sequence（分页判断 hasMore 用）。"""
     conn = db_connect()
@@ -3829,9 +3861,12 @@ async def handle_sessions(request):
         sid = s.get("sessionId")
         ws = s.get("workspace") or {}
         running = runner.is_running(sid) if runner else False
-        # 每个会话各用各的模型：优先 app-server 报的，它还没报就退回面板记的
+        # 每个会话各用各的模型：优先 app-server 报的，再退回面板运行态，
+        # 最后从该会话最后一条助手消息恢复实际用过的模型。
         model = s.get("model") or ((runner.desired.get(sid) or {}).get("model")
                                    if runner else None)
+        if not (isinstance(model, dict) and model.get("modelId")):
+            model = last_session_model(sid) or model
         pending = (runner.pending_of(sid) or {}).get("model") if runner else None
         out.append({
             "id": sid,

@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""zt_auto_fetch.py —— 禅道需求巡检定时触发器（cron 每 10 分钟 + 空闲补发）
+"""zt_auto_fetch.py —— 禅道需求巡检定时触发器（cron 每 10 分钟）
 
 行为：
-  - 正常模式（cron */10）：登录面板 → 找 /root/miniphone 会话 →
-      idle  → 发送巡检提示，并清除 pending 标记
-      busy  → 跳过，并写下 pending 标记（等空闲补发）
-  - 补发模式（--pending-only，cron 每分钟）：仅当存在 pending 标记且会话已空闲时发送。
-      这样「正在执行时跳过、一空闲立刻补上」，最多延迟 1 分钟。
+  - 登录面板 → 找绑定的 /root/miniphone 会话 →
+      idle  → 发送巡检提示，消息末尾附带本次触发时间
+      busy  → 跳过本次（不排队、不补发，等下一个 10 分钟整点再看）
+  - --pending-only：已停用（2026-09-21 起忙时不再排队，空闲补发失去意义），
+      直接退出；crontab 里对应的每分钟行已摘除。
   - 发送完全跟随会话自身设置（2026-09-21）：模型显式取「排队改动 > 会话当前模型」
       下发给面板（漂移会被纠正回来）；模式与思考等级不传——排队改动照常生效，
       否则会话保持自己的设置。不再写死 mode=build。
 
 用法：
   zt_auto_fetch.py                # 每 10 分钟的正常巡检
-  zt_auto_fetch.py --pending-only # 每分钟的空闲补发探测
   zt_auto_fetch.py --check        # 只检查登录/会话状态，不发消息
   zt_auto_fetch.py --rebind       # 丢弃旧绑定，重新绑定工作区第一个会话
 
@@ -25,7 +24,6 @@
 """
 import asyncio
 import json
-import os
 import sys
 import time
 
@@ -35,8 +33,6 @@ BASE = "http://127.0.0.1:8081"
 WORKSPACE = "/root/miniphone"
 CONFIG = "/opt/zcode-chat/config.json"
 TARGET_FILE = "/opt/zcode-chat/data/zt_fetch_target.json"
-PENDING = "/tmp/zt_auto_fetch.pending"
-PENDING_TTL = 2400          # pending 标记有效期 40 分钟，超时作废
 
 PROMPT = (
     "【定时触发·禅道需求巡检】请使用最新的 zentao / zentao-agent skill 完成：\n"
@@ -52,35 +48,6 @@ def login_key():
     with open(CONFIG) as fh:
         cfg = json.load(fh)
     return cfg.get("key_plain") or "admin123"
-
-
-def write_pending():
-    try:
-        with open(PENDING, "w") as fh:
-            fh.write(str(time.time()))
-    except OSError:
-        pass
-
-
-def read_pending():
-    try:
-        ts = float(open(PENDING).read().strip())
-    except (OSError, ValueError):
-        return None
-    if time.time() - ts > PENDING_TTL:
-        try:
-            os.remove(PENDING)
-        except OSError:
-            pass
-        return None
-    return ts
-
-
-def clear_pending():
-    try:
-        os.remove(PENDING)
-    except OSError:
-        pass
 
 
 def _valid_model(cand):
@@ -100,8 +67,11 @@ def resolve_send_model(target):
 
 
 async def main():
-    pending_only = "--pending-only" in sys.argv
     check_only = "--check" in sys.argv
+    if "--pending-only" in sys.argv:
+        # 历史上的空闲补发探测（每分钟 cron）。忙时不再排队后补发失去意义，
+        # 这里直接退出兜底，防止旧 crontab 行残留时每分钟触发真实巡检。
+        return 0
     async with aiohttp.ClientSession() as http:
         async with http.post(BASE + "/api/login", json={"key": login_key()}) as r:
             data = await r.json()
@@ -162,20 +132,17 @@ async def main():
             return 0
 
         if status != "idle":
-            if not pending_only:
-                write_pending()
-                print("[skip] 会话忙（%s），已登记待空闲补发" % status)
+            # 忙时本次不触发：不排队、不补发，等下一个 10 分钟整点再看
+            print("[skip] 会话忙（%s），本次不触发（不排队不补发）" % status)
             return 0
 
-        # 空闲：补发模式没有 pending 标记就不动作
-        if pending_only and read_pending() is None:
-            return 0
-        clear_pending()
+        trigger_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        content = PROMPT + "\n（本次触发时间：%s）" % trigger_time
 
         async with http.ws_connect(BASE + "/ws", headers=headers) as ws:
             # mode/thoughtLevel 传 None：面板先落地「排队改动」，否则会话保持自己的设置；
             # model 显式传「排队改动 > 当前模型」，见 resolve_send_model。
-            frame = {"type": "send", "sessionId": sid, "content": PROMPT,
+            frame = {"type": "send", "sessionId": sid, "content": content,
                      "mode": None, "model": follow_model, "thoughtLevel": None}
             await ws.send_str(json.dumps(frame, ensure_ascii=False))
             acked = False
@@ -186,8 +153,8 @@ async def main():
                     ev = json.loads(msg.data)
                     t = ev.get("type")
                     if t in ("accepted", "started", "resumed"):
-                        print("[sent] %s -> %s（%s，model=%s）"
-                              % (t, sid, "空闲补发" if pending_only else "定时巡检",
+                        print("[sent] %s -> %s（触发时间 %s，model=%s）"
+                              % (t, sid, trigger_time,
                                  "%s/%s" % (follow_model["providerId"], follow_model["modelId"])
                                  if follow_model else "跟随会话"))
                         acked = True

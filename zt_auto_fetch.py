@@ -8,6 +8,9 @@
       busy  → 跳过，并写下 pending 标记（等空闲补发）
   - 补发模式（--pending-only，cron 每分钟）：仅当存在 pending 标记且会话已空闲时发送。
       这样「正在执行时跳过、一空闲立刻补上」，最多延迟 1 分钟。
+  - 发送完全跟随会话自身设置（2026-09-21）：模型显式取「排队改动 > 会话当前模型」
+      下发给面板（漂移会被纠正回来）；模式与思考等级不传——排队改动照常生效，
+      否则会话保持自己的设置。不再写死 mode=build。
 
 用法：
   zt_auto_fetch.py                # 每 10 分钟的正常巡检
@@ -80,6 +83,22 @@ def clear_pending():
         pass
 
 
+def _valid_model(cand):
+    return isinstance(cand, dict) and bool(cand.get("providerId")) and bool(cand.get("modelId"))
+
+
+def resolve_send_model(target):
+    """跟随会话自身的模型设置：排队中的改动（执行期间改的）优先，其次当前模型。
+
+    显式把模型随消息下发给面板，定时轮次永远落在「该会话配置的模型」上；
+    会话模型若被运行时兜底改漂移过，也会被这里纠正回来。
+    """
+    for cand in (target.get("pendingModel"), target.get("model")):
+        if _valid_model(cand):
+            return {"providerId": cand["providerId"], "modelId": cand["modelId"]}
+    return None
+
+
 async def main():
     pending_only = "--pending-only" in sys.argv
     check_only = "--check" in sys.argv
@@ -129,6 +148,15 @@ async def main():
         sid = target["id"]
         status = target.get("status")
         print("[info] 会话:", sid, "状态:", status)
+        follow_model = resolve_send_model(target)
+        if follow_model:
+            model_desc = "%s/%s" % (follow_model["providerId"], follow_model["modelId"])
+            if _valid_model(target.get("pendingModel")):
+                model_desc += "（排队改动优先落地）"
+        else:
+            model_desc = "会话尚未设置模型，跟随其当前模型"
+        print("[info] 跟随会话设置: mode=%s（不强加） model=%s"
+              % (target.get("mode") or "-", model_desc))
         if check_only:
             print("[check] OK（未发送消息）")
             return 0
@@ -145,8 +173,10 @@ async def main():
         clear_pending()
 
         async with http.ws_connect(BASE + "/ws", headers=headers) as ws:
+            # mode/thoughtLevel 传 None：面板先落地「排队改动」，否则会话保持自己的设置；
+            # model 显式传「排队改动 > 当前模型」，见 resolve_send_model。
             frame = {"type": "send", "sessionId": sid, "content": PROMPT,
-                     "mode": "build", "model": None, "thoughtLevel": None}
+                     "mode": None, "model": follow_model, "thoughtLevel": None}
             await ws.send_str(json.dumps(frame, ensure_ascii=False))
             acked = False
             try:
@@ -156,8 +186,10 @@ async def main():
                     ev = json.loads(msg.data)
                     t = ev.get("type")
                     if t in ("accepted", "started", "resumed"):
-                        print("[sent] %s -> %s（%s）"
-                              % (t, sid, "空闲补发" if pending_only else "定时巡检"))
+                        print("[sent] %s -> %s（%s，model=%s）"
+                              % (t, sid, "空闲补发" if pending_only else "定时巡检",
+                                 "%s/%s" % (follow_model["providerId"], follow_model["modelId"])
+                                 if follow_model else "跟随会话"))
                         acked = True
                         break
                     if t == "error":

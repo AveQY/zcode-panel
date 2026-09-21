@@ -388,6 +388,46 @@ USAGE_SERIES_DAYS = 14            # 图表固定看最近 14 天
 _usage_cache = {}                 # range -> (ts, payload)
 _usage_lock = threading.Lock()
 USAGE_CACHE_TTL = 20
+# 面板自己的用量归档库。zcode 的 model_usage/tool_usage 对 session 有
+# ON DELETE CASCADE，直接删会话会把历史用量一起带走；这里在统计读取和
+# 删除会话前把明细快照到面板目录，查询时再用 id 去重合并，既不改 zcode
+# 的库，也不会因会话生命周期丢失历史统计。
+USAGE_ARCHIVE_DB = DATA_DIR / "usage_archive.sqlite"
+USAGE_ARCHIVE_LOCK = threading.Lock()
+USAGE_ARCHIVE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS model_usage_archive (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    turn_id TEXT,
+    provider_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    mode TEXT,
+    status TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    duration_ms INTEGER,
+    tool_call_count INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    archived_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_model_usage_archive_started
+    ON model_usage_archive(started_at);
+CREATE TABLE IF NOT EXISTS tool_usage_archive (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    archived_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_usage_archive_started
+    ON tool_usage_archive(started_at);
+"""
 
 
 def day_start_ms(ts=None):
@@ -406,37 +446,114 @@ def day_key(ms):
     return "%04d-%02d-%02d" % (t.tm_year, t.tm_mon, t.tm_mday)
 
 
-def usage_rows(since_ms=None):
-    """读 model_usage 明细（只读）。表还不存在时返回空列表。"""
+def _usage_live_rows(since_ms=None):
+    """读 zcode 当前 model_usage 明细（只读）。"""
     conn = db_connect()
     try:
-        sql = ("SELECT session_id, turn_id, provider_id, model_id, mode, status, "
+        sql = ("SELECT id, session_id, turn_id, provider_id, model_id, mode, status, "
                "started_at, completed_at, duration_ms, tool_call_count, "
                "input_tokens, output_tokens, reasoning_tokens, "
                "cache_creation_input_tokens, cache_read_input_tokens, "
                + USAGE_TOTAL_EXPR + " AS total_tokens FROM model_usage")
+        params = ()
         if since_ms:
-            sql += " WHERE started_at >= %d" % int(since_ms)
-        return [dict(r) for r in conn.execute(sql)]
+            sql += " WHERE started_at >= ?"
+            params = (int(since_ms),)
+        return [dict(r) for r in conn.execute(sql, params)]
     except sqlite3.Error:
         return []
     finally:
         conn.close()
+
+
+def _usage_archive_rows(since_ms=None):
+    """读面板自己的 model_usage 归档。归档库不存在时返回空。"""
+    if not USAGE_ARCHIVE_DB.exists():
+        return []
+    conn = None
+    try:
+        conn = _usage_archive_connect()
+        _ensure_usage_archive(conn)
+        sql = ("SELECT id, session_id, turn_id, provider_id, model_id, mode, status, "
+               "started_at, completed_at, duration_ms, tool_call_count, "
+               "input_tokens, output_tokens, reasoning_tokens, "
+               "cache_creation_input_tokens, cache_read_input_tokens, "
+               "total_tokens FROM model_usage_archive")
+        params = ()
+        if since_ms:
+            sql += " WHERE started_at >= ?"
+            params = (int(since_ms),)
+        return [dict(r) for r in conn.execute(sql, params)]
+    except sqlite3.Error as exc:
+        log(f"读取用量归档失败: {exc}")
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _usage_merge_key(r):
+    return r.get("id") or (r.get("session_id"), r.get("turn_id"),
+                           r.get("provider_id"), r.get("model_id"),
+                           r.get("started_at"))
+
+
+def usage_rows(since_ms=None):
+    """合并当前库和面板归档明细，按 id 去重；当前库优先取最新状态。"""
+    merged = {}
+    for r in _usage_archive_rows(since_ms):
+        merged[_usage_merge_key(r)] = r
+    for r in _usage_live_rows(since_ms):
+        merged[_usage_merge_key(r)] = r
+    return list(merged.values())
+
+
+def _usage_tool_live_rows(since_ms=None):
+    """读 zcode 当前 tool_usage 明细（只读）。"""
+    conn = db_connect()
+    try:
+        sql = "SELECT id, session_id, tool_name, status, started_at FROM tool_usage"
+        params = ()
+        if since_ms:
+            sql += " WHERE started_at >= ?"
+            params = (int(since_ms),)
+        return [dict(r) for r in conn.execute(sql, params)]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def _usage_tool_archive_rows(since_ms=None):
+    """读面板自己的 tool_usage 归档。"""
+    if not USAGE_ARCHIVE_DB.exists():
+        return []
+    conn = None
+    try:
+        conn = _usage_archive_connect()
+        _ensure_usage_archive(conn)
+        sql = "SELECT id, session_id, tool_name, status, started_at FROM tool_usage_archive"
+        params = ()
+        if since_ms:
+            sql += " WHERE started_at >= ?"
+            params = (int(since_ms),)
+        return [dict(r) for r in conn.execute(sql, params)]
+    except sqlite3.Error as exc:
+        log(f"读取工具用量归档失败: {exc}")
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def usage_tool_rows(since_ms=None):
-    """读 tool_usage，只要次数与成败，用于「工具调用」指标。"""
-    conn = db_connect()
-    try:
-        sql = ("SELECT session_id, tool_name, status FROM tool_usage")
-        if since_ms:
-            sql += " WHERE started_at >= %d" % int(since_ms)
-        return [dict(r) for r in conn.execute(sql)]
-    except sqlite3.Error:
-        return []
-    finally:
-        conn.close()
-
+    """合并当前库和面板归档的工具调用明细，按 id 去重。"""
+    merged = {}
+    for r in _usage_tool_archive_rows(since_ms):
+        merged[r.get("id") or (r.get("session_id"), r.get("tool_name"), r.get("started_at"))] = r
+    for r in _usage_tool_live_rows(since_ms):
+        merged[r.get("id") or (r.get("session_id"), r.get("tool_name"), r.get("started_at"))] = r
+    return list(merged.values())
 
 def _usage_blank():
     return {"tokens": 0, "inputTokens": 0, "outputTokens": 0, "reasoningTokens": 0,
@@ -494,6 +611,7 @@ def _usage_group(rows, key_fn):
 
 
 def build_usage_payload(range_key="today"):
+    archive_usage_snapshot()
     days = USAGE_RANGE_DAYS.get(range_key, 1)
     today0 = day_start_ms()
     since = None if days is None else today0 - (days - 1) * 86400000
@@ -576,6 +694,99 @@ def db_write():
     conn = sqlite3.connect(ZCODE_DB, timeout=15)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _usage_archive_connect():
+    """打开面板自己的用量归档库（调用方负责关闭）。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(USAGE_ARCHIVE_DB), timeout=15)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _ensure_usage_archive(conn):
+    conn.executescript(USAGE_ARCHIVE_SCHEMA)
+
+
+def archive_usage_snapshot(session_id=None):
+    """把 zcode 当前用量明细快照到面板归档库。
+
+    session_id 为空时处理全部会话，供用量面板首次读取时补历史；指定
+    session_id 时在删除会话前强制保存该会话的最后状态。写入用 INSERT
+    OR REPLACE，重复同步不会产生重复行。
+    """
+    where = ""
+    params = ()
+    if session_id is not None:
+        where = " WHERE session_id = ?"
+        params = (session_id,)
+    try:
+        src = db_connect()
+        try:
+            model_rows = [dict(r) for r in src.execute(
+                "SELECT id, session_id, turn_id, provider_id, model_id, mode, status, "
+                "started_at, completed_at, duration_ms, tool_call_count, "
+                "input_tokens, output_tokens, reasoning_tokens, "
+                "cache_creation_input_tokens, cache_read_input_tokens, "
+                + USAGE_TOTAL_EXPR + " AS total_tokens FROM model_usage" + where,
+                params)]
+            tool_rows = [dict(r) for r in src.execute(
+                "SELECT id, session_id, tool_name, status, started_at FROM tool_usage" + where,
+                params)]
+        finally:
+            src.close()
+    except sqlite3.Error as exc:
+        log(f"读取用量以归档失败: {exc}")
+        return 0
+
+    if not model_rows and not tool_rows:
+        return 0
+    now_ms = int(time.time() * 1000)
+    model_values = [
+        (r.get("id"), r.get("session_id"), r.get("turn_id"),
+         r.get("provider_id"), r.get("model_id"), r.get("mode"), r.get("status"),
+         r.get("started_at"), r.get("completed_at"), r.get("duration_ms"),
+         r.get("tool_call_count") or 0, r.get("input_tokens") or 0,
+         r.get("output_tokens") or 0, r.get("reasoning_tokens") or 0,
+         r.get("cache_creation_input_tokens") or 0,
+         r.get("cache_read_input_tokens") or 0, r.get("total_tokens") or 0, now_ms)
+        for r in model_rows if r.get("id")
+    ]
+    tool_values = [
+        (r.get("id"), r.get("session_id"), r.get("tool_name"), r.get("status"),
+         r.get("started_at"), now_ms)
+        for r in tool_rows if r.get("id")
+    ]
+    with USAGE_ARCHIVE_LOCK:
+        dst = _usage_archive_connect()
+        try:
+            _ensure_usage_archive(dst)
+            if model_values:
+                dst.executemany(
+                    "INSERT OR REPLACE INTO model_usage_archive "
+                    "(id, session_id, turn_id, provider_id, model_id, mode, status, "
+                    "started_at, completed_at, duration_ms, tool_call_count, "
+                    "input_tokens, output_tokens, reasoning_tokens, "
+                    "cache_creation_input_tokens, cache_read_input_tokens, "
+                    "total_tokens, archived_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    model_values)
+            if tool_values:
+                dst.executemany(
+                    "INSERT OR REPLACE INTO tool_usage_archive "
+                    "(id, session_id, tool_name, status, started_at, archived_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    tool_values)
+            dst.commit()
+        except sqlite3.Error as exc:
+            try:
+                dst.rollback()
+            except Exception:
+                pass
+            log(f"写入用量归档失败: {exc}")
+            return 0
+        finally:
+            dst.close()
+    return len(model_values) + len(tool_values)
 
 
 def load_messages(session_id, limit=None, before=None):
@@ -700,6 +911,8 @@ def delete_session(session_id):
     表结构会随 zcode 版本增加（workflow_* / *_usage / session_input ...），
     所以不写死表名，改成扫一遍 schema 找带 session_id 列的表。
     """
+    # 必须在级联删除之前留下面板自己的用量快照，否则历史 token 会一起消失。
+    archive_usage_snapshot(session_id)
     conn = db_write()
     try:
         cur = conn.cursor()

@@ -303,7 +303,7 @@ input, textarea, select {
 /* ---------------- 消息 ---------------- */
 
 .row { padding: 0 24px 20px; max-width: 900px; margin: 0 auto; width: 100%; }
-.row.user { display: flex; justify-content: flex-end; }
+.row.user { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 
 .bubble-user {
   max-width: 76%;
@@ -326,6 +326,16 @@ input, textarea, select {
   margin-top: 2px;
 }
 .assistant-body { flex: 1; min-width: 0; }
+
+.msg-time {
+  color: var(--text-mute);
+  font-size: 11.5px;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.assistant-body .msg-time { margin-top: 7px; }
+.row.user .msg-time { margin-right: 4px; }
 
 .thinking {
   display: inline-flex; align-items: center; gap: 8px;

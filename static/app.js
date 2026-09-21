@@ -147,6 +147,14 @@
     return (d.getMonth() + 1) + '/' + d.getDate();
   }
 
+  // 消息末尾的本地时间，历史接口和实时流都使用毫秒时间戳
+  function fmtMsgTime(ms) {
+    if (!ms) return '';
+    var d = new Date(ms);
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
+      ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
   /* ============================================ 数字格式化 */
 
   // token 用量按 k / m / b 缩写（1000 进制）
@@ -817,6 +825,15 @@
     return entry.mdEl;
   }
 
+  function addMsgTimeEl(entry, timeMs) {
+    if (!entry || !entry.body || entry.timeEl) return;
+    var el = document.createElement('div');
+    el.className = 'msg-time';
+    el.textContent = fmtMsgTime(timeMs || Date.now());
+    entry.body.appendChild(el);
+    entry.timeEl = el;
+  }
+
   function appendDelta(messageId, text) {
     if (!text) return;
     var entry = ensureAssistant(messageId);
@@ -950,7 +967,7 @@
     try { return JSON.stringify(input, null, 2); } catch (e) { return String(input); }
   }
 
-  function appendUserMessage(text, prepend) {
+  function appendUserMessage(text, prepend, timeMs) {
     hideWelcome();
     var box = $('messages');
     var row = document.createElement('div');
@@ -959,6 +976,10 @@
     bubble.className = 'bubble-user';
     bubble.textContent = text;
     row.appendChild(bubble);
+    var timeEl = document.createElement('div');
+    timeEl.className = 'msg-time';
+    timeEl.textContent = fmtMsgTime(timeMs || Date.now());
+    row.appendChild(timeEl);
     if (prepend) box.insertBefore(row, box.firstChild);
     else { box.appendChild(row); scrollToBottom(true); }
   }
@@ -979,6 +1000,7 @@
       var el = state.cur.mdEl;
       if (el) el.innerHTML = mdParse(state.cur.raw);
     }
+    if (state.cur) addMsgTimeEl(state.cur, d && d.time ? d.time : Date.now());
     state.cur = null;
     loadSessions(true).then(function () {
       if (state.tab === 'active') renderActive();
@@ -1137,7 +1159,7 @@
     }
     if (!wsOpen()) {
       // 断线不丢消息：先把消息落到界面，等重连成功后自动补发
-      appendUserMessage(text);
+      appendUserMessage(text, false, Date.now());
       input.value = '';
       input.style.height = 'auto';
       setSending(true);
@@ -1154,7 +1176,7 @@
       return;
     }
 
-    appendUserMessage(text);
+    appendUserMessage(text, false, Date.now());
     input.value = '';
     input.style.height = 'auto';
 
@@ -1803,7 +1825,7 @@
     if (m.role === 'user') {
       var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
         .map(function (p) { return p.text || ''; }).join('');
-      if (texts) appendUserMessage(texts, prepend);
+      if (texts) appendUserMessage(texts, prepend, m.time);
       return;
     }
     if (m.role !== 'assistant') return;
@@ -1864,6 +1886,7 @@
           ? m.error : JSON.stringify(m.error)) + '</div>';
       entry.body.appendChild(ed);
     }
+    addMsgTimeEl(entry, m.time);
   }
 
   function renderActive() {

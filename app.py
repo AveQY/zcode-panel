@@ -3205,6 +3205,11 @@ async def get_options(ws_path, force=False):
         return data
 
 
+LEVEL_LABELS = {"low": "低", "medium": "中", "high": "高",
+               "max": "最高", "minimal": "最低", "none": "关闭",
+               "xhigh": "极高", "enabled": "开", "disabled": "关"}
+
+
 def build_registry():
     """把 ~/.zcode/cli/config.json 转成 app-server 要的 provider registry。
 
@@ -3233,6 +3238,27 @@ def build_registry():
                 pass
             if mod.get("input"):
                 item["supportsImages"] = "image" in mod["input"]
+            rsn = m.get("reasoning")
+            if rsn:
+                # config.json 里声明的 reasoning（levels 是字符串数组）转成
+                # app-server registry 需要的形状（levels 是 [{value,label}]）。
+                # 不透传的话，models.dev 未收录的模型（如 step-5-preview）
+                # 在 app-server 侧没有任何 reasoning 能力，setThoughtLevel
+                # 会直接抛 "Unsupported reasoning effort: <level>"。
+                lv = rsn.get("levels") or []
+                norm = []
+                for v in lv:
+                    val = v if isinstance(v, str) else (v or {}).get("value")
+                    if not val:
+                        continue
+                    norm.append({"value": str(val), "label": LEVEL_LABELS.get(str(val), str(val))})
+                if norm:
+                    r = {"enabled": bool(rsn.get("enabled", True)), "levels": norm}
+                    if rsn.get("defaultLevel"):
+                        r["defaultLevel"] = rsn["defaultLevel"]
+                    if rsn.get("providerOptionsByLevel"):
+                        r["providerOptionsByLevel"] = rsn["providerOptionsByLevel"]
+                    item["reasoning"] = r
             models.append(item)
         if not models:
             continue

@@ -2723,20 +2723,56 @@
           added ? 'ok' : 'err');
   });
 
+  // 厂商 ID 自动生成：名称里的字母数字直接拿来当 slug，中文等取不到就退化成 vendor-xxxx。
+  function hashText(s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+    return h.toString(36);
+  }
+
+  function providerSlug(name) {
+    var s = String(name || '').toLowerCase()
+      .replace(/[^a-z0-9_\-]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40)
+      .replace(/^-+|-+$/g, '');
+    return s || ('vendor-' + hashText(String(name || '') + Date.now()));
+  }
+
+  function nextProviderId(name) {
+    var base = providerSlug(name);
+    var taken = {};
+    (state.providers || []).forEach(function (p) { taken[p.providerId] = true; });
+    var pid = base, n = 2;
+    while (taken[pid]) {
+      var sfx = '-' + n;
+      pid = base.slice(0, 40 - sfx.length) + sfx;
+      n++;
+    }
+    return pid;
+  }
+
+  function setProviderIdHint(pid) {
+    var el = $('pv-id-hint');
+    if (!el) return;
+    el.innerHTML = pid
+      ? ('厂商 ID：<code>' + esc(pid) + '</code>（自动生成，不可修改）')
+      : '厂商 ID 会自动生成，不用手填。';
+  }
+
   function openProvider(pid) {
     state.editingProvider = pid;
     $('pv-title').textContent = pid ? '编辑厂商' : '新增第三方厂商';
     $('pv-delete').classList.toggle('hidden', !pid);
     $('pv-models').innerHTML = '';
     $('pv-key').type = 'password';
-    $('pv-id').disabled = !!pid;
     // 每次开弹窗都收起上一次拉到的模型列表，避免串场
     $('pv-fetched').innerHTML = '';
     $('pv-fetched-note').textContent = '';
     $('pv-fetched-wrap').classList.add('hidden');
 
     if (!pid) {
-      $('pv-id').value = '';
+      setProviderIdHint(null);
       $('pv-name').value = '';
       $('pv-kind').value = 'openai-compatible';
       $('pv-base').value = '';
@@ -2752,7 +2788,7 @@
         return x.providerId === pid;
       })[0];
       if (!p) { toast('厂商不存在', 'err'); return; }
-      $('pv-id').value = p.providerId;
+      setProviderIdHint(p.providerId);
       $('pv-name').value = p.name || '';
       $('pv-kind').value = p.kind || 'openai-compatible';
       $('pv-base').value = p.baseURL || '';
@@ -2775,11 +2811,13 @@
   });
 
   $('pv-save').addEventListener('click', function () {
-    var pid = $('pv-id').value.trim();
+    var name = $('pv-name').value.trim();
     var base = $('pv-base').value.trim();
-    if (!pid) { toast('请填写厂商 ID', 'err'); return; }
+    if (!name) { toast('请填写显示名称', 'err'); return; }
+    // 厂商 ID 由面板生成：编辑时沿用原 ID，新建时按显示名称推导一个没被占用的
+    var pid = state.editingProvider || nextProviderId(name);
     if (!/^[A-Za-z0-9_\-]{1,40}$/.test(pid)) {
-      toast('厂商 ID 只能用字母数字下划线横线（1-40 位）', 'err');
+      toast('厂商 ID 生成异常，请改一下显示名称再试', 'err');
       return;
     }
     if (!base) { toast('请填写 Base URL', 'err'); return; }
@@ -2801,7 +2839,7 @@
 
     var payload = {
       providerId: pid,
-      name: $('pv-name').value.trim() || pid,
+      name: name,
       kind: $('pv-kind').value,
       baseURL: base,
       models: models,

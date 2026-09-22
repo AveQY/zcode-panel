@@ -6,7 +6,7 @@
 <meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="referrer" content="no-referrer">
 <title>ZCode 对话控制台</title>
-<link rel="stylesheet" href="/static/style.css?v=20260922c">
+<link rel="stylesheet" href="/static/style.css?v=20260922d">
 </head>
 <body>
 
@@ -500,15 +500,10 @@
       <button class="icon-btn" data-close="provider-modal">&#10005;</button>
     </div>
     <div class="modal-body">
-      <div class="form-row two-col">
-        <div>
-          <label class="form-label" for="pv-id">厂商 ID</label>
-          <input id="pv-id" type="text" placeholder="例如 myvendor">
-        </div>
-        <div>
-          <label class="form-label" for="pv-name">显示名称</label>
-          <input id="pv-name" type="text" placeholder="例如 我的中转">
-        </div>
+      <div class="form-row">
+        <label class="form-label" for="pv-name">显示名称</label>
+        <input id="pv-name" type="text" placeholder="例如 我的中转">
+        <div class="form-hint" id="pv-id-hint">厂商 ID 会自动生成，不用手填。</div>
       </div>
 
       <div class="form-row two-col">
@@ -598,6 +593,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js?v=20260922c"></script>
+<script src="/static/app.js?v=20260922d"></script>
 </body>
 </html>

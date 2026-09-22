@@ -968,14 +968,19 @@ select { cursor: pointer; }
   font-size: 10.5px; color: var(--text-mute);
   background: #e8ebef; border-radius: 20px; padding: 0 6px; flex-shrink: 0;
 }
-.ws-more {
+.ws-more,
+.ws-add-session {
   width: 20px; height: 20px; border-radius: 5px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
   color: var(--text-mute); font-size: 13px; line-height: 1;
   opacity: 0;
 }
-.ws-group-head:hover .ws-more { opacity: 1; }
-.ws-more:hover { background: #dfe3e8; color: var(--text); }
+.ws-add-session { font-size: 15px; }
+.ws-group-head:hover .ws-more,
+.ws-group-head:hover .ws-add-session { opacity: 1; }
+.ws-more:hover,
+.ws-add-session:hover { background: #dfe3e8; color: var(--text); }
+.ws-add-session:disabled { opacity: .55; cursor: wait; }
 .ws-group-body { padding-left: 8px; }
 .ws-group-body.hidden { display: none; }
 .ws-group-empty { font-size: 11.5px; color: var(--text-mute); padding: 4px 8px 6px 11px; }
@@ -1277,5 +1282,6 @@ select.locked, select:disabled.locked { background: var(--sidebar); color: var(-
    否则手机上永远无法归档 / 删除会话、管理工作区 */
 @media (hover: none) {
   .session-more { display: flex; }
-  .ws-more { opacity: 1; }
+  .ws-more,
+  .ws-add-session { opacity: 1; }
 }

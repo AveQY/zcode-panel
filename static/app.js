@@ -1517,6 +1517,21 @@
     cnt.textContent = g.items.length;
     head.appendChild(cnt);
 
+    // 工作区标题旁的「+」：不用打开弹窗，直接在这个工作区下创建会话。
+    if (state.tab !== 'archived' && g.path) {
+      var add = document.createElement('button');
+      add.type = 'button';
+      add.className = 'ws-add-session';
+      add.innerHTML = '&#43;';
+      add.title = '在「' + g.name + '」下新建会话';
+      add.setAttribute('aria-label', add.title);
+      add.addEventListener('click', function (e) {
+        e.stopPropagation();
+        createSessionInWorkspace(g.path, add);
+      });
+      head.appendChild(add);
+    }
+
     var more = document.createElement('button');
     more.type = 'button';
     more.className = 'ws-more';
@@ -1955,6 +1970,62 @@
     $('input').focus();
   }
 
+  // 创建成功后切到新会话。新建会话弹窗和工作区「+」共用这段收尾逻辑。
+  function activateCreatedSession(sessionId, wsPath, mode, model, thoughtLevel) {
+    newChat();
+    state.sessionId = sessionId;
+    rememberSession(sessionId);
+    if (model && model.providerId && model.modelId) {
+      var v = model.providerId + '|' + model.modelId;
+      var sel = $('model-select');
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === v) { sel.value = v; break; }
+      }
+    }
+    if (mode) $('mode-select').value = mode;
+    updateModeDesc();
+    if (thoughtLevel) $('thought-select').value = thoughtLevel;
+    $('chat-title').textContent = '新会话';
+    $('chat-meta').textContent = wsPath || '';
+    var ww = $('welcome-ws');
+    if (ww) ww.textContent = wsPath || '';
+    loadSessions(true).then(renderActive);
+    $('input').focus();
+  }
+
+  // 工作区标题旁「+」的直建逻辑：沿用当前会话的模式/模型/思考等级。
+  function createSessionInWorkspace(wsPath, btn) {
+    if (!wsPath) { toast('工作区路径无效', 'err'); return; }
+    var model = currentModelValue();
+    var mode = $('mode-select').value || 'build';
+    var thoughtLevel = $('thought-select').value || null;
+    var w = findWorkspace(wsPath);
+    var purpose = (w && w.purpose === 'task') ? 'task' : 'project';
+    var oldHtml = btn ? btn.innerHTML : '';
+    if (btn) { btn.disabled = true; btn.innerHTML = '&#8230;'; }
+
+    req('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        workspacePath: wsPath,
+        purpose: purpose,
+        mode: mode,
+        model: model,
+        thoughtLevel: thoughtLevel,
+      }),
+    }).then(function (r) {
+      if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
+      if (!r.data.ok) { toast(r.data.error || '新建会话失败', 'err'); return; }
+      state.wsCollapsed[wsPath] = false;
+      saveWsCollapsed();
+      activateCreatedSession(r.data.sessionId, wsPath, mode, model, thoughtLevel);
+      toast('已在「' + (w ? w.name : wsNameOf(wsPath)) + '」下创建会话', 'ok');
+    }).catch(function () {
+      if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
+      toast('网络异常', 'err');
+    });
+  }
+
   /* ============================================ 新建会话 */
 
   function openNewChat() {
@@ -2203,6 +2274,8 @@
     var wsPath = $('nc-workspace').value;
     var mv = $('nc-model').value;
     var model = mv ? { providerId: mv.split('|')[0], modelId: mv.split('|').slice(1).join('|') } : null;
+    var mode = $('nc-mode').value;
+    var thoughtLevel = $('nc-thought').value || null;
     btn.disabled = true;
     btn.textContent = '创建中…';
     req('/api/sessions', {
@@ -2210,34 +2283,16 @@
       body: JSON.stringify({
         workspacePath: wsPath,
         purpose: currentPurpose(),
-        mode: $('nc-mode').value,
+        mode: mode,
         model: model,
-        thoughtLevel: $('nc-thought').value || null,
+        thoughtLevel: thoughtLevel,
       }),
     }).then(function (r) {
       btn.disabled = false;
       btn.textContent = '创建并开始';
       if (!r.data.ok) { toast(r.data.error || '新建会话失败', 'err'); return; }
       closeModal('newchat-modal');
-      newChat();
-      state.sessionId = r.data.sessionId;
-      rememberSession(r.data.sessionId);
-      if (model) {
-        var v = model.providerId + '|' + model.modelId;
-        var sel = $('model-select');
-        for (var i = 0; i < sel.options.length; i++) {
-          if (sel.options[i].value === v) { sel.value = v; break; }
-        }
-      }
-      $('mode-select').value = $('nc-mode').value;
-      updateModeDesc();
-      $('thought-select').value = $('nc-thought').value || $('thought-select').value;
-      $('chat-title').textContent = '新会话';
-      $('chat-meta').textContent = wsPath;
-      var ww = $('welcome-ws');
-      if (ww) ww.textContent = wsPath;
-      loadSessions(true).then(renderActive);
-      $('input').focus();
+      activateCreatedSession(r.data.sessionId, wsPath, mode, model, thoughtLevel);
       toast('会话已创建，可以开始对话了', 'ok');
     }).catch(function () {
       btn.disabled = false;

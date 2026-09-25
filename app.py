@@ -136,6 +136,7 @@ SCHEDULE_RESUME_VERIFY_SEC = 12  # 发出续跑提示后，等「新一轮真的
 SCHEDULE_PENDING_MAX_SEC = 600  # 待续跑的最长等待时间
 SCHEDULE_MAX_DURATION_MIN = 10080      # 单条规则最长生效 7 天
 SCHEDULE_HISTORY_MAX = 50
+SCHEDULE_REMOTE_PROBE_SEC = 1.5  # 没有本地事件流时，问 app-server 轮次状态的间隔
 # 回看天数：时段可以跨午夜，所以要看昨天；每周规则要看到上一个同名星期几，
 # 否则「每周三 10:00」到周六就会因为本周三超出回看窗口而误判为失效。
 SCHEDULE_LOOKBACK = {"daily": 2, "weekly": 8, "once": 0}
@@ -167,6 +168,7 @@ feed = None          # SessionFeedManager
 runner = None        # TurnManager
 scheduler = None     # ModelScheduler
 schedules = []       # 定时规则（持久化在 data/model_schedules.json）
+SCHEDULE_RUNTIME_SAVED = None   # 上次运行态（active/prev），随规则一起持久化
 # 全局 WS 订阅者：会话事件流是「按会话」广播的，定时切换是全局事件，需要单独一份
 NOTIFY_SUBSCRIBERS = set()
 
@@ -872,6 +874,43 @@ def last_session_model(session_id):
         return None
     finally:
         conn.close()
+
+
+def session_model_selection(session_id):
+    """这个会话**自己**在用的模型。
+
+    优先读 session_entry 的 runtime/model_selection —— 那是 app-server 自己记的
+    「本会话当前用哪个模型」，每个会话各记一份。config.json 的 model.main 只是
+    「新建会话的默认值」，而且 setModel 会顺带把它改写，拿它当恢复基准会把
+    不同会话统统回滚成同一个模型（实测各会话模型本来就不同）。
+    """
+    if not session_id:
+        return None
+    row = None
+    try:
+        conn = db_connect()
+    except Exception:
+        conn = None
+    if conn is not None:
+        try:
+            row = conn.execute(
+                "SELECT data FROM session_entry WHERE session_id = ? "
+                "AND type = 'runtime/model_selection' LIMIT 1",
+                (session_id,)).fetchone()
+        except Exception:
+            row = None
+        finally:
+            conn.close()
+    if row is not None:
+        try:
+            d = json.loads(row["data"] or "{}")
+        except Exception:
+            d = {}
+        pid = d.get("providerId") or d.get("providerID")
+        mid = d.get("modelId") or d.get("modelID")
+        if pid and mid:
+            return {"providerId": pid, "modelId": mid}
+    return last_session_model(session_id)
 
 
 def session_msg_stats(session_id):
@@ -2057,12 +2096,16 @@ WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "�
 
 
 def load_schedules():
-    global schedules
+    global schedules, SCHEDULE_RUNTIME_SAVED
+    SCHEDULE_RUNTIME_SAVED = None
     if SCHEDULE_PATH.exists():
         try:
             d = json.loads(SCHEDULE_PATH.read_text(encoding="utf-8"))
             items = d.get("schedules") or []
             schedules = [it for it in items if isinstance(it, dict)]
+            rt = d.get("runtime")
+            if isinstance(rt, dict):
+                SCHEDULE_RUNTIME_SAVED = rt
         except Exception as exc:
             log(f"定时规则读取失败，按空处理: {exc}")
             schedules = []
@@ -2072,10 +2115,20 @@ def load_schedules():
 
 
 def save_schedules():
+    """规则 + 运行态一起落盘。
+
+    运行态（active / prev）也存，是为了服务重启后不丢「谁被切走了、原来是什么」——
+    否则重启一次，恢复就再也回不到各自原来的模型，只能靠人肉重设。
+    """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {"schedules": schedules}
+    if scheduler is not None:
+        try:
+            payload["runtime"] = scheduler.runtime_state()
+        except Exception as exc:
+            log(f"定时运行态序列化失败: {exc}")
     tmp = SCHEDULE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"schedules": schedules}, ensure_ascii=False, indent=2),
-                   encoding="utf-8")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(SCHEDULE_PATH)
 
 
@@ -2090,6 +2143,12 @@ def current_global_model():
         return None
     pid, mid = main.split("/", 1)
     return {"providerId": pid, "modelId": mid}
+
+
+def global_model_raw():
+    """config.json 里 model 段的原文，用于恢复时原样写回。"""
+    m = read_zcode_config().get("model") or {}
+    return {"main": m.get("main") or "", "lite": m.get("lite") or ""}
 
 
 def model_label(provider_id, model_id):
@@ -2224,15 +2283,28 @@ def next_fire_at(rule, now_ts=None):
     return None
 
 
+def rule_created_ms(rule):
+    try:
+        v = rule.get("createdAt")
+        return int(v) if v else 0
+    except Exception:
+        return 0
+
+
 def evaluate_schedule(now_ts=None):
-    """在所有「此刻应生效」的规则里选一条：触发时间最新的胜出。"""
+    """在所有「此刻应生效」的规则里选一条：触发时间最新的胜出。
+
+    同一分钟到点的多条规则原来靠列表顺序定胜负，那是个没定义的行为；
+    现在显式按 createdAt 定序 —— 后建的规则优先（更接近用户当下的意图）。
+    """
     now_ts = now_ts if now_ts is not None else time.time()
     best = None
     for rule in schedules:
         active, fired, expires = rule_state(rule, now_ts)
         if not active:
             continue
-        if best is None or fired > best[1]:
+        if (best is None or fired > best[1]
+                or (fired == best[1] and rule_created_ms(rule) > rule_created_ms(best[0]))):
             best = (rule, fired, expires)
     return best
 
@@ -2266,19 +2338,41 @@ def describe_rule(rule, now_ts=None):
 
 # ---- 下发 -----------------------------------------------------------------
 
-def target_sessions():
-    """本进程「见过」的会话 —— 也就是真正可能正在被使用的那些。
-
-    数据库里还有几十条休眠的历史会话，为它们逐个 resume + setModel 才是「影响线上」；
-    那些会话由内存里的覆盖项惰性接管，下次一发消息就是新模型。
-    """
+def panel_sessions():
+    """面板进程直接经手的会话：发过消息、或订阅过事件的那些。"""
     ids = set()
     if runner:
         ids |= set(runner.desired.keys())
         ids |= set(runner.running.keys())
     if feed:
         ids |= set(feed.feeds.keys())
-    return sorted(ids)
+    return ids
+
+
+async def target_sessions():
+    """本次下发要覆盖的会话 = 面板经手的 + app-server 里正在跑的外部会话。
+
+    外部会话（headless / 禅道自动执行）由别的客户端直接驱动，面板进程里没有它们的
+    事件流；但它们确实在占着模型配额，所以只要 app-server 说它还在跑，就一并切换 ——
+    否则「所有会话都换」只是个空头承诺。反过来，已经闲置的外部会话**不去唤醒**：
+    为了切个模型把一堆历史会话 resume 起来，代价远大于收益。
+
+    返回 (要下发的会话 id 列表, 其中属于「外部」的 id 集合)。
+    """
+    panel_ids = panel_sessions()
+    external = set()
+    try:
+        res = await zc.call("session/list", {}, timeout=30)
+        for s in ((res or {}).get("sessions") or []):
+            sid = s.get("sessionId")
+            if not sid or sid in panel_ids:
+                continue
+            if str(s.get("status") or "").strip().lower() in TURN_IDLE_STATES:
+                continue
+            external.add(sid)
+    except Exception as exc:
+        log(f"查询外部会话失败: {exc}")
+    return sorted(panel_ids | external), external
 
 
 async def wait_turn_stopped(session_id, timeout=SCHEDULE_STOP_WAIT_SEC):
@@ -2289,13 +2383,20 @@ async def wait_turn_stopped(session_id, timeout=SCHEDULE_STOP_WAIT_SEC):
     app-server 的真实事件（turn.completed / 事件流结束）收敛出来的，才可信。
     """
     t0 = time.time()
+    next_probe = 0.0
     while time.time() - t0 < timeout:
         f = feed.get(session_id) if feed else None
-        if f is None:
-            break
-        if not f.turn_active:
-            await asyncio.sleep(SCHEDULE_SETTLE_SEC)
-            return True
+        if f is not None:
+            if not f.turn_active:
+                await asyncio.sleep(SCHEDULE_SETTLE_SEC)
+                return True
+        elif time.time() >= next_probe:
+            # 面板没有这个会话的事件流（外部 / headless 会话）：直接问 app-server。
+            # 原来这里直接 break，等于「立刻判定没停下来」，会让续跑被静默跳过。
+            next_probe = time.time() + SCHEDULE_REMOTE_PROBE_SEC
+            if await remote_turn_state(session_id) == "idle":
+                await asyncio.sleep(SCHEDULE_SETTLE_SEC)
+                return True
         await asyncio.sleep(0.4)
     log(f"定时切换：会话 {session_id} 在 {timeout}s 内未见轮次结束")
     return False
@@ -2333,7 +2434,8 @@ async def resume_and_verify(session_id, prompt, timeout=SCHEDULE_RESUME_VERIFY_S
     return False
 
 
-async def switch_session_model(session_id, target, tries=SCHEDULE_SWITCH_TRIES):
+async def switch_session_model(session_id, target, tries=SCHEDULE_SWITCH_TRIES,
+                               allow_resume=True):
     last = None
     for i in range(tries):
         try:
@@ -2343,6 +2445,9 @@ async def switch_session_model(session_id, target, tries=SCHEDULE_SWITCH_TRIES):
             last = exc
             log(f"定时切换：会话 {session_id} setModel 失败（第 {i + 1}/{tries} 次）: {exc}")
             if runner.is_inactive_error(exc):
+                if not allow_resume:
+                    # 外部会话：不为切模型把它唤醒（拉起来一堆休眠会话代价太大）
+                    return False, str(exc)
                 # 会话闲置太久被 app-server 卸掉了：先把它拉起来，
                 # 否则重试多少次都是同一个错。拉不起来就交给内存覆盖项兜底。
                 if not await runner.ensure_active(session_id, force=True):
@@ -2355,31 +2460,47 @@ async def switch_session_model(session_id, target, tries=SCHEDULE_SWITCH_TRIES):
 
 async def apply_model_everywhere(target, *, reason="", resume=True,
                                  prompt=SCHEDULE_RESUME_DEFAULT, scope="all",
-                                 interrupt=True):
+                                 interrupt=True, snapshot=False, per_session=None):
     """把 target 模型下发给所有已知会话；正在跑的会话会先停、换完再让它接着做。
 
     scope="running-only" 用于「恢复」时避免无谓地打扰空闲会话。
-    interrupt=False 用于「恢复」：只把模型改回去，不打断正在跑的轮次
-    （恢复不该杀掉用户正在进行的工作）。
+    snapshot=True 时，把每个会话「切换前自己用的模型」记进 report —— 恢复要靠它
+    逐会话精确回滚，而不是把所有会话都退回同一个全局默认模型。
+
+    外部会话（headless / 禅道自动执行）只切模型、绝不打断也绝不唤醒：它们的轮次由
+    别的客户端驱动，面板贸然 cancel / resume 会造出重复执行。
     """
-    pid, mid = target.get("providerId"), target.get("modelId")
+    pid, mid = (target or {}).get("providerId"), (target or {}).get("modelId")
     report = {"total": 0, "switched": 0, "failed": 0, "interrupted": 0, "stopped": 0,
               "resumed": 0, "resumeSkipped": 0, "inactive": 0, "pending": 0,
-              "pendingItems": [], "reason": reason,
+              "external": 0, "pendingItems": [], "reason": reason,
               "at": int(time.time() * 1000), "api": "session/setModel",
               "restart": False, "sessions": []}
     if not pid or not mid:
-        report["failed"] = 0
+        # 目标模型都没解析出来：这是真失败，不能像以前那样记 0 个失败糊过去
+        report["failed"] = 1
+        report["error"] = "没有可用的目标模型（规则未配置模型，或读不到原模型）"
+        log("模型下发中止（%s）：没有可用的目标模型" % (reason or "未注明"))
         return report
 
-    for sid in target_sessions():
-        was_running = bool(runner and runner.is_running(sid))
+    sids, external = await target_sessions()
+    for sid in sids:
+        tgt = (per_session or {}).get(sid) or target
+        if not (tgt.get("providerId") and tgt.get("modelId")):
+            continue
+        is_external = sid in external
+        was_running = is_external or bool(runner and runner.is_running(sid))
         if scope == "running-only" and not was_running:
             continue
         report["total"] += 1
-        row = {"sessionId": sid, "wasRunning": was_running}
+        row = {"sessionId": sid, "wasRunning": was_running, "external": is_external}
+        if is_external:
+            report["external"] += 1
+        if snapshot:
+            # 快照必须在下发之前取：setModel 一调，库里记的就是新模型了
+            row["prevModel"] = session_model_selection(sid)
         stopped = None
-        if was_running and interrupt:
+        if was_running and interrupt and not is_external:
             # 正在跑：先请求停止，再等它真的收尾，最后才换模型、续跑
             try:
                 await runner.cancel(sid, strict=True)
@@ -2393,7 +2514,7 @@ async def apply_model_everywhere(target, *, reason="", resume=True,
             if stopped:
                 report["stopped"] += 1
 
-        ok, err = await switch_session_model(sid, target)
+        ok, err = await switch_session_model(sid, tgt, allow_resume=not is_external)
         if ok:
             report["switched"] += 1
             row["switched"] = True
@@ -2408,7 +2529,7 @@ async def apply_model_everywhere(target, *, reason="", resume=True,
             row["switched"] = False
             row["error"] = err
 
-        if was_running and resume and interrupt:
+        if was_running and resume and interrupt and not is_external:
             if stopped:
                 if ok and await resume_and_verify(sid, prompt):
                     report["resumed"] += 1
@@ -2425,17 +2546,17 @@ async def apply_model_everywhere(target, *, reason="", resume=True,
                 row["pending"] = ("轮次未在 %ds 内结束，已登记：空闲后自动补发续跑提示"
                                   % SCHEDULE_STOP_WAIT_SEC)
                 report["pendingItems"].append({
-                    "sessionId": sid, "prompt": prompt, "target": target,
+                    "sessionId": sid, "prompt": prompt, "target": tgt,
                     "needSwitch": not ok,
                 })
                 log(f"定时切换：会话 {sid} 未停下，登记待续跑（空闲后补发）")
         report["sessions"].append(row)
 
-    log("模型下发完成（%s）：目标 %s/%s，命中 %d 个会话，切换成功 %d，失败 %d，闲置跳过 %d，"
-        "请求打断 %d，确认停止 %d，续跑成功 %d，跳过续跑 %d，待续跑 %d"
-        % (reason or "未注明", pid, mid, report["total"], report["switched"],
-           report["failed"], report["inactive"], report["interrupted"], report["stopped"],
-           report["resumed"], report["resumeSkipped"], report["pending"]))
+    log("模型下发完成（%s）：目标 %s/%s，命中 %d 个会话（含外部 %d），切换成功 %d，失败 %d，"
+        "闲置跳过 %d，请求打断 %d，确认停止 %d，续跑成功 %d，跳过续跑 %d，待续跑 %d"
+        % (reason or "未注明", pid, mid, report["total"], report["external"],
+           report["switched"], report["failed"], report["inactive"], report["interrupted"],
+           report["stopped"], report["resumed"], report["resumeSkipped"], report["pending"]))
     return report
 
 
@@ -2470,6 +2591,36 @@ class ModelScheduler:
         self.history = []
         self.pending = {}       # sid -> 待续跑项（轮次没停下来时的兜底）
         self.started_at = int(time.time() * 1000)
+        self.restore(SCHEDULE_RUNTIME_SAVED)
+
+    # ---- 运行态持久化（D8）----
+    def restore(self, saved):
+        """服务重启后接回上次的运行态，别让「谁被切走了、原来是什么」随重启蒸发。"""
+        if not isinstance(saved, dict):
+            return False
+        active = saved.get("active")
+        if not isinstance(active, dict):
+            return False
+        m = active.get("model") or {}
+        if not (m.get("providerId") and m.get("modelId")):
+            return False
+        until = active.get("until")
+        if until and int(time.time() * 1000) >= int(until):
+            log("模型定时：上次的运行态已过期，不再接续")
+            return False
+        self.active = active
+        prev = saved.get("prev")
+        self.prev = prev if isinstance(prev, dict) else None
+        log("模型定时：已接续重启前的生效窗口 %s -> %s/%s"
+            % (active.get("name") or active.get("id"),
+               m.get("providerId"), m.get("modelId")))
+        return True
+
+    def runtime_state(self):
+        """要持久化的运行态（JSON 可序列化）。"""
+        return {"active": dict(self.active) if self.active else None,
+                "prev": self.prev,
+                "savedAt": int(time.time() * 1000)}
 
     # ---- 对外只读 ----
     def override_model(self):
@@ -2484,8 +2635,12 @@ class ModelScheduler:
 
     def public_runtime(self):
         a = self.active
+        prev = self.prev or {}
         out = {"active": None, "prev": self.prev, "serverTime": int(time.time() * 1000),
-               "tickSeconds": SCHEDULE_TICK, "pending": len(self.pending)}
+               "tickSeconds": SCHEDULE_TICK, "pending": len(self.pending),
+               "prevSessions": len(prev.get("sessions") or {}),
+               "prevGlobal": prev.get("global") or {},
+               "prevAt": prev.get("at")}
         if a:
             out["active"] = {
                 "id": a.get("id"), "name": a.get("name"),
@@ -2567,7 +2722,15 @@ class ModelScheduler:
 
         was_active = bool(self.active)
         if not was_active:
-            self.prev = {"model": current_global_model(), "at": int(time.time() * 1000)}
+            # 恢复基准：全局默认（写回 config.json 用）+ 每个会话**自己**原来的模型。
+            # setModel 会顺带改写 config.json 的 model.main，所以这两份都得在下发
+            # 之前取好，否则「恢复」只会把大家统一退回最后一次被改写的那个。
+            self.prev = {
+                "model": current_global_model(),
+                "global": global_model_raw(),
+                "sessions": {},
+                "at": int(time.time() * 1000),
+            }
         resume = bool(rule.get("resumeRunning", True))
         prompt = (rule.get("resumePrompt") or "").strip() or SCHEDULE_RESUME_DEFAULT
 
@@ -2583,16 +2746,30 @@ class ModelScheduler:
         }
         log("模型定时生效：%s -> %s/%s（手动=%s，续跑=%s）"
             % (self.active["name"], pid, mid, manual, resume))
+        # interrupt 必须跟着 resume 走：前端那个开关的文案是「先停止当前这一轮，
+        # 换完模型后自动让它接着做」，是一个整体。原来这里没传 interrupt（默认 True），
+        # 于是「不续跑」的规则照样会把正在跑的会话打断、而且不再接上 —— 任务就这么没了。
         report = await apply_model_everywhere(model, reason="定时生效：" + self.active["name"],
-                                              resume=resume, prompt=prompt)
+                                              resume=resume, prompt=prompt,
+                                              interrupt=resume,
+                                              snapshot=(not was_active))
         if resume:
             self.register_pending(report.get("pendingItems"), reason="定时生效：" + self.active["name"])
+        if not was_active and self.prev is not None:
+            # 汇聚每会话原模型：恢复时要按会话各回各的，不能统一退回全局默认
+            got = {}
+            for row in (report.get("sessions") or []):
+                sid, pm = row.get("sessionId"), row.get("prevModel")
+                if sid and pm and pm.get("providerId") and pm.get("modelId"):
+                    got[sid] = pm
+            self.prev["sessions"] = got
         rule["lastRunAt"] = int(time.time() * 1000)
-        rule["lastResult"] = {k: report[k] for k in
+        rule["lastResult"] = {k: report.get(k, 0) for k in
                               ("total", "switched", "failed", "interrupted", "stopped",
-                                  "resumed", "resumeSkipped", "inactive", "pending")}
-        if not manual:
-            save_schedules()
+                                  "resumed", "resumeSkipped", "inactive", "pending",
+                                  "external")}
+        # 手动「立即执行」的结果同样要落盘：否则刷新页面 / 重启服务后这次执行就没了
+        save_schedules()
         self._record({"scope": "switch", "id": rule.get("id"),
                       "name": self.active["name"], "model": model, "report": rule["lastResult"]})
         await notify_global({"type": "model-scheduled", "scope": "switch",
@@ -2605,28 +2782,70 @@ class ModelScheduler:
             return await self._revert_locked(reason, manual, scope)
 
     async def _revert_locked(self, reason="定时时段结束", manual=False, scope="all"):
-        prev_model = (self.prev or {}).get("model") if self.prev else None
-        name = (self.active or {}).get("name")
+        prev = self.prev or {}
+        prev_model = prev.get("model")
+        sessions = prev.get("sessions") or {}
+        active = self.active or {}
+        # 打断策略跟着规则走：规则设了「不打断正在跑的会话」，恢复时也不打断。
+        # 默认打断 + 续跑 —— 与前端「正在跑的会话同样会被打断后继续」的承诺一致。
+        resume = bool(active.get("resume", True))
+        prompt = active.get("prompt") or SCHEDULE_RESUME_DEFAULT
+        name = active.get("name")
         self.active = None
         self.prev = None
-        if not prev_model:
+        fallback = prev_model or current_global_model()
+        if not fallback:
+            fallback = next((m for m in sessions.values()
+                             if m and m.get("providerId") and m.get("modelId")), None)
+        if not fallback and not sessions:
             self._record({"scope": "revert", "reason": reason, "model": None})
+            save_schedules()
             await notify_global({"type": "model-scheduled", "scope": "revert",
                                  "reason": reason, "active": None})
             return {"ok": True, "model": None, "report": None}
-        log("模型定时恢复：%s -> %s/%s（%s）"
-            % (name, prev_model["providerId"], prev_model["modelId"], reason))
-        report = await apply_model_everywhere(prev_model, reason="定时恢复：" + reason,
-                                             prompt=SCHEDULE_RESUME_DEFAULT, scope=scope,
-                                             interrupt=False, resume=False)
-        self._record({"scope": "revert", "reason": reason, "model": prev_model,
-                      "report": {k: report[k] for k in
+        log("模型定时恢复：%s -> 逐会话回各自原模型（%d 个有快照，兜底 %s/%s，%s）"
+            % (name, len(sessions), (fallback or {}).get("providerId"),
+               (fallback or {}).get("modelId"), reason))
+        report = await apply_model_everywhere(fallback, reason="定时恢复：" + reason,
+                                             prompt=prompt, scope=scope,
+                                             interrupt=resume, resume=resume,
+                                             per_session=sessions)
+        if resume:
+            self.register_pending(report.get("pendingItems"), reason="定时恢复：" + reason)
+        # setModel 会顺带把 config.json 的 model.main 改成切走的那个；恢复时必须
+        # 写回去，否则「面板看着恢复了，新建会话却还在用定时模型」。
+        await self._restore_global_model(prev.get("global"), reason)
+        self._record({"scope": "revert", "reason": reason, "model": fallback,
+                      "report": {k: report.get(k, 0) for k in
                                  ("total", "switched", "failed", "interrupted", "stopped",
-                                  "resumed", "resumeSkipped", "inactive", "pending")}})
+                                  "resumed", "resumeSkipped", "inactive", "pending",
+                                  "external")}})
+        save_schedules()
         await notify_global({"type": "model-scheduled", "scope": "revert",
                              "reason": reason, "active": None,
-                             "model": prev_model, "report": report})
-        return {"ok": True, "model": prev_model, "report": report}
+                             "model": fallback, "report": report})
+        return {"ok": True, "model": fallback, "report": report}
+
+    async def _restore_global_model(self, want, reason):
+        """把 config.json 的 model 段写回切换前的内容（setModel 的副作用清理）。"""
+        if not isinstance(want, dict) or not want.get("main") or zc is None:
+            return False
+        try:
+            async with zc.config_lock:
+                cfg = read_zcode_config()
+                cur = cfg.get("model") or {}
+                if (cur.get("main") or "") == want.get("main") and \
+                   (cur.get("lite") or "") == (want.get("lite") or ""):
+                    return False
+                cfg["model"] = {"main": want.get("main"),
+                                "lite": want.get("lite") or want.get("main")}
+                write_zcode_config(cfg)
+            log("模型定时恢复：config.json 默认模型已写回 %s（%s）"
+                % (want.get("main"), reason))
+            return True
+        except Exception as exc:
+            log(f"模型定时恢复：写回 config.json 失败: {exc}")
+            return False
 
     # ---- 调度循环 ----
     async def tick(self):
@@ -2652,8 +2871,14 @@ class ModelScheduler:
                 cur["until"] = int(best[2] * 1000) if best[2] else None
                 return
             if want is None:
-                # 手动切换不会被自然规则的空档回收，要用户自己点「恢复」
-                if cur_id and not cur_manual:
+                # 手动切换不会被自然规则的空档回收，要用户自己点「恢复」；
+                # 但「立即执行」带时长的那次，到点要自动恢复。
+                if cur_id and cur_manual:
+                    until = (cur or {}).get("until")
+                    if until and now * 1000 >= int(until):
+                        await self._revert_locked("立即执行时长结束")
+                    return
+                if cur_id:
                     await self._revert_locked("定时时段结束")
                 return
             # 有自然到点的规则且与当前不同 → 切过去（手动切换也会被自然规则接管）
@@ -4588,13 +4813,11 @@ def build_schedule_entry(data, existing=None):
     return e, None
 
 
-async def activate_rule(rule, *, manual=False, write=True):
+async def activate_rule(rule, *, manual=False, fired=None, expires=None):
     """把一条规则立刻应用上去（供「立即执行」和调度器共用）。"""
     if scheduler is None:
         return {"ok": False, "error": "调度器未就绪"}
-    if write:
-        save_schedules()
-    return await scheduler.activate(rule, fired=None, expires=None, manual=manual)
+    return await scheduler.activate(rule, fired=fired, expires=expires, manual=manual)
 
 
 async def handle_schedules(request):
@@ -4676,7 +4899,11 @@ async def handle_schedule_delete(request):
 
 
 async def handle_schedule_run(request):
-    """立即把这条规则应用一次（不算定时生效，不会被空档自动回收）。"""
+    """立即把这条规则应用一次（不算定时生效，不会被空档自动回收）。
+
+    手动执行同样遵守规则时长：填了 durationMinutes 就到点自动切回，
+    没填才是「一直生效，直到手动恢复」。
+    """
     blocked = guard(request)
     if blocked:
         return blocked
@@ -4684,11 +4911,18 @@ async def handle_schedule_run(request):
     rule = find_schedule(sid)
     if not rule:
         return json_error("规则不存在", 404)
-    res = await activate_rule(rule, manual=True)
+    now = time.time()
+    try:
+        dur = int(rule.get("durationMinutes") or 0) * 60
+    except Exception:
+        dur = 0
+    expires = now + dur if dur > 0 else None
+    res = await activate_rule(rule, manual=True, fired=now, expires=expires)
     if not res.get("ok"):
         return json_error(res.get("error") or "执行失败", 502)
     return web.json_response({"ok": True, "active": res.get("active"),
-                              "report": res.get("report")})
+                              "report": res.get("report"),
+                              "expiresAt": int(expires * 1000) if expires else None})
 
 
 async def handle_schedule_revert(request):

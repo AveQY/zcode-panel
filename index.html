@@ -2,11 +2,11 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="referrer" content="no-referrer">
 <title>ZCode 对话控制台</title>
-<link rel="stylesheet" href="/static/style.css?v=20260918c">
+<link rel="stylesheet" href="/static/style.css?v=20260925a">
 </head>
 <body>
 
@@ -35,6 +35,9 @@
 
 <!-- ============================ 主体 ============================ -->
 <div id="app-view" class="app-view hidden">
+
+  <!-- 移动端抽屉遮罩：侧栏浮层打开时挡住聊天区，点它收起抽屉（桌面端隐藏） -->
+  <div id="sidebar-mask" class="sidebar-mask hidden"></div>
 
   <aside id="sidebar" class="sidebar">
     <div class="sidebar-head">
@@ -497,15 +500,10 @@
       <button class="icon-btn" data-close="provider-modal">&#10005;</button>
     </div>
     <div class="modal-body">
-      <div class="form-row two-col">
-        <div>
-          <label class="form-label" for="pv-id">厂商 ID</label>
-          <input id="pv-id" type="text" placeholder="例如 myvendor">
-        </div>
-        <div>
-          <label class="form-label" for="pv-name">显示名称</label>
-          <input id="pv-name" type="text" placeholder="例如 我的中转">
-        </div>
+      <div class="form-row">
+        <label class="form-label" for="pv-name">显示名称</label>
+        <input id="pv-name" type="text" placeholder="例如 我的中转">
+        <div class="form-hint" id="pv-id-hint">厂商 ID 会自动生成，不用手填。</div>
       </div>
 
       <div class="form-row two-col">
@@ -595,6 +593,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js?v=20260918c"></script>
+<script src="/static/app.js?v=20260925a"></script>
 </body>
 </html>

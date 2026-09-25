@@ -644,9 +644,12 @@
           refreshSchedViews();
         } else if (d.scope === 'sync') {
           // 老服务端可能不带 pending 字段，这种情况下别把已经拿到的值抹成 0
-          var prevPend = (state.scheduleRuntime || {}).pending || 0;
-          state.scheduleRuntime = { active: d.active || null,
-                                    pending: (d.pending === undefined ? prevPend : d.pending) || 0 };
+          var prevRt = state.scheduleRuntime || {};
+          var prevPend = prevRt.pending || 0;
+          state.scheduleRuntime = Object.assign({}, prevRt, {
+            active: d.active || null,
+            pending: (d.pending === undefined ? prevPend : d.pending) || 0,
+          });
           renderSchedBanner();
           renderModelSelects();
         }
@@ -2918,6 +2921,19 @@
     return '持续 ' + min + ' 分钟';
   }
 
+  // 「生效前模型」怎么描述：优先说清「逐会话各回各的」，
+  // 没有快照时才退回全局默认模型。
+  function schedPrevText(rt) {
+    rt = rt || {};
+    var n = Number(rt.prevSessions) || 0;
+    if (n > 0) return '逐会话各回原模型（' + n + ' 个会话有快照）';
+    var pm = (rt.prev && rt.prev.model) || null;
+    if (pm && pm.providerId) return pm.providerId + '/' + pm.modelId;
+    var g = rt.prevGlobal || {};
+    if (g.main) return g.main + '（全局默认）';
+    return '未知';
+  }
+
   function schedEndText(startMs, min) {
     if (!startMs || !min) return '';
     var d = new Date(startMs + min * 60000);
@@ -2944,8 +2960,7 @@
     if (rt.active) {
       var a = rt.active;
       var untilTxt = a.until ? ('到 ' + fmtDTFull(a.until)) : '持续生效（直到恢复或下一条规则）';
-      var prevTxt = (rt.prev && rt.prev.model)
-        ? (rt.prev.model.providerId + '/' + rt.prev.model.modelId) : '未知';
+      var prevTxt = schedPrevText(rt);
       box.classList.remove('hidden');
       box.innerHTML =
         '<div class="sched-active-head">' +
@@ -2979,7 +2994,10 @@
           last = '上次 ' + fmtDT(s.lastRunAt) + '：命中 ' + (s.lastResult.total || 0) +
             ' 个会话，成功 ' + (s.lastResult.switched || 0) +
             (s.lastResult.interrupted ? '，中断 ' + s.lastResult.interrupted + ' 个并续跑 ' +
-              (s.lastResult.resumed || 0) + ' 个' : '');
+              (s.lastResult.resumed || 0) + ' 个' : '') +
+            (s.lastResult.external ? '，含外部会话 ' + s.lastResult.external + ' 个' : '') +
+            (s.lastResult.pending ? '，' + s.lastResult.pending + ' 个待空闲续跑' : '') +
+            (s.lastResult.inactive ? '，' + s.lastResult.inactive + ' 个已闲置' : '');
         }
         return '<div class="sched-row' + (on ? '' : ' off') + (s.active ? ' running' : '') +
           '" data-id="' + esc(s.id) + '">' +
@@ -3189,15 +3207,20 @@
     req('/api/schedules/' + encodeURIComponent(id) + '/run', { method: 'POST' }).then(function (r) {
       if (!r.data.ok) { toast(r.data.error || '执行失败', 'err'); return; }
       var rep = r.data.report || {};
-      toast('已切换：命中 ' + (rep.total || 0) + ' 个会话，成功 ' + (rep.switched || 0) +
-            (rep.interrupted ? '，中断并续跑 ' + (rep.resumed || 0) + ' 个' : ''));
+      var msg = '已切换：命中 ' + (rep.total || 0) + ' 个会话，成功 ' + (rep.switched || 0) +
+            (rep.interrupted ? '，中断并续跑 ' + (rep.resumed || 0) + ' 个' : '') +
+            (rep.external ? '，含外部会话 ' + rep.external + ' 个' : '') +
+            (rep.pending ? '，' + rep.pending + ' 个待空闲续跑' : '');
+      // 手动执行同样遵守规则时长：到点会自动切回，把这件事说清楚
+      if (r.data.expiresAt) msg += '；' + fmtDT(r.data.expiresAt) + ' 自动恢复';
+      toast(msg, rep.failed ? 'err' : 'ok');
       loadSchedules(true);
       loadOptions(true);
     });
   }
 
   function revertSched() {
-    confirmBox('恢复原模型', '把定时生效前的模型重新下发给所有会话？\n正在跑的会话同样会被打断后继续。', '恢复')
+    confirmBox('恢复原模型', '把每个会话切回它各自在定时生效前用的模型？\n正在跑的会话会按规则设置决定是否打断后继续。', '恢复')
       .then(function (ok) {
         if (!ok) return;
         req('/api/schedules/revert', { method: 'POST' }).then(function (r) {

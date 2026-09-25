@@ -105,6 +105,14 @@ TURN_ABSOLUTE_MAX = 12 * 3600  # 单轮硬上限（求证后仍然在跑也不�
 # 新建会话要等第一轮结束才落库，查不到不代表没在干活。
 TURN_IDLE_STATES = ("idle", "completed", "done", "stopped", "cancelled",
                     "canceled", "closed", "archived", "error", "failed")
+# ---- 会话输出实时化（外部进程的会话只能靠库来「看」） ----------------------
+# 面板自己驱动的轮次有事件流（WS 实时推）；但禅道自动执行器这类外部进程会
+# 自己拉起一个 app-server，它产生的事件永远进不了面板的事件流，只有 SQLite
+# 能反映出来。所以「库里的轮次还没收尾」是判断外部会话在跑的唯一可靠依据。
+DB_LIVE_MAX_AGE_MS = 12 * 3600 * 1000   # 未收尾轮次的保鲜期：更久没动的当残留
+DB_ACTIVE_WINDOW_MS = 10 * 60 * 1000    # 多久内有落库才认为「活跃」（决定是否锁输入框）
+DB_LIST_LIVE_MS = 30 * 60 * 1000        # 列表页「执行中」标记的窗口：更久没动的当残留
+TAIL_LIMIT = 60                         # 单次增量最多回多少条消息
 MAX_MESSAGE_CHARS = 20000
 
 # ---- 厂商连通性探测 --------------------------------------------------------
@@ -801,7 +809,8 @@ def load_messages(session_id, limit=None, before=None):
     conn = db_connect()
     try:
         cur = conn.cursor()
-        sql = "SELECT id, data, sequence, time_created FROM message WHERE session_id = ?"
+        sql = ("SELECT id, data, sequence, time_created, time_updated "
+               "FROM message WHERE session_id = ?")
         params = [session_id]
         if before is not None:
             sql += " AND sequence < ?"
@@ -813,33 +822,152 @@ def load_messages(session_id, limit=None, before=None):
         cur.execute(sql, params)
         # 倒序取再反转，等价于时间正序的「最后 limit 条」
         rows = list(cur.fetchall())[::-1]
-        out = []
-        for r in rows:
-            try:
-                meta = json.loads(r["data"] or "{}")
-            except Exception:
-                meta = {}
-            cur.execute("SELECT data, sequence FROM part WHERE message_id = ? ORDER BY sequence",
-                        (r["id"],))
-            parts = []
-            for p in cur.fetchall():
-                try:
-                    parts.append(json.loads(p["data"] or "{}"))
-                except Exception:
-                    continue
-            model = meta.get("modelID")
-            if not model and isinstance(meta.get("model"), dict):
-                model = meta["model"].get("modelID")
-            out.append({
-                "id": r["id"],
-                "role": meta.get("role", "unknown"),
-                "time": r["time_created"],
-                "seq": r["sequence"],
-                "model": model,
-                "error": meta.get("error"),
-                "parts": parts,
-            })
-        return out
+        return [message_payload(cur, r) for r in rows]
+    finally:
+        conn.close()
+
+
+def message_payload(cur, row):
+    """一行 message + 它的 part，拼成前端要的结构（历史与增量共用）。
+
+    completed / updated 两个字段是「实时化」补上的：前端靠 completed 判断
+    这条助手消息是「正在生成」还是「已收尾」，靠 updated 推进增量游标。
+    """
+    try:
+        meta = json.loads(row["data"] or "{}")
+    except Exception:
+        meta = {}
+    cur.execute("SELECT data, sequence, time_updated FROM part "
+                "WHERE message_id = ? ORDER BY sequence", (row["id"],))
+    parts = []
+    updated = int(row["time_updated"] or row["time_created"] or 0)
+    for p in cur.fetchall():
+        updated = max(updated, int(p["time_updated"] or 0))
+        try:
+            parts.append(json.loads(p["data"] or "{}"))
+        except Exception:
+            continue
+    model = meta.get("modelID")
+    if not model and isinstance(meta.get("model"), dict):
+        model = meta["model"].get("modelID")
+    tinfo = meta.get("time") if isinstance(meta.get("time"), dict) else {}
+    return {
+        "id": row["id"],
+        "role": meta.get("role", "unknown"),
+        "time": row["time_created"],
+        "seq": row["sequence"],
+        "model": model,
+        "error": meta.get("error"),
+        "parts": parts,
+        "completed": bool(tinfo.get("completed")),
+        "updated": updated,
+    }
+
+
+def load_messages_since(session_id, since_ms, limit=TAIL_LIMIT):
+    """增量取数：该会话里 time_updated 比 since_ms 新的消息（含 part 更新）。
+
+    库里是按「步骤」落盘的：一个 step 的 reasoning/text/tool part 会在该步收尾
+    时一次性写入（part.time_updated 会变，message.time_updated 不一定变），所以
+    两个时间戳都要比。返回的是整条消息，前端按 id 做「整条替换」，天然幂等。
+    """
+    conn = db_connect()
+    try:
+        cur = conn.cursor()
+        if since_ms and since_ms > 0:
+            cur.execute(
+                "SELECT m.id, m.data, m.sequence, m.time_created, m.time_updated "
+                "FROM message m WHERE m.session_id = ? AND ("
+                "  m.time_updated > ? OR EXISTS ("
+                "    SELECT 1 FROM part p WHERE p.message_id = m.id "
+                "    AND p.time_updated > ?)) "
+                "ORDER BY m.sequence LIMIT ?",
+                (session_id, int(since_ms), int(since_ms), int(limit)))
+            rows = cur.fetchall()
+        else:
+            # 没给游标（刚打开会话）时给「最后 limit 条」，不能给最老的
+            cur.execute(
+                "SELECT id, data, sequence, time_created, time_updated "
+                "FROM message WHERE session_id = ? ORDER BY sequence DESC LIMIT ?",
+                (session_id, int(limit)))
+            rows = list(cur.fetchall())[::-1]
+        return [message_payload(cur, r) for r in rows]
+    finally:
+        conn.close()
+
+
+def session_max_updated(session_id):
+    """该会话最新的落库时间戳（message / part 取大）。"""
+    conn = db_connect()
+    try:
+        r = conn.execute(
+            "SELECT MAX(t) AS mx FROM ("
+            "  SELECT MAX(time_updated) AS t FROM message WHERE session_id = ? "
+            "  UNION ALL "
+            "  SELECT MAX(time_updated) FROM part WHERE session_id = ?)",
+            (session_id, session_id)).fetchone()
+        return int(r["mx"] or 0)
+    finally:
+        conn.close()
+
+
+def db_session_live(session_id, max_age_ms=DB_LIVE_MAX_AGE_MS):
+    """库里判断这个会话是不是还有没收尾的轮次。
+
+    判据：最新一条助手消息没有写 time.completed。外部 app-server 是「先把
+    助手消息建出来、边跑边写 part、收尾时补 completed」，所以这条判据覆盖
+    整轮执行期。加保鲜期是为了不把「崩在半路、再没人管」的残留永远当在跑。
+    """
+    if not session_id:
+        return False
+    floor = int(time.time() * 1000) - int(max_age_ms)
+    try:
+        conn = db_connect()
+    except Exception:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT m.id FROM message m JOIN session s ON s.id = m.session_id "
+            "WHERE m.session_id = ? AND s.time_archived IS NULL "
+            "AND json_extract(m.data, '$.role') = 'assistant' "
+            "AND json_extract(m.data, '$.time.completed') IS NULL "
+            "AND m.time_created >= ? "
+            "AND m.sequence = (SELECT MAX(sequence) FROM message x "
+            "                  WHERE x.session_id = m.session_id) LIMIT 1",
+            (session_id, floor)).fetchone()
+        return row is not None
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def db_live_sessions():
+    """一次查出所有「还在跑」的会话（列表页打执行中标记用）。
+
+    窗口比 DB_LIVE_MAX_AGE_MS 短：挂列表上的「执行中」是个强提示，崩在半路的
+    残留不该一直挂着；真正在跑的任务每步都会落库，30 分钟的空档已经很宽松。
+    """
+    floor = int(time.time() * 1000) - DB_LIST_LIVE_MS
+    try:
+        conn = db_connect()
+    except Exception:
+        return set()
+    try:
+        rows = conn.execute(
+            "SELECT m.session_id AS sid FROM message m "
+            "JOIN session s ON s.id = m.session_id "
+            "WHERE s.time_archived IS NULL "
+            "AND json_extract(m.data, '$.role') = 'assistant' "
+            "AND json_extract(m.data, '$.time.completed') IS NULL "
+            "AND m.time_created >= ? "
+            "AND m.sequence = (SELECT MAX(sequence) FROM message x "
+            "                  WHERE x.session_id = m.session_id)",
+            (floor,)).fetchall()
+        return {r["sid"] for r in rows}
+    except Exception as exc:
+        log("探测执行中会话失败: %s" % exc)
+        return set()
     finally:
         conn.close()
 
@@ -4081,11 +4209,15 @@ async def handle_sessions(request):
     except Exception as exc:
         return json_error(f"读取会话列表失败: {exc}", 502)
 
+    db_live = db_live_sessions()
     out = []
     for s in ((res or {}).get("sessions") or []):
         sid = s.get("sessionId")
         ws = s.get("workspace") or {}
         running = runner.is_running(sid) if runner else False
+        # 外部进程（禅道自动执行器等）在跑的会话，面板的 runner 根本不知道，
+        # 只能靠库里「还没收尾」来标执行中 —— 否则用户看不到它其实在跑。
+        db_running = bool(sid in db_live)
         # 每个会话各用各的模型：优先 app-server 报的，再退回面板运行态，
         # 最后从该会话最后一条助手消息恢复实际用过的模型。
         model = s.get("model") or ((runner.desired.get(sid) or {}).get("model")
@@ -4100,7 +4232,8 @@ async def handle_sessions(request):
             "workspaceKey": ws.get("workspaceKey") or "",
             "created": s.get("createdAt"),
             "updated": s.get("updatedAt"),
-            "status": "running" if running else (s.get("status") or "idle"),
+            "status": "running" if (running or db_running) else (s.get("status") or "idle"),
+            "dbLive": db_running,
             "mode": s.get("mode"),
             "model": model,
             "pendingModel": pending,
@@ -4182,6 +4315,11 @@ async def handle_session_messages(request):
     total, min_seq = session_msg_stats(sid)
     has_more = bool(msgs and min_seq is not None and msgs[0]["seq"] > min_seq)
     f = feed.get(sid)
+    ws_live = bool(f and f.turn_active)
+    db_live = db_session_live(sid)
+    cursor = 0
+    for m in msgs:
+        cursor = max(cursor, int(m.get("updated") or 0))
     return web.json_response({
         "ok": True,
         "sessionId": sid,
@@ -4192,8 +4330,55 @@ async def handle_session_messages(request):
         "total": total,
         "hasMore": has_more,
         "oldestSeq": (msgs[0]["seq"] if msgs else None),
-        "live": bool(f and f.turn_active),
+        "live": ws_live or db_live,
+        "wsLive": ws_live,
+        "dbLive": db_live,
+        # active = 刚有落库（真的在跑）；未收尾但早已停住的是残留，别锁输入框
+        "active": bool(db_live and (
+            time.time() * 1000 - session_max_updated(sid)) < DB_ACTIVE_WINDOW_MS),
+        "cursor": cursor,
         "usage": (f.usage if f else None),
+    })
+
+
+async def handle_session_tail(request):
+    """会话增量尾随：只回「比 after 新」的消息，供外部会话做准实时刷新。
+
+    纯文本回复在库里是整段落的（一个 step 收尾时才写），所以粒度是「每步一次」，
+    不是逐 token；带工具的任务（禅道执行就是这种）每步都会落一条，效果接近实时。
+    """
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    sid = request.match_info["sid"]
+    if not SESSION_ID_RE.match(sid):
+        return json_error("非法的会话 ID", 400)
+    try:
+        after = int(request.query.get("after") or 0)
+    except (TypeError, ValueError):
+        after = 0
+    after = max(0, after)
+    newest = session_max_updated(sid)
+    # 游标回退 1ms：同一毫秒里落库的多条更新不会因为「严格大于」被漏掉，
+    # 前端按消息 id 整条替换，重复下发是幂等的。
+    msgs = load_messages_since(sid, max(0, after - 1), limit=TAIL_LIMIT)
+    f = feed.get(sid)
+    ws_live = bool(f and f.turn_active)
+    db_live = db_session_live(sid)
+    cursor = max(after, newest)
+    for m in msgs:
+        cursor = max(cursor, int(m.get("updated") or 0))
+    return web.json_response({
+        "ok": True,
+        "sessionId": sid,
+        "live": ws_live or db_live,
+        "wsLive": ws_live,
+        "dbLive": db_live,
+        # active = 真的活跃（刚有落库）。残留的未收尾轮次不该锁住输入框。
+        "active": bool(db_live and (time.time() * 1000 - newest) < DB_ACTIVE_WINDOW_MS),
+        "cursor": cursor,
+        "messages": msgs,
+        "title": session_title(sid),
     })
 
 
@@ -4535,6 +4720,18 @@ async def handle_provider_upsert(request):
         if not entry.get("models"):
             return json_error("该厂商下至少要有一个模型，请在弹窗的模型列表里添加")
         providers[pid] = entry
+        # 删模型 / 改模型 ID 之后，当前主模型可能正好指向已经不存在的条目。
+        # 悬空的主模型会让 app-server 起不来（或静默回落），顺手挪到剩下的第一个。
+        mcfg = dict(cfg.get("model") or {})
+        main = str(mcfg.get("main") or "")
+        if main.startswith(pid + "/") and main.split("/", 1)[1] not in entry["models"]:
+            first = "%s/%s" % (pid, list(entry["models"].keys())[0])
+            lite = str(mcfg.get("lite") or "")
+            mcfg["main"] = first
+            if lite.startswith(pid + "/") and lite.split("/", 1)[1] not in entry["models"]:
+                mcfg["lite"] = first
+            cfg["model"] = mcfg
+            log(f"主模型已失效，改指 {first}")
         write_zcode_config(cfg)
     await zc.restart("厂商配置变更")
     log(f"保存厂商: {pid}")
@@ -4988,11 +5185,15 @@ async def handle_ws(request):
                     if f:
                         f.add_subscriber(ws)
                         watched.add(sid)
-                        # 把已缓存的事件回放给迟到者
-                        for ev in f.buffer[-400:]:
-                            await safe_send(ws, ev)
                         if f.turn_active:
+                            # 只回放「正在跑的这一轮」：上一轮的缓存回放会和
+                            # 已经渲染好的历史叠在一起，出现重复内容。
+                            for ev in f.buffer[-400:]:
+                                await safe_send(ws, ev)
                             await safe_send(ws, {"type": "resumed", "sessionId": sid})
+                        else:
+                            # 明确告诉前端「没有可续的流」，别让它干等 resumed
+                            await safe_send(ws, {"type": "idle", "sessionId": sid})
                 continue
 
             if action == "unwatch":
@@ -5177,6 +5378,7 @@ def make_app():
     app.router.add_get("/api/sessions", handle_sessions)
     app.router.add_post("/api/sessions", handle_session_create)
     app.router.add_get("/api/sessions/{sid}/messages", handle_session_messages)
+    app.router.add_get("/api/sessions/{sid}/tail", handle_session_tail)
     app.router.add_post("/api/sessions/{sid}/archive", handle_session_archive)
     app.router.add_delete("/api/sessions/{sid}", handle_session_delete)
     app.router.add_post("/api/sessions/{sid}/settings", handle_session_settings)

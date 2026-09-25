@@ -22,6 +22,7 @@
     providers: [],
     provScope: 'official',      // official | custom（默认停在「官方配置」，与 HTML 里 active 的按钮一致）
     editingProvider: null,
+    editingModels: [],          // 打开弹窗时该厂商原有的模型 ID（算「删了哪些」用）
     cur: null,                  // 当前正在流式渲染的助手消息
     msgPage: { hasMore: false, oldestSeq: null, loading: false,
                total: 0, rendered: 0 },   // 历史消息分页：最近50条 + 上滑加载更早
@@ -48,6 +49,9 @@
     schedules: [],
     scheduleRuntime: { active: null },
     schedEditing: null,         // 正在编辑的规则（null = 新建）
+    // --- 实时尾随（外部进程跑的会话只能靠读库刷新）---
+    tail: { sid: null, timer: null, cursor: 0, busy: false, external: false, quiet: 0 },
+    localUserMsgs: [],          // 本地已渲染、还没绑上库里 id 的用户消息（防重复）
   };
 
   var WS_COLLAPSE_KEY = 'zwc_ws_collapsed';
@@ -86,6 +90,12 @@
   var WS_PING_INTERVAL = 20000;   // 20s 一次
   var WS_IDLE_LIMIT = 50000;      // 50s 无任何入站帧即判定链路已死
   var WS_IDLE_CHECK = 10000;
+
+  // 外部进程（禅道自动执行器等）自己拉起 app-server，它的事件进不了面板的事件流，
+  // 只能定时读库做增量尾随。库里按「步骤」落盘，1.2s 一轮足够接近实时；长时间
+  // 没动静就退到 4s，省得空转。
+  var TAIL_INTERVAL = 1200;
+  var TAIL_QUIET_INTERVAL = 4000;
 
   /* ============================================ 基础工具 */
 
@@ -446,6 +456,8 @@
       return;
     }
     state.wsLastInbound = Date.now();
+    // 后台标签页会节流定时器，回前台立刻补一次增量
+    if (state.tail && state.tail.sid) scheduleTail(0);
   });
 
   function onWsReady() {
@@ -457,6 +469,11 @@
     }
     // 生成过程中掉线：丢掉半截气泡，靠服务端回放把本轮续上
     if (state.sessionId && isRunning(state.sessionId)) {
+      if ((state.running[state.sessionId] || {}).external) {
+        // 外部进程的轮次本来就没有事件流可续，内容靠库里的增量尾随刷新，
+        // 重连时别把已经渲染好的气泡清掉
+        return;
+      }
       resetLiveBubble();
       wsSend({ type: 'watch', sessionId: state.sessionId });
       setStatus('连接已恢复，正在恢复输出…');
@@ -523,7 +540,7 @@
       case 'accepted':
       case 'started':
       case 'resumed':
-        markRunning(sid, true);
+        markRunning(sid, true, { external: false });
         markAcked(sid);
         break;
       case 'done':
@@ -568,6 +585,7 @@
         break;
 
       case 'started':
+        markRunning(state.sessionId, true, { external: false });
         ensureAssistant(d.messageId);
         setStatus('模型正在处理…');
         break;
@@ -602,7 +620,14 @@
       case 'resumed':
         clearTimeout(state.wsResumeTimer);
         state.wsResumeTimer = null;
+        markRunning(state.sessionId, true, { external: false });
         setStatus('正在恢复输出…');
+        break;
+
+      case 'idle':
+        // 服务端明确说「没有可续的流」：不用再等 resumed，交给库里的增量尾随
+        clearTimeout(state.wsResumeTimer);
+        state.wsResumeTimer = null;
         break;
 
       case 'cancelling':
@@ -692,6 +717,7 @@
     box.innerHTML = '';
     state.messageMap.clear();
     state.cur = null;
+    state.localUserMsgs = [];
     state.msgPage = { hasMore: false, oldestSeq: null, loading: false,
                       total: 0, rendered: 0 };
   }
@@ -970,7 +996,7 @@
     try { return JSON.stringify(input, null, 2); } catch (e) { return String(input); }
   }
 
-  function appendUserMessage(text, prepend, timeMs) {
+  function appendUserMessage(text, prepend, timeMs, beforeEl) {
     hideWelcome();
     var box = $('messages');
     var row = document.createElement('div');
@@ -984,7 +1010,12 @@
     timeEl.textContent = fmtMsgTime(timeMs || Date.now());
     row.appendChild(timeEl);
     if (prepend) box.insertBefore(row, box.firstChild);
+    else if (beforeEl) box.insertBefore(row, beforeEl);
     else { box.appendChild(row); scrollToBottom(true); }
+    // 记一笔：库里那条同样的用户消息稍后会被尾随取回来，靠它认领，别重复渲染
+    state.localUserMsgs.push({ text: text, row: row, bound: false });
+    if (state.localUserMsgs.length > 30) state.localUserMsgs.shift();
+    return row;
   }
 
   function clearCursors() {
@@ -1043,10 +1074,13 @@
     return i >= 0 ? s.slice(i + 1) : s;
   }
 
-  function markRunning(sid, on) {
+  function markRunning(sid, on, opts) {
     if (!sid) return;
     if (on) {
       if (!state.running[sid]) state.running[sid] = { since: Date.now() };
+      // external：外部进程在跑（面板停不掉它，输入框要如实说明）
+      if (opts && opts.external === false) delete state.running[sid].external;
+      else if (opts && opts.external) state.running[sid].external = true;
     } else if (state.running[sid]) {
       delete state.running[sid];
     }
@@ -1075,13 +1109,15 @@
   // 输入区只反映「当前正在看的这个会话」
   function syncComposer() {
     var on = isRunning(state.sessionId);
+    var ext = !!(on && (state.running[state.sessionId] || {}).external);
     state.sending = on;
     $('send-btn').disabled = on;
     var stop = $('stop-btn');
     if (stop) {
       stop.classList.toggle('hidden', !on);
-      stop.disabled = false;
-      stop.textContent = '停止生成';
+      // 外部进程在跑的轮次面板停不掉，按钮如实说明，别让用户点了没反应
+      stop.disabled = ext;
+      stop.textContent = ext ? '外部任务执行中' : '停止生成';
     }
     if (on) {
       state.startedAt = (state.running[state.sessionId] || {}).since || Date.now();
@@ -1818,14 +1854,26 @@
         applySessionSettings(s, sm);
       }
 
+      // 实时性：这个会话不管此刻跑没跑，都把「增量尾随」挂上。
+      // 外部进程（禅道自动执行器）自己拉起 app-server，它的事件永远进不了面板
+      // 的事件流，只有定时读库才能做到「不用切换/刷新就看到新消息」。
+      startTail(sid, r.data.cursor || 0);
+
       // 用服务端状态校准「它还在不在跑」：网页关着的时候它可能已经跑完了。
-      // 还在跑就把事件流接回来，服务端会把本轮已产生的事件重放一遍，
-      // 于是切回去就能看到正在输出的内容，而不是一片空白。
-      if (r.data.live) {
-        markRunning(sid, true);
+      if (r.data.wsLive) {
+        // 面板自己驱动的轮次：走事件流，能拿到逐 token 的增量
+        markRunning(sid, true, { external: false });
         showThinking();
         wsSend({ type: 'watch', sessionId: sid });
         setStatus('已接回后台执行，正在恢复输出…');
+      } else if (r.data.dbLive && r.data.active) {
+        markRunning(sid, true, { external: true });
+        showThinking();
+        setStatus('这个会话正在外部执行，输出自动刷新…');
+      } else if (r.data.dbLive) {
+        // 未收尾但已停住：残留轮次，不锁输入框（尾随会持续纠正状态）
+        markRunning(sid, false);
+        setStatus('这个会话上一轮没有正常收尾（外部进程已停止）');
       } else {
         markRunning(sid, false);
         setStatus('');
@@ -1868,29 +1916,23 @@
     lastModelValue = $('model-select').value;
   }
 
-  function renderHistoryMessage(m, prepend) {
-    if (m.role === 'user') {
-      var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
-        .map(function (p) { return p.text || ''; }).join('');
-      if (texts) appendUserMessage(texts, prepend, m.time);
-      return;
-    }
-    if (m.role !== 'assistant') return;
-
-    removeThinking();
-    hideWelcome();
-    var mid = m.id;
-    var box = $('messages');
+  // 一条助手消息 -> 一个完整气泡。历史加载、增量尾随、断线对齐都走这里，
+  // 保证同一条消息无论从哪条路径来，渲染结果都一致。
+  function buildAssistantRow(m) {
     var row = document.createElement('div');
     row.className = 'row';
     row.innerHTML = '<div class="assistant"><div class="avatar">Z</div>' +
       '<div class="assistant-body"></div></div>';
-    if (prepend) box.insertBefore(row, box.firstChild);
-    else box.appendChild(row);
-    var entry = { mid: mid, role: 'assistant', row: row,
+    var entry = { mid: m.id, role: 'assistant', row: row,
                   body: row.querySelector('.assistant-body'), mdEl: null, raw: '' };
-    state.messageMap.set(mid, entry);
+    state.messageMap.set(m.id, entry);   // 先登记：part 里的 handleTool 要按 id 查它
+    fillAssistantParts(entry, m);
+    if (m.completed === false) appendLiveCursor(entry);
+    else addMsgTimeEl(entry, m.time);
+    return entry;
+  }
 
+  function fillAssistantParts(entry, m) {
     (m.parts || []).forEach(function (p) {
       if (p.type === 'text' && p.text) {
         var el = mdElOf(entry);
@@ -1918,7 +1960,7 @@
       } else if (p.type === 'tool') {
         var st = p.state || {};
         handleTool({
-          messageId: mid, toolCallId: p.callID || p.toolCallId,
+          messageId: m.id, toolCallId: p.callID || p.toolCallId,
           toolName: p.tool, state: st.status || 'completed',
           input: st.input, payload: { output: st.output, error: st.error },
         });
@@ -1933,7 +1975,185 @@
           ? m.error : JSON.stringify(m.error)) + '</div>';
       entry.body.appendChild(ed);
     }
-    addMsgTimeEl(entry, m.time);
+  }
+
+  // 还没收尾的消息给个光标，表示这一轮还在往下写
+  function appendLiveCursor(entry) {
+    if (!entry || !entry.body) return;
+    var el = document.createElement('span');
+    el.className = 'cursor-blink';
+    entry.body.appendChild(el);
+  }
+
+  function renderHistoryMessage(m, prepend, beforeEl) {
+    if (m.role === 'user') {
+      var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
+        .map(function (p) { return p.text || ''; }).join('');
+      if (texts) appendUserMessage(texts, prepend, m.time, beforeEl);
+      return;
+    }
+    if (m.role !== 'assistant') return;
+
+    removeThinking();
+    hideWelcome();
+    var entry = buildAssistantRow(m);
+    var box = $('messages');
+    if (prepend) box.insertBefore(entry.row, box.firstChild);
+    // 底部可能有「正在处理」占位行，新内容要插在它前面
+    else box.insertBefore(entry.row, beforeEl || $('thinking-row') || null);
+  }
+
+  /* ---------- 实时尾随：外部进程跑的会话只能靠读库刷新 ---------- */
+
+  function messageSignature(m) {
+    try { return JSON.stringify([m.completed, m.error, m.parts || []]); }
+    catch (e) { return ''; }
+  }
+
+  // 把一条库里的消息同步进当前视图（按 id 幂等：内容没变就什么都不做）
+  function upsertTailMessage(m) {
+    if (!m || !m.id) return;
+    if (m.role === 'user') {
+      if (state.messageMap.get(m.id)) return;
+      var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
+        .map(function (p) { return p.text || ''; }).join('');
+      if (!texts) return;
+      // 自己刚发出去、本地已经渲染过的那条：认领它，别出现两条一样的
+      var locals = state.localUserMsgs || [];
+      for (var i = 0; i < locals.length; i++) {
+        if (!locals[i].bound && locals[i].text === texts) {
+          locals[i].bound = true;
+          locals[i].row.dataset.mid = m.id;
+          state.messageMap.set(m.id, { mid: m.id, role: 'user', row: locals[i].row });
+          return;
+        }
+      }
+      var row = appendUserMessage(texts, false, m.time);
+      if (row) {
+        row.dataset.mid = m.id;
+        state.messageMap.set(m.id, { mid: m.id, role: 'user', row: row });
+        state.msgPage.total += 1;
+        state.msgPage.rendered += 1;
+      }
+      return;
+    }
+    if (m.role !== 'assistant') return;
+
+    var sig = messageSignature(m);
+    var old = state.messageMap.get(m.id);
+    if (old && old.sig === sig) return;      // 内容没变就别动 DOM，免得闪
+    removeThinking();
+    hideWelcome();
+    state.cur = null;                        // 重建期间别让 part 渲染串到别的气泡
+    var entry = buildAssistantRow(m);
+    entry.sig = sig;
+    var box = $('messages');
+    if (old && old.row && old.row.parentNode) {
+      box.insertBefore(entry.row, old.row);  // 原地替换，保住消息顺序
+      old.row.parentNode.removeChild(old.row);
+    } else {
+      box.insertBefore(entry.row, $('thinking-row') || null);
+      state.msgPage.total += 1;
+      state.msgPage.rendered += 1;
+    }
+    if (m.completed === false) state.cur = entry;
+    scrollToBottom();
+  }
+
+  function startTail(sid, cursor) {
+    if (!sid) return;
+    var t = state.tail;
+    if (t.sid === sid && t.timer) {
+      if (cursor) t.cursor = Math.max(t.cursor || 0, cursor);
+      return;
+    }
+    stopTail();
+    state.tail = { sid: sid, timer: null, cursor: cursor || 0,
+                   busy: false, external: false, quiet: 0 };
+    scheduleTail(0);
+  }
+
+  function stopTail() {
+    var t = state.tail;
+    if (t && t.timer) clearTimeout(t.timer);
+    state.tail = { sid: null, timer: null, cursor: 0,
+                   busy: false, external: false, quiet: 0 };
+  }
+
+  function scheduleTail(delay) {
+    var t = state.tail;
+    if (!t || !t.sid) return;
+    if (t.timer) clearTimeout(t.timer);
+    t.timer = setTimeout(pollTail, delay);
+  }
+
+  function pollTail() {
+    var t = state.tail;
+    if (!t || !t.sid || t.busy) return;
+    if (t.sid !== state.sessionId) { stopTail(); return; }
+    if (document.hidden) { scheduleTail(TAIL_INTERVAL); return; }
+    var sid = t.sid;
+    t.busy = true;
+    req('/api/sessions/' + encodeURIComponent(sid) + '/tail?after=' + (t.cursor || 0))
+      .then(function (r) {
+        t.busy = false;
+        if (!state.tail || state.tail !== t || state.sessionId !== sid) return;
+        if (r.status === 401) { stopTail(); showLogin('登录已过期，请重新输入密钥'); return; }
+        if (r.status === 403) { stopTail(); showLogin(r.data.error || '此 IP 已被永久封禁'); return; }
+        var d = r.data || {};
+        if (!d.ok) { scheduleTail(TAIL_QUIET_INTERVAL); return; }
+        if (d.cursor) t.cursor = Math.max(t.cursor || 0, d.cursor);
+        if (d.wsLive) {
+          // 面板自己驱动的轮次有逐 token 的事件流，别用库里的整段内容去盖它
+          t.external = false;
+          t.quiet = 0;
+          scheduleTail(TAIL_INTERVAL);
+          return;
+        }
+        var changed = d.messages || [];
+        changed.forEach(upsertTailMessage);
+        if (d.live && d.active) {
+          t.external = true;
+          t.quiet = 0;
+          markRunning(sid, true, { external: true });
+          if (!state.cur) showThinking();
+          setStatus('外部任务执行中，输出自动刷新…');
+        } else if (d.live) {
+          // 未收尾、但早就没动静了：多半是崩在半路的残留，别锁住输入框，
+          // 也别把它当「正在跑」；隔几秒再探一次，它重新动起来会立刻接上。
+          if (isRunning(sid)) markRunning(sid, false);
+          removeThinking();
+          t.quiet = Math.max(t.quiet || 0, 11);
+          setStatus('这个会话上一轮没有正常收尾（外部进程已停止）');
+        } else {
+          if (t.external || isRunning(sid)) { finishExternalTurn(sid); return; }
+          t.quiet = changed.length ? 0 : (t.quiet || 0) + 1;
+        }
+        scheduleTail(t.quiet > 10 ? TAIL_QUIET_INTERVAL : TAIL_INTERVAL);
+      })
+      .catch(function () {
+        t.busy = false;
+        if (state.tail === t) scheduleTail(TAIL_QUIET_INTERVAL);
+      });
+  }
+
+  function finishExternalTurn(sid) {
+    var wasExternal = !!(state.tail && state.tail.external);
+    var wasRunning = isRunning(sid);
+    stopTail();
+    markRunning(sid, false);
+    if (sid !== state.sessionId) return;
+    clearCursors();
+    removeThinking();
+    setStatus('');
+    if (state.cur && state.cur.raw) {
+      var el = state.cur.mdEl;
+      if (el) el.innerHTML = mdParse(state.cur.raw);
+    }
+    state.cur = null;
+    if (wasExternal && wasRunning) toast('「' + titleOf(sid) + '」已完成', 'ok');
+    loadSessions(true);
+    loadUsage(null, true);
   }
 
   function renderActive() {
@@ -1959,6 +2179,7 @@
     // 别的会话在后台跑着，也不影响你开一个新会话
     state.sessionId = null;
     state.cur = null;
+    stopTail();
     rememberSession(null);
     clearMessages();
     $('messages').innerHTML = welcomeHtml();
@@ -2775,6 +2996,7 @@
     $('pv-fetched-wrap').classList.add('hidden');
 
     if (!pid) {
+      state.editingModels = [];
       setProviderIdHint(null);
       $('pv-name').value = '';
       $('pv-kind').value = 'openai-compatible';
@@ -2796,6 +3018,9 @@
       $('pv-kind').value = p.kind || 'openai-compatible';
       $('pv-base').value = p.baseURL || '';
       $('pv-key').value = p.apiKey || '';
+      state.editingModels = (p.models || []).map(function (m) {
+        return m.modelId;
+      }).filter(Boolean);
       (p.models || []).forEach(function (m) {
         $('pv-models').appendChild(modelRow(m));
       });
@@ -2840,12 +3065,21 @@
     }
     if (!models.length) { toast('至少填一个模型', 'err'); return; }
 
+    // 后端是「合并式」写入：只有显式告诉它删哪些，模型才会真从配置里消失。
+    // 原来的 ID 集合减去现在还留着的，就是被删掉 / 被改名的那些。
+    var keep = {};
+    models.forEach(function (m) { keep[m.modelId] = true; });
+    var removeModels = (state.editingModels || []).filter(function (id) {
+      return !keep[id];
+    });
+
     var payload = {
       providerId: pid,
       name: name,
       kind: $('pv-kind').value,
       baseURL: base,
       models: models,
+      removeModels: removeModels,
     };
     var key = $('pv-key').value;
     if (key) payload.apiKey = key;

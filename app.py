@@ -145,6 +145,7 @@ SCHEDULE_PENDING_MAX_SEC = 600  # 待续跑的最长等待时间
 SCHEDULE_MAX_DURATION_MIN = 10080      # 单条规则最长生效 7 天
 SCHEDULE_HISTORY_MAX = 50
 SCHEDULE_REMOTE_PROBE_SEC = 1.5  # 没有本地事件流时，问 app-server 轮次状态的间隔
+SCHEDULE_HEALTH_CACHE_SEC = 60  # 定时模型可用性探测缓存，避免每个 tick 都请求上游
 # 回看天数：时段可以跨午夜，所以要看昨天；每周规则要看到上一个同名星期几，
 # 否则「每周三 10:00」到周六就会因为本周三超出回看窗口而误判为失效。
 SCHEDULE_LOOKBACK = {"daily": 2, "weekly": 8, "once": 0}
@@ -809,8 +810,19 @@ def load_messages(session_id, limit=None, before=None):
     conn = db_connect()
     try:
         cur = conn.cursor()
+        # 只从数据库取会展示给用户的消息。隐藏的 agent_runtime/system 消息以及
+        # 带有自动来源标记的 user 消息仍保留在库里，但不参与历史分页。
+        visible_sql = (
+            " AND (json_extract(data, '$.role') != 'user' OR "
+            "(json_extract(data, '$.semantics.uiVisibility') != 'hidden' "
+            "AND json_extract(data, '$.semantics.transcriptVisibility') != 'hidden' "
+            "AND (json_extract(data, '$.anchor.sourceCommandId') LIKE 'panel-manual-%' "
+            "OR (json_extract(data, '$.anchor.sourceCommandId') IS NULL "
+            "AND json_extract(data, '$.semantics.origin') = 'real_user' "
+            "AND json_extract(data, '$.anchor.origin') = 'realUser'))))"
+        )
         sql = ("SELECT id, data, sequence, time_created, time_updated "
-               "FROM message WHERE session_id = ?")
+               "FROM message WHERE session_id = ?" + visible_sql)
         params = [session_id]
         if before is not None:
             sql += " AND sequence < ?"
@@ -881,6 +893,13 @@ def load_messages_since(session_id, since_ms, limit=TAIL_LIMIT):
                 "  m.time_updated > ? OR EXISTS ("
                 "    SELECT 1 FROM part p WHERE p.message_id = m.id "
                 "    AND p.time_updated > ?)) "
+                "AND (json_extract(m.data, '$.role') != 'user' OR "
+                "(json_extract(m.data, '$.semantics.uiVisibility') != 'hidden' "
+                "AND json_extract(m.data, '$.semantics.transcriptVisibility') != 'hidden' "
+                "AND (json_extract(m.data, '$.anchor.sourceCommandId') LIKE 'panel-manual-%' "
+                "OR (json_extract(m.data, '$.anchor.sourceCommandId') IS NULL "
+                "AND json_extract(m.data, '$.semantics.origin') = 'real_user' "
+                "AND json_extract(m.data, '$.anchor.origin') = 'realUser')))) "
                 "ORDER BY m.sequence LIMIT ?",
                 (session_id, int(since_ms), int(since_ms), int(limit)))
             rows = cur.fetchall()
@@ -888,7 +907,15 @@ def load_messages_since(session_id, since_ms, limit=TAIL_LIMIT):
             # 没给游标（刚打开会话）时给「最后 limit 条」，不能给最老的
             cur.execute(
                 "SELECT id, data, sequence, time_created, time_updated "
-                "FROM message WHERE session_id = ? ORDER BY sequence DESC LIMIT ?",
+                "FROM message WHERE session_id = ? "
+                "AND (json_extract(data, '$.role') != 'user' OR "
+                "(json_extract(data, '$.semantics.uiVisibility') != 'hidden' "
+                "AND json_extract(data, '$.semantics.transcriptVisibility') != 'hidden' "
+                "AND (json_extract(data, '$.anchor.sourceCommandId') LIKE 'panel-manual-%' "
+                "OR (json_extract(data, '$.anchor.sourceCommandId') IS NULL "
+                "AND json_extract(data, '$.semantics.origin') = 'real_user' "
+                "AND json_extract(data, '$.anchor.origin') = 'realUser')))) "
+                "ORDER BY sequence DESC LIMIT ?",
                 (session_id, int(limit)))
             rows = list(cur.fetchall())[::-1]
         return [message_payload(cur, r) for r in rows]
@@ -2718,6 +2745,9 @@ class ModelScheduler:
         self.prev = None        # 覆盖生效前的模型（用于恢复）
         self.history = []
         self.pending = {}       # sid -> 待续跑项（轮次没停下来时的兜底）
+        # 定时模型失败后，在本次时间窗内不反复切换/回滚；下一个时间窗再重新探测。
+        self.failed_windows = {}  # rule_id -> (fired, provider_id, model_id)
+        self.health_cache = {}    # (provider_id, model_id) -> (timestamp, ok, result)
         self.started_at = int(time.time() * 1000)
         self.restore(SCHEDULE_RUNTIME_SAVED)
 
@@ -2749,6 +2779,44 @@ class ModelScheduler:
         return {"active": dict(self.active) if self.active else None,
                 "prev": self.prev,
                 "savedAt": int(time.time() * 1000)}
+
+    async def _check_model_available(self, model, force=False):
+        """探测定时模型是否真的可用。
+
+        模型出现在 config.json 里不等于上游能用：余额不足、模型下线、Key 失效
+        等情况都可能只在真正请求时暴露。这里复用面板已有的最小对话探测，
+        只对当前定时模型做缓存探测，避免每个 10 秒 tick 都打上游。
+        """
+        pid = str((model or {}).get("providerId") or "").strip()
+        mid = str((model or {}).get("modelId") or "").strip()
+        if not pid or not mid:
+            return False, {"ok": False, "error": "定时规则没有完整的模型配置"}
+        key = (pid, mid)
+        cached = self.health_cache.get(key)
+        if not force and cached and time.time() - cached[0] < SCHEDULE_HEALTH_CACHE_SEC:
+            return cached[1], cached[2]
+        try:
+            # resolve_probe_conf 会从当前 provider 配置补齐 Base URL、Key 和 headers。
+            conf = resolve_probe_conf({"providerId": pid, "modelId": mid})
+            result = await probe_chat(conf["kind"], conf["baseURL"], conf["apiKey"],
+                                      mid, conf["headers"])
+        except Exception as exc:
+            result = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        ok = bool(result.get("ok"))
+        self.health_cache[key] = (time.time(), ok, result)
+        if ok:
+            log("模型定时探测：%s/%s 可用" % (pid, mid))
+        else:
+            detail = result.get("error") or result.get("hint") or result.get("reply") or "未知错误"
+            log("模型定时探测：%s/%s 不可用：%s" % (pid, mid, str(detail)[:300]))
+        return ok, result
+
+    @staticmethod
+    def _failed_window_key(rule, model, fired):
+        # fired 是同一规则本次时间窗的稳定标识；手动立即执行没有 fired 时按分钟区分。
+        fired_key = int(fired) if fired else int(time.time() // 60)
+        return (fired_key, str((model or {}).get("providerId") or ""),
+                str((model or {}).get("modelId") or ""))
 
     # ---- 对外只读 ----
     def override_model(self):
@@ -2847,6 +2915,29 @@ class ModelScheduler:
         if not pid or not mid:
             log(f"定时规则 {rule.get('id')} 没有配模型，跳过")
             return {"ok": False, "error": "规则没有配置目标模型"}
+
+        rule_id = str(rule.get("id") or "")
+        failed_key = self._failed_window_key(rule, model, fired)
+        if self.failed_windows.get(rule_id) == failed_key:
+            # 本时间窗已经确认不可用，保持原模型，不要每 10 秒反复切换。
+            return {"ok": False, "unavailable": True,
+                    "error": "定时模型在本时间窗内已确认不可用，继续使用原模型"}
+        available, health = await self._check_model_available(model)
+        if not available:
+            self.failed_windows[rule_id] = failed_key
+            detail = health.get("error") or health.get("hint") or health.get("reply") or "上游探测失败"
+            reason = "定时模型不可用，自动切回原模型：%s/%s" % (pid, mid)
+            log("%s（%s）" % (reason, str(detail)[:300]))
+            self._record({"scope": "fallback", "id": rule_id, "name": rule.get("name"),
+                          "model": model, "reason": reason, "detail": str(detail)[:500]})
+            # 若是从另一个定时模型切换过来，先恢复该时间窗开始前的原模型。
+            if self.active:
+                await self._revert_locked(reason)
+            else:
+                save_schedules()
+                await notify_global({"type": "model-scheduled", "scope": "fallback",
+                                     "reason": reason, "active": None, "model": model})
+            return {"ok": False, "unavailable": True, "error": reason, "probe": health}
 
         was_active = bool(self.active)
         if not was_active:
@@ -2990,6 +3081,18 @@ class ModelScheduler:
             if want is not None and want.get("id") == cur_id:
                 new_model = {"providerId": want.get("providerId"),
                              "modelId": want.get("modelId")}
+                # 定时窗口持续期间也要复核：模型可能在切换成功后才欠费、下线或失效。
+                # 探测失败时恢复 activate 前的逐会话快照和全局默认模型。
+                healthy, health = await self._check_model_available(cur.get("model") or new_model)
+                if not healthy:
+                    failed_key = self._failed_window_key(want, cur.get("model") or new_model, best[1])
+                    self.failed_windows[str(want.get("id") or "")] = failed_key
+                    detail = health.get("error") or health.get("hint") or health.get("reply") or "上游探测失败"
+                    await self._revert_locked(
+                        "定时模型不可用，自动切回原模型：%s/%s（%s/%s）" %
+                        (new_model.get("providerId"), new_model.get("modelId"),
+                         "原因", str(detail)[:240]))
+                    return
                 # 生效中的规则被改了模型/续跑开关 → 立刻按新值重新下发
                 if (cur.get("model") != new_model
                         or cur.get("resume") != bool(want.get("resumeRunning", True))):

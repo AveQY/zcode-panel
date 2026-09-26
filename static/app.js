@@ -1985,8 +1985,15 @@
     entry.body.appendChild(el);
   }
 
+  function shouldRenderUserMessage(m) {
+    // 后端根据协议来源和可见性标记过滤；没有标记的旧消息按不显示处理，
+    // 避免把自动续跑、禅道执行、系统提醒误当成用户输入。
+    return !!(m && m.role === 'user' && m.visibleToUser === true);
+  }
+
   function renderHistoryMessage(m, prepend, beforeEl) {
     if (m.role === 'user') {
+      if (!shouldRenderUserMessage(m)) return;
       var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
         .map(function (p) { return p.text || ''; }).join('');
       if (texts) appendUserMessage(texts, prepend, m.time, beforeEl);
@@ -2014,6 +2021,7 @@
   function upsertTailMessage(m) {
     if (!m || !m.id) return;
     if (m.role === 'user') {
+      if (!shouldRenderUserMessage(m)) return;
       if (state.messageMap.get(m.id)) return;
       var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
         .map(function (p) { return p.text || ''; }).join('');

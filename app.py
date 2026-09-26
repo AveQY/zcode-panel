@@ -816,10 +816,7 @@ def load_messages(session_id, limit=None, before=None):
             " AND (json_extract(data, '$.role') != 'user' OR "
             "(json_extract(data, '$.semantics.uiVisibility') != 'hidden' "
             "AND json_extract(data, '$.semantics.transcriptVisibility') != 'hidden' "
-            "AND (json_extract(data, '$.anchor.sourceCommandId') LIKE 'panel-manual-%' "
-            "OR (json_extract(data, '$.anchor.sourceCommandId') IS NULL "
-            "AND json_extract(data, '$.semantics.origin') = 'real_user' "
-            "AND json_extract(data, '$.anchor.origin') = 'realUser'))))"
+            "AND json_extract(data, '$.anchor.sourceCommandId') LIKE 'panel-manual-%'))"
         )
         sql = ("SELECT id, data, sequence, time_created, time_updated "
                "FROM message WHERE session_id = ?" + visible_sql)
@@ -863,6 +860,22 @@ def message_payload(cur, row):
     if not model and isinstance(meta.get("model"), dict):
         model = meta["model"].get("modelID")
     tinfo = meta.get("time") if isinstance(meta.get("time"), dict) else {}
+    semantics = meta.get("semantics") if isinstance(meta.get("semantics"), dict) else {}
+    anchor = meta.get("anchor") if isinstance(meta.get("anchor"), dict) else {}
+    # 面板发送时会带 panel-manual-* inputId，协议会把它保存在
+    # user message.anchor.sourceCommandId。历史真实用户消息保留兼容显示；
+    # 明确 hidden 的运行时消息始终不显示。
+    command_id = str(anchor.get("sourceCommandId") or "")
+    is_visible_user = (
+        meta.get("role") != "user"
+        or (
+            semantics.get("uiVisibility") != "hidden"
+            and semantics.get("transcriptVisibility") != "hidden"
+            and (
+                command_id.startswith("panel-manual-")
+            )
+        )
+    )
     return {
         "id": row["id"],
         "role": meta.get("role", "unknown"),
@@ -873,6 +886,7 @@ def message_payload(cur, row):
         "parts": parts,
         "completed": bool(tinfo.get("completed")),
         "updated": updated,
+        "visibleToUser": bool(is_visible_user),
     }
 
 
@@ -896,10 +910,7 @@ def load_messages_since(session_id, since_ms, limit=TAIL_LIMIT):
                 "AND (json_extract(m.data, '$.role') != 'user' OR "
                 "(json_extract(m.data, '$.semantics.uiVisibility') != 'hidden' "
                 "AND json_extract(m.data, '$.semantics.transcriptVisibility') != 'hidden' "
-                "AND (json_extract(m.data, '$.anchor.sourceCommandId') LIKE 'panel-manual-%' "
-                "OR (json_extract(m.data, '$.anchor.sourceCommandId') IS NULL "
-                "AND json_extract(m.data, '$.semantics.origin') = 'real_user' "
-                "AND json_extract(m.data, '$.anchor.origin') = 'realUser')))) "
+                "AND json_extract(m.data, '$.anchor.sourceCommandId') LIKE 'panel-manual-%')) "
                 "ORDER BY m.sequence LIMIT ?",
                 (session_id, int(since_ms), int(since_ms), int(limit)))
             rows = cur.fetchall()
@@ -911,10 +922,7 @@ def load_messages_since(session_id, since_ms, limit=TAIL_LIMIT):
                 "AND (json_extract(data, '$.role') != 'user' OR "
                 "(json_extract(data, '$.semantics.uiVisibility') != 'hidden' "
                 "AND json_extract(data, '$.semantics.transcriptVisibility') != 'hidden' "
-                "AND (json_extract(data, '$.anchor.sourceCommandId') LIKE 'panel-manual-%' "
-                "OR (json_extract(data, '$.anchor.sourceCommandId') IS NULL "
-                "AND json_extract(data, '$.semantics.origin') = 'real_user' "
-                "AND json_extract(data, '$.anchor.origin') = 'realUser')))) "
+                "AND json_extract(data, '$.anchor.sourceCommandId') LIKE 'panel-manual-%')) "
                 "ORDER BY sequence DESC LIMIT ?",
                 (session_id, int(limit)))
             rows = list(cur.fetchall())[::-1]
@@ -2147,7 +2155,10 @@ class TurnManager:
                                        "请稍等几秒再发")
             await feed.start_pump(session_id)
             self.running[session_id] = {"startedAt": int(time.time() * 1000)}
-            payload = {"sessionId": session_id, "content": content}
+            # 为每次面板发送写入可追溯来源；自动续跑使用不同前缀。
+            input_prefix = "panel-auto-" if auto else "panel-manual-"
+            payload = {"sessionId": session_id, "content": content,
+                       "inputId": input_prefix + secrets.token_hex(12)}
             try:
                 res = await zc.call("session/send", payload, timeout=60)
             except Exception as exc:

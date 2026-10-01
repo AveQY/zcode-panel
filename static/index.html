@@ -6,7 +6,7 @@
 <meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="referrer" content="no-referrer">
 <title>ZCode 对话控制台</title>
-<link rel="stylesheet" href="/static/style.css?v=20260925c">
+<link rel="stylesheet" href="/static/style.css?v=20261001a">
 </head>
 <body>
 
@@ -65,6 +65,7 @@
     <div class="sidebar-foot">
       <div class="foot-row">
         <span id="foot-info" class="foot-info"></span>
+        <button id="tasks-btn" class="text-btn" title="任务看板：排队 / 并行执行多个任务">任务</button>
         <button id="settings-btn" class="text-btn" title="打开设置">&#9881; 设置</button>
       </div>
     </div>
@@ -78,6 +79,8 @@
         <span id="chat-meta" class="chat-meta"></span>
       </div>
       <div class="chat-actions">
+        <button id="changes-btn" class="text-btn" title="查看这个会话工作区的文件变更" disabled>变更</button>
+        <button id="files-btn" class="text-btn" title="浏览 / 编辑工作区文件" disabled>文件</button>
         <button id="usage-chip" class="usage-chip" title="今日 token 用量，点击查看使用统计">
           <span class="usage-chip-label">今日</span>
           <b id="usage-chip-value">&mdash;</b>
@@ -373,12 +376,24 @@
         <div class="setting-item">
           <div class="setting-text">
             <b>自动放行工具调用</b>
-            <span>关闭后，zcode 请求执行高风险命令时会被拒绝，需要你在桌面端处理</span>
+            <span>开启后所有操作直接执行；关闭后，高风险操作会<b>在网页上弹出确认</b>（12 秒内未处理自动拒绝，因为 app-server 对确认只等约 15 秒）</span>
           </div>
           <label class="switch">
             <input type="checkbox" id="set-auto-approve">
             <span class="slider"></span>
           </label>
+        </div>
+        <div class="setting-item">
+          <div class="setting-text">
+            <b>任务并行数</b>
+            <span>任务看板里同时执行的任务数。同一工作区并行跑多个任务可能互相覆盖文件，谨慎调高</span>
+          </div>
+          <select id="set-task-parallel" class="narrow">
+            <option value="1">1（串行）</option>
+            <option value="2">2</option>
+            <option value="3">3</option>
+            <option value="4">4</option>
+          </select>
         </div>
         <div class="setting-item">
           <div class="setting-text">
@@ -590,9 +605,120 @@
   </div>
 </div>
 
+<!-- ============================ 权限确认（借鉴 claudecodeui） ============================ -->
+<div id="perm-modal" class="modal hidden">
+  <div class="modal-mask"></div>
+  <div class="modal-card small perm-card">
+    <div class="modal-head">
+      <h3>操作确认</h3>
+      <span id="perm-countdown" class="perm-countdown">12s</span>
+    </div>
+    <div class="modal-body">
+      <div class="perm-tool">
+        <span id="perm-risk" class="risk-badge">?</span>
+        <b id="perm-tool">—</b>
+      </div>
+      <p id="perm-reason" class="confirm-text"></p>
+      <pre id="perm-detail" class="code-box perm-detail hidden"></pre>
+    </div>
+    <div class="modal-foot">
+      <button id="perm-toggle-detail" class="text-btn">详情</button>
+      <span class="grow"></span>
+      <button id="perm-deny" class="ghost-btn danger">拒绝</button>
+      <button id="perm-allow" class="primary-btn">允许本次</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ 文件管理（借鉴 OpenHands） ============================ -->
+<div id="files-drawer" class="drawer hidden">
+  <div class="drawer-mask" data-close-drawer="files-drawer"></div>
+  <div class="drawer-panel">
+    <div class="drawer-head">
+      <div class="drawer-title">
+        <b>工作区文件</b>
+        <code id="fd-path" class="drawer-crumb">/</code>
+      </div>
+      <div class="row-inline">
+        <button id="fd-newdir" class="ghost-btn slim" type="button">新建目录</button>
+        <button id="fd-upload" class="ghost-btn slim" type="button">上传文件</button>
+        <button id="fd-refresh" class="icon-btn" title="刷新">&#8635;</button>
+        <button class="icon-btn" data-close-drawer="files-drawer">&#10005;</button>
+      </div>
+    </div>
+    <input type="file" id="fd-file-input" multiple class="hidden">
+    <div class="drawer-body">
+      <div id="fd-tree" class="fd-tree"></div>
+      <div id="fd-viewer" class="fd-viewer hidden">
+        <div class="fd-viewer-head">
+          <code id="fv-name" class="grow"></code>
+          <button id="fv-save" class="primary-btn slim">保存</button>
+          <button id="fv-download" class="ghost-btn slim">下载</button>
+          <button id="fv-delete" class="text-btn danger slim">删除</button>
+          <button id="fv-close" class="icon-btn" title="关闭">&#10005;</button>
+        </div>
+        <textarea id="fv-editor" class="fd-editor" spellcheck="false"></textarea>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ 变更查看（借鉴 claudecodeui） ============================ -->
+<div id="changes-drawer" class="drawer hidden">
+  <div class="drawer-mask" data-close-drawer="changes-drawer"></div>
+  <div class="drawer-panel">
+    <div class="drawer-head">
+      <div class="drawer-title">
+        <b>文件变更</b>
+        <span id="ch-workspace" class="drawer-crumb"></span>
+      </div>
+      <div class="row-inline">
+        <button id="ch-refresh" class="icon-btn" title="刷新">&#8635;</button>
+        <button class="icon-btn" data-close-drawer="changes-drawer">&#10005;</button>
+      </div>
+    </div>
+    <div class="drawer-body">
+      <div id="ch-status" class="ch-status"></div>
+      <pre id="ch-diff" class="ch-diff code-box"></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ============================ 任务看板（借鉴 vibe-kanban） ============================ -->
+<div id="tasks-modal" class="modal hidden">
+  <div class="modal-mask" data-close="tasks-modal"></div>
+  <div class="modal-card wide tasks-card">
+    <div class="modal-head">
+      <h3>任务看板</h3>
+      <button class="icon-btn" data-close="tasks-modal">&#10005;</button>
+    </div>
+    <div class="modal-body">
+      <div class="task-form">
+        <div class="row-inline">
+          <input id="tk-title" type="text" class="grow" placeholder="任务标题（留空取内容前 40 字）"
+                 maxlength="80" autocomplete="off" spellcheck="false">
+          <select id="tk-workspace" class="mid-sel"></select>
+        </div>
+        <div class="row-inline">
+          <select id="tk-mode" class="narrow"></select>
+          <select id="tk-model" class="mid-sel"></select>
+          <select id="tk-thought" class="narrow"></select>
+        </div>
+        <textarea id="tk-prompt" rows="3" placeholder="要交给 agent 执行的任务描述…"
+                  spellcheck="false"></textarea>
+        <div class="row-inline">
+          <span class="form-hint grow" id="tk-hint">每个任务会在所选工作区里新建独立会话执行。</span>
+          <button id="tk-submit" class="primary-btn">加入队列</button>
+        </div>
+      </div>
+      <div id="task-board" class="task-board"></div>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js?v=20260925c"></script>
+<script src="/static/app.js?v=20261001a"></script>
 </body>
 </html>

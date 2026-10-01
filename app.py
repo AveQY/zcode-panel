@@ -36,6 +36,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote as url_quote
 
 from aiohttp import web, WSMsgType
 
@@ -58,6 +59,43 @@ AUTO_RUN_DELAY = 8                     # 正常收尾后几秒自动续跑
 AUTO_RUN_MAX_ROUNDS = 30               # 连续自动续跑轮数上限（防失控兜底）
 AUTO_RETRY_MAX = 3                     # 出错后重试原消息的次数
 AUTO_RETRY_DELAYS = [20, 60, 180]      # 重试退避（秒）
+
+# ---- 面板扩展（借鉴 claudecodeui / OpenHands / vibe-kanban / crystal）--------
+# 权限确认：app-server 对反向请求只等 ~15s 就超时（见 app.asar 中 timeout:15000），
+# 所以网页确认窗口必须留在这个预算之内，超时按拒绝应答，整轮才不会失败。
+PERMISSION_TIMEOUT = 12
+# 文件管理：单文件读取/写入上限，防止把大文件整个读进内存
+FS_MAX_READ = 1024 * 1024              # 1MB
+FS_MAX_WRITE = 4 * 1024 * 1024         # 4MB
+FS_MAX_UPLOAD = 32 * 1024 * 1024       # 上传总大小
+FS_SCAN_CAP = 5000                     # 非 git 变更扫描最多看多少个文件
+FS_LIST_CAP = 300                      # 非 git 变更最多列多少个文件
+# 变更 diff 输出上限（超大 diff 截断，前端提示）
+CHANGES_DIFF_MAX = 240 * 1024
+# 文件扫描时跳过的目录名
+FS_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                "dist", "build", ".cache", ".next", ".nuxt", "target"}
+
+TASKS_DB = DATA_DIR / "panel_tasks.db"
+TASK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  workspace TEXT NOT NULL,
+  mode TEXT DEFAULT '',
+  model_provider TEXT DEFAULT '',
+  model_id TEXT DEFAULT '',
+  thought_level TEXT DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'queued',
+  session_id TEXT DEFAULT '',
+  result TEXT DEFAULT '',
+  error TEXT DEFAULT '',
+  created_ms INTEGER DEFAULT 0,
+  started_ms INTEGER DEFAULT 0,
+  finished_ms INTEGER DEFAULT 0
+);
+"""
 
 ZCODE_BIN = "/usr/local/bin/zcode"
 ZCODE_DB = "/root/.zcode/cli/db/db.sqlite"
@@ -167,6 +205,7 @@ DEFAULT_CONFIG = {
     "default_thought_level": "",
     "auto_approve": True,
     "workspace_root": "/root",
+    "task_parallel": 1,
 }
 
 config = dict(DEFAULT_CONFIG)
@@ -176,6 +215,7 @@ zc = None            # ZCodeServer
 feed = None          # SessionFeedManager
 runner = None        # TurnManager
 scheduler = None     # ModelScheduler
+task_runner = None   # TaskRunner（任务看板）
 schedules = []       # 定时规则（持久化在 data/model_schedules.json）
 SCHEDULE_RUNTIME_SAVED = None   # 上次运行态（active/prev），随规则一起持久化
 # 全局 WS 订阅者：会话事件流是「按会话」广播的，定时切换是全局事件，需要单独一份
@@ -1306,6 +1346,7 @@ class ZCodeServer:
         self.notification_handlers = []      # fn(method, params)
         self.server_request_log = []
         self.permission_events = []
+        self.pending_permissions = {}    # pid -> entry（等待网页确认的权限请求）
         self.auto_approve = True
         # 重启必须串行：并发的 stop/start 会把对方刚拉起来的进程再杀掉，
         # 结果就是 self.proc 指向一个已死进程，之后所有调用都报「app-server 未运行」。
@@ -1429,17 +1470,25 @@ class ZCodeServer:
             result = dict(RUNTIME_PREFERENCES)
         elif method == "interaction/requestPermission":
             allow = bool(config.get("auto_approve", True))
-            result = {"decision": "allow" if allow else "deny",
-                      "reason": "网页控制台自动放行" if allow else "网页控制台已关闭自动放行"}
-            self.permission_events.append({
-                "at": int(time.time() * 1000),
-                "toolName": params.get("toolName"),
-                "riskLevel": params.get("riskLevel"),
-                "reason": params.get("reason"),
-                "decision": result["decision"],
-            })
-            del self.permission_events[:-50]
-            log(f"权限请求：{params.get('toolName')} risk={params.get('riskLevel')} -> {result['decision']}")
+            if allow:
+                result = {"decision": "allow",
+                          "reason": "网页控制台自动放行"}
+                self.permission_events.append({
+                    "at": int(time.time() * 1000),
+                    "toolName": params.get("toolName"),
+                    "riskLevel": params.get("riskLevel"),
+                    "reason": params.get("reason"),
+                    "decision": result["decision"],
+                })
+                del self.permission_events[:-50]
+                log(f"权限请求：{params.get('toolName')} risk={params.get('riskLevel')} -> {result['decision']}")
+                await self._write({"id": mid, "result": result})
+            else:
+                # 交互确认：不能在这里 await 等用户（会卡死 stdio 读线程），
+                # 挂起 pending 后由独立任务倒计时应答。app-server 对反向请求
+                # 只等 ~15s，所以窗口必须落在 PERMISSION_TIMEOUT 之内。
+                asyncio.create_task(self._interactive_permission(mid, params))
+            return
         elif method == "interaction/requestUserInput":
             result = {"action": "decline"}
         elif method in ("interaction/requestOfficialMcpAuthHeaders",
@@ -1450,6 +1499,61 @@ class ZCodeServer:
             del self.server_request_log[:-50]
             result = {}
         await self._write({"id": mid, "result": result})
+
+    async def _interactive_permission(self, mid, params):
+        """把权限请求挂到网页上等人点按钮，倒计时结束按拒绝应答。
+
+        必须独立成任务：_dispatch 是逐行串行的，在这里 await 用户响应会把
+        stdio 读线程卡住，app-server 的所有回包都挤在管道里。
+        """
+        pid = "pm_" + secrets.token_hex(6)
+        entry = {"id": pid,
+                 "params": dict(params or {}),
+                 "created": int(time.time() * 1000),
+                 "future": asyncio.get_running_loop().create_future()}
+        self.pending_permissions[pid] = entry
+        try:
+            await notify_global({"type": "permission_request",
+                                 "permission": permission_public(entry)})
+        except Exception:
+            pass
+        try:
+            result = await asyncio.wait_for(entry["future"], timeout=PERMISSION_TIMEOUT)
+            decision = str(result.get("decision") or "deny")
+        except asyncio.TimeoutError:
+            result = {"decision": "deny",
+                      "reason": f"网页确认超时（{PERMISSION_TIMEOUT} 秒），已自动拒绝"}
+            decision = "deny"
+        self.pending_permissions.pop(pid, None)
+        self.permission_events.append({
+            "at": int(time.time() * 1000),
+            "toolName": params.get("toolName"),
+            "riskLevel": params.get("riskLevel"),
+            "reason": params.get("reason"),
+            "decision": decision,
+        })
+        del self.permission_events[:-50]
+        log(f"权限请求：{params.get('toolName')} risk={params.get('riskLevel')} -> {decision}（网页确认）")
+        try:
+            await notify_global({"type": "permission_resolved",
+                                 "id": pid, "decision": decision})
+        except Exception:
+            pass
+        try:
+            await self._write({"id": mid, "result": result})
+        except Exception as exc:
+            log(f"权限应答写入失败: {exc}")
+
+    def resolve_permission(self, pid, decision):
+        """网页点了允许/拒绝。返回 False 表示请求已不存在（超时被清掉了）。"""
+        entry = self.pending_permissions.get(pid)
+        if not entry or entry["future"].done():
+            return False
+        entry["future"].set_result({
+            "decision": "allow" if decision == "allow" else "deny",
+            "reason": "网页端手动允许" if decision == "allow" else "网页端手动拒绝",
+        })
+        return True
 
     async def _write(self, obj):
         async with self.lock:
@@ -1525,6 +1629,7 @@ class SessionFeed:
         self.subscribed = False
         self.last_activity = time.time()
         self.usage = None
+        self.last_response = None   # turn.completed 里带的最终回复文本（任务看板取结果用）
         self.error = None
         self.lock = asyncio.Lock()
 
@@ -1625,6 +1730,7 @@ class SessionFeedManager:
         f.turn_done = False
         f.error = None
         f.usage = None
+        f.last_response = None
         f.last_activity = time.time()
         f.turn_started_at = time.time()
         f.stop_requested = False     # 新一轮开始，之前的停止请求已经翻篇
@@ -1801,6 +1907,7 @@ class SessionFeedManager:
 
         if etype == "turn.completed":
             f.usage = pl.get("usage") or {}
+            f.last_response = pl.get("response") or ""
             f.turn_done = True
             await f.broadcast({"type": "turnEnd", "sessionId": sid,
                                "response": pl.get("response"),
@@ -1881,6 +1988,8 @@ class TurnManager:
         self.pending_settings = {}   # session_id -> {"mode","model","thoughtLevel"}
         # 自动续跑 / 失败自动重试。sid -> {"enabled","message","max_rounds","rounds","retries"}
         self.auto_run = {}
+        # 一轮收尾的观察者：fn(session_id, outcome)，任务看板靠它感知任务结束
+        self.turn_hooks = []
         self.last_sent = {}     # sid -> 最近一条发出去的消息（失败重试用）
         load_auto_run(self)
 
@@ -1924,6 +2033,11 @@ class TurnManager:
 
     def _after_turn(self, session_id, outcome):
         """一轮结束后的自动续跑/重试决策。outcome: completed / failed / cancelled。"""
+        for hook in list(self.turn_hooks):
+            try:
+                hook(session_id, outcome)
+            except Exception as exc:
+                log(f"turn hook 异常: {exc}")
         ar = self.auto_run.get(session_id)
         if not ar or not ar.get("enabled"):
             return
@@ -2739,6 +2853,18 @@ async def notify_global(payload):
             dead.append(ws)
     for ws in dead:
         NOTIFY_SUBSCRIBERS.discard(ws)
+
+
+def permission_public(entry):
+    """pending 权限请求里能安全推给前端的字段。"""
+    p = entry.get("params") or {}
+    return {"id": entry["id"],
+            "toolName": p.get("toolName"),
+            "riskLevel": p.get("riskLevel"),
+            "reason": p.get("reason"),
+            "sessionId": p.get("sessionId"),
+            "created": entry.get("created"),
+            "detail": json.dumps(p, ensure_ascii=False)[:1600]}
 
 
 class ModelScheduler:
@@ -4788,11 +4914,19 @@ async def handle_settings_misc(request):
             pass
     if "defaultMode" in data and data["defaultMode"] in VALID_MODES:
         config["default_mode"] = data["defaultMode"]
+    if "taskParallel" in data:
+        try:
+            n = int(data["taskParallel"])
+            if 1 <= n <= 4:
+                config["task_parallel"] = n
+        except Exception:
+            pass
     save_config()
     return web.json_response({"ok": True, "config": {
         "autoApprove": config.get("auto_approve"),
         "maxAttempts": config.get("max_attempts"),
         "defaultMode": config.get("default_mode"),
+        "taskParallel": config.get("task_parallel", 1),
     }})
 
 
@@ -5409,7 +5543,7 @@ START_TIME = time.time()
 
 
 async def on_startup(app):
-    global ban_store, token_store, zc, feed, runner, scheduler
+    global ban_store, token_store, zc, feed, runner, scheduler, task_runner
     load_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ban_store = BanStore(BAN_PATH)
@@ -5420,6 +5554,10 @@ async def on_startup(app):
     runner = TurnManager()
     load_schedules()
     scheduler = ModelScheduler()
+    # 任务看板：建库/恢复中断任务，并把自己挂进 TurnManager 的收尾观察者
+    task_runner = TaskRunner()
+    runner.turn_hooks.append(_on_turn_event)
+    await task_runner.start()
     log("封禁名单已载入：%d 条记录，其中永久封禁 %d 个"
         % (len(ban_store.data), sum(1 for v in ban_store.data.values() if v.get("banned"))))
     try:
@@ -5437,6 +5575,8 @@ async def on_startup(app):
 
 
 async def on_cleanup(app):
+    if task_runner:
+        await task_runner.stop()
     if scheduler:
         await scheduler.stop()
     if zc:
@@ -5470,6 +5610,629 @@ async def _on_prepare_cache(request, response):
         response.headers.setdefault("Cache-Control", "public, max-age=43200")
     elif p == "/":
         response.headers.setdefault("Cache-Control", "no-cache")
+
+
+# ---------------------------------------------------------------- 面板扩展：文件管理 / 变更 / 权限 / 任务
+#
+# 借鉴来源：
+#   * 文件树 + 文件查看/编辑      —— OpenHands 的工作区文件面板
+#   * 变更 diff 查看器            —— claudecodeui 的文件变更视图
+#   * 权限网页确认弹窗            —— claudecodeui 的权限交互（受 15s 协议超时约束改为倒计时）
+#   * 任务看板（队列/并行/状态）  —— vibe-kanban 的多任务编排 + crystal 的会话隔离思路
+#
+# 安全边界：所有 fs 接口都 jail 在 workspace_root 之下；全部走 guard() 密钥认证。
+
+
+def _fs_jail(raw):
+    """把传入路径解析成绝对路径并校验必须位于 workspace_root 之内。"""
+    root = os.path.realpath(config.get("workspace_root", "/root"))
+    p = os.path.realpath(os.path.abspath(str(raw or "").strip()))
+    if p == root or p.startswith(root.rstrip(os.sep) + os.sep):
+        return p
+    return None
+
+
+def _fs_entry(de):
+    try:
+        st = de.stat()
+        return {"name": de.name, "dir": de.is_dir(),
+                "size": 0 if de.is_dir() else st.st_size,
+                "mtime": int(st.st_mtime * 1000)}
+    except OSError:
+        return None
+
+
+async def handle_fs_tree(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    p = _fs_jail(request.query.get("path") or config.get("workspace_root", "/root"))
+    if not p or not os.path.isdir(p):
+        return json_error("目录不存在或越界", 404)
+    entries = []
+    try:
+        with os.scandir(p) as it:
+            for de in it:
+                e = _fs_entry(de)
+                if e:
+                    entries.append(e)
+    except OSError as exc:
+        return json_error(f"读取目录失败: {exc}", 500)
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+    return web.json_response({"ok": True, "path": p, "entries": entries})
+
+
+async def handle_fs_file_get(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    p = _fs_jail(request.query.get("path"))
+    if not p or not os.path.isfile(p):
+        return json_error("文件不存在或越界", 404)
+    st = os.stat(p)
+    with open(p, "rb") as f:
+        head = f.read(8192)
+        is_text = b"\x00" not in head
+        if is_text:
+            body = head + f.read(max(0, FS_MAX_READ - len(head)))
+        else:
+            body = b""
+    truncated = st.st_size > len(body) if is_text else True
+    return web.json_response({
+        "ok": True, "path": p, "size": st.st_size,
+        "mtime": int(st.st_mtime * 1000),
+        "isText": is_text,
+        "truncated": truncated,
+        "content": body.decode("utf-8", "replace") if is_text else "",
+    })
+
+
+async def handle_fs_file_put(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    data = await body_json(request)
+    p = _fs_jail(data.get("path"))
+    content = data.get("content")
+    if not p:
+        return json_error("路径越界", 403)
+    if not isinstance(content, str):
+        return json_error("content 必须是文本")
+    raw = content.encode("utf-8")
+    if len(raw) > FS_MAX_WRITE:
+        return json_error(f"内容超过 {FS_MAX_WRITE // 1024 // 1024}MB 上限", 413)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".panel-tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, p)
+    log(f"文件已写入: {p}（{len(raw)} 字节）")
+    return web.json_response({"ok": True, "path": p})
+
+
+async def handle_fs_mkdir(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    data = await body_json(request)
+    p = _fs_jail(data.get("path"))
+    if not p:
+        return json_error("路径越界", 403)
+    os.makedirs(p, exist_ok=True)
+    return web.json_response({"ok": True, "path": p})
+
+
+async def handle_fs_delete(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    data = await body_json(request)
+    p = _fs_jail(data.get("path"))
+    if not p:
+        return json_error("路径越界", 403)
+    root = os.path.realpath(config.get("workspace_root", "/root"))
+    if p == root:
+        return json_error("不能删除工作区根目录", 403)
+    if os.path.isfile(p) or os.path.islink(p):
+        os.unlink(p)
+    elif os.path.isdir(p):
+        if data.get("recursive"):
+            shutil.rmtree(p)
+        else:
+            os.rmdir(p)     # 非递归只允许删空目录，避免误删
+    else:
+        return json_error("路径不存在", 404)
+    log(f"已删除: {p}（recursive={bool(data.get('recursive'))}）")
+    return web.json_response({"ok": True})
+
+
+async def handle_fs_upload(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    if not (request.content_type or "").startswith("multipart/"):
+        return json_error("需要 multipart/form-data", 400)
+    target_dir = None
+    saved = []
+    total = 0
+    reader = await request.multipart()
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "path":
+            target_dir = _fs_jail(await part.text())
+        elif part.filename:
+            if not target_dir:
+                return json_error("缺少目标目录字段 path", 400)
+            buf = bytearray()
+            while True:
+                chunk = await part.read_chunk(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > FS_MAX_UPLOAD:
+                    return json_error("上传总大小超限", 413)
+                buf.extend(chunk)
+            dest = os.path.join(target_dir, os.path.basename(part.filename))
+            n = 1
+            while os.path.exists(dest):
+                stem, ext = os.path.splitext(dest)
+                dest = f"{stem}-{n}{ext}"
+                n += 1
+            with open(dest, "wb") as f:
+                f.write(bytes(buf))
+            saved.append(dest)
+    if not target_dir:
+        return json_error("缺少目标目录字段 path", 400)
+    return web.json_response({"ok": True, "saved": saved, "dir": target_dir})
+
+
+async def handle_fs_download(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    p = _fs_jail(request.query.get("path"))
+    if not p or not os.path.isfile(p):
+        return json_error("文件不存在或越界", 404)
+    name = os.path.basename(p)
+    resp = web.FileResponse(p)
+    resp.headers["Content-Disposition"] = (
+        "attachment; filename*=UTF-8''" + url_quote(name))
+    return resp
+
+
+async def _run_git(ws, args, timeout=12):
+    """在工作区里跑一条只读 git 命令，返回 (text, truncated)。"""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "-C", ws, "--no-optional-locks", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        limit=CHANGES_DIFF_MAX * 2)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return "", True
+    text = out.decode("utf-8", "replace")
+    if len(text) > CHANGES_DIFF_MAX:
+        return text[:CHANGES_DIFF_MAX], True
+    return text, False
+
+
+async def handle_session_changes(request):
+    """会话工作区的变更视图：git 仓库给 status + diff；否则按修改时间列文件。"""
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    sid = request.match_info["sid"]
+    if not SESSION_ID_RE.match(sid):
+        return json_error("非法的会话 ID", 400)
+    row = session_row(sid)
+    ws = _fs_jail((row or {}).get("directory") or "")
+    if not ws or not os.path.isdir(ws):
+        return json_error("会话工作区不存在", 404)
+
+    if os.path.exists(os.path.join(ws, ".git")):
+        status, st_trunc = await _run_git(ws, ["status", "--porcelain", "-uall"])
+        diff, diff_trunc = await _run_git(ws, ["diff", "--unified=3"])
+        items = []
+        for line in status.splitlines():
+            line = line.rstrip("\r")
+            if len(line) >= 4:
+                items.append({"status": line[:2].strip() or line[:2],
+                              "path": line[3:].strip().strip('"')})
+        return web.json_response({"ok": True, "git": True, "workspace": ws,
+                                  "status": items, "diff": diff,
+                                  "truncated": st_trunc or diff_trunc})
+
+    # 非 git 工作区：按修改时间列出近期变过的文件（本轮执行期间优先）
+    f = feed.get(sid) if feed else None
+    default_since = f.turn_started_at * 1000 if (f and f.turn_started_at) \
+        else (time.time() - 86400) * 1000
+    try:
+        since = float(request.query.get("since") or default_since)
+    except ValueError:
+        since = default_since
+    files = []
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(ws):
+        dirnames[:] = [d for d in dirnames if d not in FS_SKIP_DIRS]
+        for name in filenames:
+            scanned += 1
+            if scanned > FS_SCAN_CAP:
+                break
+            fp = os.path.join(dirpath, name)
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            if st.st_mtime * 1000 >= since:
+                files.append({"path": fp, "size": st.st_size,
+                              "mtime": int(st.st_mtime * 1000)})
+        if scanned > FS_SCAN_CAP:
+            break
+    files.sort(key=lambda x: -x["mtime"])
+    truncated = len(files) > FS_LIST_CAP
+    return web.json_response({"ok": True, "git": False, "workspace": ws,
+                              "files": files[:FS_LIST_CAP],
+                              "scanned": scanned, "truncated": truncated,
+                              "since": int(since)})
+
+
+async def handle_permissions_list(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    pending = []
+    recent = []
+    auto = bool(config.get("auto_approve", True))
+    if zc:
+        pending = [permission_public(e) for e in
+                   sorted(zc.pending_permissions.values(),
+                          key=lambda e: e.get("created") or 0)]
+        recent = list(reversed(zc.permission_events[-20:]))
+    return web.json_response({"ok": True, "pending": pending, "recent": recent,
+                              "autoApprove": auto, "timeout": PERMISSION_TIMEOUT})
+
+
+async def handle_permission_resolve(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    data = await body_json(request)
+    decision = str(data.get("decision") or "").lower()
+    if decision not in ("allow", "deny"):
+        return json_error("decision 必须是 allow / deny")
+    if not zc or not zc.resolve_permission(request.match_info["pid"], decision):
+        return json_error("该确认请求已过期或不存在", 410)
+    return web.json_response({"ok": True})
+
+
+def _task_conn():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(TASKS_DB), timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(TASK_SCHEMA)   # IF NOT EXISTS：首次运行/老库都安全
+    return conn
+
+
+def _task_row(r):
+    if r is None:
+        return None
+    return dict(r)
+
+
+class TaskRunner:
+    """任务看板执行器：排队 → 建独立会话 → 发 prompt → 跟到收尾 → 记录结果。
+
+    每个任务独占一个新会话（crystal 式隔离：任务之间互不串工作现场），
+    并行度来自 config.task_parallel；同一工作区并行跑多个任务会有互相
+    踩文件的风险，前端会提示但不硬拦。
+    """
+
+    def __init__(self):
+        self.active = {}     # task_id -> session_id
+        self.wait = {}       # session_id -> future（等 turn hook 通知收尾）
+        self.worker_task = None
+
+    # ---- 存储 ---------------------------------------------------------------
+
+    def list(self, limit=200):
+        conn = _task_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        finally:
+            conn.close()
+        return [_task_row(r) for r in rows]
+
+    def get(self, tid):
+        conn = _task_conn()
+        try:
+            return _task_row(conn.execute(
+                "SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+        finally:
+            conn.close()
+
+    def update(self, tid, **fields):
+        if not fields:
+            return
+        keys = ", ".join(f"{k}=?" for k in fields)
+        vals = list(fields.values()) + [tid]
+        conn = _task_conn()
+        try:
+            conn.execute(f"UPDATE tasks SET {keys} WHERE id=?", vals)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def enqueue(self, title, prompt, workspace, mode="", model=None,
+                thought_level=""):
+        conn = _task_conn()
+        try:
+            cur = conn.execute(
+                "INSERT INTO tasks (title, prompt, workspace, mode, model_provider,"
+                " model_id, thought_level, status, created_ms)"
+                " VALUES (?,?,?,?,?,?,?, 'queued', ?)",
+                (title, prompt, workspace, mode or "",
+                 (model or {}).get("providerId", ""),
+                 (model or {}).get("modelId", ""),
+                 thought_level or "", int(time.time() * 1000)))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    def retry(self, tid):
+        src = self.get(tid)
+        if not src or src["status"] == "running" or src["status"] == "queued":
+            return None
+        return self.enqueue(src["title"], src["prompt"], src["workspace"],
+                            src["mode"],
+                            {"providerId": src["model_provider"],
+                             "modelId": src["model_id"]} if src["model_id"] else None,
+                            src["thought_level"])
+
+    def delete(self, tid):
+        row = self.get(tid)
+        if not row or row["status"] in ("running", "queued"):
+            return False
+        conn = _task_conn()
+        try:
+            conn.execute("DELETE FROM tasks WHERE id=?", (tid,))
+            conn.commit()
+        finally:
+            conn.close()
+        return True
+
+    # ---- 调度 ---------------------------------------------------------------
+
+    def parallel(self):
+        try:
+            return min(max(int(config.get("task_parallel", 1)), 1), 4)
+        except Exception:
+            return 1
+
+    async def broadcast_task(self, tid):
+        row = self.get(tid)
+        if row:
+            try:
+                await notify_global({"type": "task.updated", "task": row})
+            except Exception:
+                pass
+
+    async def start(self):
+        self.recover()
+        self.worker_task = asyncio.create_task(self._worker())
+
+    async def stop(self):
+        if self.worker_task and not self.worker_task.done():
+            self.worker_task.cancel()
+
+    def recover(self):
+        """面板重启时把卡在 running/queued 的旧任务标记失败，避免永久假死。"""
+        conn = _task_conn()
+        try:
+            conn.execute("UPDATE tasks SET status='failed',"
+                         " error='面板重启，任务中断', finished_ms=?"
+                         " WHERE status IN ('running','queued')",
+                         (int(time.time() * 1000),))
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def _worker(self):
+        while True:
+            try:
+                if len(self.active) < self.parallel():
+                    conn = _task_conn()
+                    try:
+                        row = conn.execute(
+                            "SELECT id FROM tasks WHERE status='queued'"
+                            " ORDER BY id ASC LIMIT 1").fetchone()
+                    finally:
+                        conn.close()
+                    if row:
+                        asyncio.create_task(self.run_task(row["id"]))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log(f"任务调度异常: {exc}")
+            await asyncio.sleep(1.5)
+
+    # ---- 执行 ---------------------------------------------------------------
+
+    async def run_task(self, tid):
+        row = self.get(tid)
+        if not row or row["status"] != "queued":
+            return
+        ws = _fs_jail(row["workspace"])
+        if not ws or not os.path.isdir(ws):
+            self.update(tid, status="failed", error="工作区不存在或越界",
+                        finished_ms=int(time.time() * 1000))
+            await self.broadcast_task(tid)
+            return
+        now = int(time.time() * 1000)
+        self.update(tid, status="running", started_ms=now, error="", result="")
+        await self.broadcast_task(tid)
+
+        model = None
+        if row["model_provider"] and row["model_id"]:
+            model = {"providerId": row["model_provider"], "modelId": row["model_id"]}
+        mode = row["mode"] if row["mode"] in VALID_MODES else \
+            config.get("default_mode", "build")
+        tl = row["thought_level"] or None
+        try:
+            _, sid = await runner.create({"workspaceKey": ws, "workspacePath": ws},
+                                         mode=mode, model=model, thought_level=tl)
+        except Exception as exc:
+            self.update(tid, status="failed", error=f"创建会话失败: {exc}",
+                        finished_ms=int(time.time() * 1000))
+            await self.broadcast_task(tid)
+            return
+
+        self.active[tid] = sid
+        fut = asyncio.get_running_loop().create_future()
+        self.wait[sid] = fut
+        self.update(tid, session_id=sid)
+        try:
+            await runner.send(sid, row["prompt"], mode=mode, model=model,
+                              thought_level=tl, auto=True)
+        except Exception as exc:
+            self.wait.pop(sid, None)
+            self.active.pop(tid, None)
+            self.update(tid, status="failed", error=f"发送失败: {exc}",
+                        finished_ms=int(time.time() * 1000))
+            await self.broadcast_task(tid)
+            return
+        try:
+            outcome = await asyncio.wait_for(fut, timeout=86400)
+        except asyncio.TimeoutError:
+            outcome = "failed"
+        self.wait.pop(sid, None)
+        self.active.pop(tid, None)
+
+        f = feed.get(sid) if feed else None
+        now = int(time.time() * 1000)
+        if outcome == "completed" and not (f and f.stop_requested):
+            result_text = (f.last_response if f else "") or ""
+            self.update(tid, status="done", result=result_text[:8000], finished_ms=now)
+        elif outcome == "cancelled" or (f and f.stop_requested):
+            self.update(tid, status="cancelled", finished_ms=now)
+        else:
+            err = ""
+            if f and isinstance(f.error, dict):
+                err = str(f.error.get("message") or f.error.get("error") or "")
+            elif f and f.error:
+                err = str(f.error)
+            self.update(tid, status="failed", error=err or "执行失败", finished_ms=now)
+        await self.broadcast_task(tid)
+
+    def cancel(self, tid):
+        row = self.get(tid)
+        if not row:
+            return False
+        if row["status"] == "queued":
+            self.update(tid, status="cancelled", finished_ms=int(time.time() * 1000))
+            asyncio.create_task(self.broadcast_task(tid))
+            return True
+        if row["status"] == "running" and row["session_id"] and runner:
+            asyncio.create_task(runner.cancel(row["session_id"]))
+            return True
+        return False
+
+
+def _on_turn_event(session_id, outcome):
+    """TurnManager 的收尾观察者：唤醒等这个会话的任务。"""
+    if task_runner and session_id in task_runner.wait:
+        fut = task_runner.wait[session_id]
+        if not fut.done():
+            fut.set_result(outcome)
+
+
+async def handle_tasks_list(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    return web.json_response({
+        "ok": True,
+        "tasks": task_runner.list() if task_runner else [],
+        "parallel": task_runner.parallel() if task_runner else 1,
+        "workspaceRoot": config.get("workspace_root", "/root"),
+    })
+
+
+async def handle_task_create(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    data = await body_json(request)
+    prompt = str(data.get("prompt") or "").strip()
+    if not prompt:
+        return json_error("任务内容（prompt）不能为空")
+    if len(prompt) > 20000:
+        return json_error("任务内容过长（上限 20000 字）")
+    ws = _fs_jail(data.get("workspace"))
+    if not ws or not os.path.isdir(ws):
+        return json_error("工作区不存在或越界")
+    title = str(data.get("title") or "").strip()[:80] or prompt[:40]
+    mode = str(data.get("mode") or "")
+    if mode and mode not in VALID_MODES:
+        mode = ""
+    model = data.get("model") if isinstance(data.get("model"), dict) else None
+    if model:
+        model = {"providerId": str(model.get("providerId") or ""),
+                 "modelId": str(model.get("modelId") or "")}
+    tid = task_runner.enqueue(title, prompt, ws, mode, model,
+                              str(data.get("thoughtLevel") or ""))
+    await task_runner.broadcast_task(tid)
+    log(f"新任务入队 #{tid}: {title}")
+    return web.json_response({"ok": True, "id": tid})
+
+
+async def handle_task_cancel(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    try:
+        tid = int(request.match_info["tid"])
+    except ValueError:
+        return json_error("非法任务 ID")
+    if not task_runner.cancel(tid):
+        return json_error("任务不存在或状态不允许取消", 409)
+    await task_runner.broadcast_task(tid)
+    return web.json_response({"ok": True})
+
+
+async def handle_task_retry(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    try:
+        tid = int(request.match_info["tid"])
+    except ValueError:
+        return json_error("非法任务 ID")
+    new_id = task_runner.retry(tid)
+    if not new_id:
+        return json_error("任务不存在或仍在执行中", 409)
+    await task_runner.broadcast_task(new_id)
+    return web.json_response({"ok": True, "id": new_id})
+
+
+async def handle_task_delete(request):
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    try:
+        tid = int(request.match_info["tid"])
+    except ValueError:
+        return json_error("非法任务 ID")
+    if not task_runner.delete(tid):
+        return json_error("任务不存在或仍在执行中", 409)
+    return web.json_response({"ok": True})
 
 
 def make_app():
@@ -5515,6 +6278,23 @@ def make_app():
     app.router.add_delete("/api/schedules/{sid}", handle_schedule_delete)
     app.router.add_post("/api/schedules/{sid}/run", handle_schedule_run)
     app.router.add_post("/api/schedules/revert", handle_schedule_revert)
+
+    # ---- 面板扩展 ------------------------------------------------------------
+    app.router.add_get("/api/permissions", handle_permissions_list)
+    app.router.add_post("/api/permissions/{pid}", handle_permission_resolve)
+    app.router.add_get("/api/fs/tree", handle_fs_tree)
+    app.router.add_get("/api/fs/file", handle_fs_file_get)
+    app.router.add_post("/api/fs/file", handle_fs_file_put)
+    app.router.add_post("/api/fs/mkdir", handle_fs_mkdir)
+    app.router.add_post("/api/fs/delete", handle_fs_delete)
+    app.router.add_post("/api/fs/upload", handle_fs_upload)
+    app.router.add_get("/api/fs/download", handle_fs_download)
+    app.router.add_get("/api/sessions/{sid}/changes", handle_session_changes)
+    app.router.add_get("/api/tasks", handle_tasks_list)
+    app.router.add_post("/api/tasks", handle_task_create)
+    app.router.add_post("/api/tasks/{tid}/cancel", handle_task_cancel)
+    app.router.add_post("/api/tasks/{tid}/retry", handle_task_retry)
+    app.router.add_delete("/api/tasks/{tid}", handle_task_delete)
 
     app.router.add_get("/ws", handle_ws)
     app.router.add_static("/static/", STATIC_DIR)

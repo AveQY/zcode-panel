@@ -259,6 +259,7 @@
         state.confirmResolve(false);
         state.confirmResolve = null;
       }
+      if (top.id === 'perm-modal') discardPerm();
     }
   });
 
@@ -284,6 +285,7 @@
     loadOptions();
     loadUsage('today');
     loadSchedules();
+    refreshPermissions();
     // 会话列表要按工作区分组，所以先拿到工作区清单再渲染列表
     loadWorkspaces().then(function () {
       loadSessions(true).then(restoreLastSession);
@@ -577,6 +579,18 @@
     }
     switch (d.type) {
       case 'ready':
+        break;
+
+      case 'permission_request':
+        onPermRequest(d.permission);
+        break;
+
+      case 'permission_resolved':
+        onPermResolved(d);
+        break;
+
+      case 'task.updated':
+        onTaskUpdated(d.task);
         break;
 
       case 'accepted':
@@ -1315,6 +1329,13 @@
     sel2.innerHTML = opts || '<option value="">（没有可用模型）</option>';
     if (keep2 && !sel2.value) sel2.value = keep2;
 
+    var sel3 = $('tk-model');
+    if (sel3) {
+      var keep3 = sel3.value;
+      sel3.innerHTML = opts || '<option value="">（跟随默认模型）</option>';
+      if (keep3) sel3.value = keep3;
+    }
+
     var levels = (o.thoughtLevel || {}).available || [];
     var lvOpts = levels.map(function (l) {
       var v = l.value || l;
@@ -1322,7 +1343,7 @@
     }).join('');
     if (!lvOpts) lvOpts = '<option value="">默认</option>';
 
-    ['thought-select', 'nc-thought'].forEach(function (id) {
+    ['thought-select', 'nc-thought', 'tk-thought'].forEach(function (id) {
       var el = $(id);
       var keep = el.value;
       el.innerHTML = lvOpts;
@@ -1376,6 +1397,9 @@
 
     var s2 = $('nc-mode');
     s2.innerHTML = html;
+
+    var tkMode = $('tk-mode');
+    if (tkMode) tkMode.innerHTML = html;
 
     var s3 = $('set-default-mode');
     s3.innerHTML = html;
@@ -1809,6 +1833,7 @@
     renderActive();
     // 先按已知状态摆好输入区（这个会话可能正在后台跑，那就不该让再发消息）
     syncComposer();
+    updatePanelButtons();
 
     clearMessages();
     $('chat-title').textContent = '加载中…';
@@ -3753,6 +3778,540 @@
       return r.data;
     });
   }
+
+  /* ============================================ 面板扩展：权限确认 / 文件管理 / 变更 / 任务看板 */
+
+  var permQueue = [];
+  var permShown = null;
+  var permTimer = null;
+  var taskOpen = false;
+  var taskTimer = null;
+  var fdState = { root: '', path: '', viewing: null };
+
+  function currentSessionObj() {
+    return (state.sessions || []).filter(function (s) {
+      return s.id === state.sessionId;
+    })[0] || null;
+  }
+
+  function updatePanelButtons() {
+    var has = !!currentSessionObj();
+    $('files-btn').disabled = !has;
+    $('changes-btn').disabled = !has;
+  }
+
+  // ---- 权限确认（claudecodeui 式弹窗，受 app-server 15s 反向请求超时约束） ----
+
+  function onPermRequest(p) {
+    if (!p || !p.id) return;
+    permQueue.push(p);
+    showNextPerm();
+  }
+
+  function showNextPerm() {
+    if (permShown || !permQueue.length) return;
+    var p = permQueue.shift();
+    permShown = p;
+    $('perm-tool').textContent = p.toolName || '未知工具';
+    var rb = $('perm-risk');
+    var risk = String(p.riskLevel || '?');
+    rb.textContent = risk;
+    rb.className = 'risk-badge risk-' + risk.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    $('perm-reason').textContent = p.reason || '（无说明）';
+    var det = $('perm-detail');
+    if (p.detail) {
+      det.textContent = p.detail;
+      det.classList.remove('hidden');
+      $('perm-toggle-detail').classList.remove('hidden');
+    } else {
+      det.classList.add('hidden');
+      $('perm-toggle-detail').classList.add('hidden');
+    }
+    openModal('perm-modal');
+    var left = 12;
+    var cd = $('perm-countdown');
+    cd.textContent = left + 's';
+    clearInterval(permTimer);
+    permTimer = setInterval(function () {
+      left -= 1;
+      cd.textContent = Math.max(0, left) + 's';
+      if (left <= 0) clearInterval(permTimer);
+    }, 1000);
+  }
+
+  function discardPerm() {
+    // Esc 关掉弹窗：本地放弃这次确认机会，服务端倒计时到点会自动拒绝
+    permShown = null;
+    clearInterval(permTimer);
+  }
+
+  function resolvePerm(decision) {
+    if (!permShown) return;
+    var pid = permShown.id;
+    permShown = null;
+    clearInterval(permTimer);
+    closeModal('perm-modal');
+    req('/api/permissions/' + encodeURIComponent(pid), {
+      method: 'POST',
+      body: JSON.stringify({ decision: decision })
+    }).then(function (r) {
+      if (!r.data.ok) toast(r.data.error || '确认请求已过期', 'err');
+      else toast(decision === 'allow' ? '已允许本次操作' : '已拒绝本次操作');
+      showNextPerm();
+    }).catch(function () {
+      toast('确认请求已过期', 'err');
+      showNextPerm();
+    });
+  }
+
+  function onPermResolved(d) {
+    if (permShown && permShown.id === d.id) {
+      permShown = null;
+      clearInterval(permTimer);
+      closeModal('perm-modal');
+      showNextPerm();
+    }
+  }
+
+  function refreshPermissions() {
+    req('/api/permissions').then(function (r) {
+      if (r.data && r.data.ok) {
+        (r.data.pending || []).forEach(onPermRequest);
+      }
+    }).catch(function () {});
+  }
+
+  // ---- 文件管理（OpenHands 式工作区文件树 + 在线编辑） ----
+
+  function openFiles() {
+    var s = currentSessionObj();
+    var ws = s ? (s.workspacePath || '') : '';
+    if (!ws) {
+      toast('请先选择一个会话', 'err');
+      return;
+    }
+    fdState.root = ws;
+    fdState.viewing = null;
+    $('fd-viewer').classList.add('hidden');
+    $('files-drawer').classList.remove('hidden');
+    loadTree(ws);
+  }
+
+  function closeDrawer(id) {
+    $(id).classList.add('hidden');
+  }
+
+  function parentPath(p) {
+    var norm = String(p || '').replace(/[\\/]+$/, '');
+    var idx = Math.max(norm.lastIndexOf('/'), norm.lastIndexOf('\\'));
+    return idx > 0 ? norm.slice(0, idx) : '';
+  }
+
+  function loadTree(path) {
+    if (!path) return;
+    fdState.path = path;
+    $('fd-path').textContent = path;
+    req('/api/fs/tree?path=' + encodeURIComponent(path)).then(function (r) {
+      if (!r.data.ok) {
+        toast(r.data.error || '读取目录失败', 'err');
+        return;
+      }
+      renderTree(r.data.entries || []);
+    }).catch(function () {
+      toast('读取目录失败', 'err');
+    });
+  }
+
+  function renderTree(entries) {
+    var html = '';
+    var up = parentPath(fdState.path);
+    if (up && (up === fdState.root || up.startsWith(fdState.root))) {
+      html += '<div class="fd-row dir" data-up="1"><span class="fd-ico">&#8617;</span>..</div>';
+    }
+    html += entries.map(function (e) {
+      var full = fdState.path.replace(/[\\/]+$/, '') + '/' + e.name;
+      if (e.dir) {
+        return '<div class="fd-row dir" data-path="' + esc(full) + '"><span class="fd-ico">&#128193;</span>' + esc(e.name) + '</div>';
+      }
+      return '<div class="fd-row file" data-path="' + esc(full) + '"><span class="fd-ico">&#128196;</span>' +
+        esc(e.name) + '<span class="fd-size">' + fmtNum(e.size) + '</span></div>';
+    }).join('');
+    $('fd-tree').innerHTML = html || '<div class="fd-empty">空目录</div>';
+  }
+
+  function openFileViewer(path) {
+    req('/api/fs/file?path=' + encodeURIComponent(path)).then(function (r) {
+      if (!r.data.ok) {
+        toast(r.data.error || '读取文件失败', 'err');
+        return;
+      }
+      fdState.viewing = path;
+      $('fv-name').textContent = path;
+      var ed = $('fv-editor');
+      if (!r.data.isText) {
+        ed.value = '（二进制文件不支持在线编辑，可下载查看）';
+        ed.disabled = true;
+        $('fv-save').disabled = true;
+      } else {
+        ed.value = r.data.content || '';
+        ed.disabled = false;
+        $('fv-save').disabled = !!r.data.truncated;
+        if (r.data.truncated) toast('文件超过 1MB，只显示前半部分', 'err');
+      }
+      $('fd-viewer').classList.remove('hidden');
+      ed.oninput = function () {
+        $('fv-save').disabled = ed.disabled ? true : false;
+      };
+    }).catch(function () {
+      toast('读取文件失败', 'err');
+    });
+  }
+
+  $('fd-tree').addEventListener('click', function (e) {
+    var row = e.target.closest('.fd-row');
+    if (!row) return;
+    if (row.getAttribute('data-up')) {
+      loadTree(parentPath(fdState.path));
+      return;
+    }
+    var p = row.getAttribute('data-path');
+    if (row.classList.contains('dir')) loadTree(p);
+    else openFileViewer(p);
+  });
+
+  $('fv-close').addEventListener('click', function () {
+    $('fd-viewer').classList.add('hidden');
+  });
+
+  $('fv-save').addEventListener('click', function () {
+    if (!fdState.viewing) return;
+    req('/api/fs/file', {
+      method: 'POST',
+      body: JSON.stringify({ path: fdState.viewing, content: $('fv-editor').value })
+    }).then(function (r) {
+      if (!r.data.ok) {
+        toast(r.data.error || '保存失败', 'err');
+        return;
+      }
+      toast('已保存');
+      loadTree(fdState.path);
+    }).catch(function () {
+      toast('保存失败', 'err');
+    });
+  });
+
+  $('fv-download').addEventListener('click', function () {
+    if (fdState.viewing) {
+      location.href = '/api/fs/download?path=' + encodeURIComponent(fdState.viewing);
+    }
+  });
+
+  $('fv-delete').addEventListener('click', function () {
+    if (!fdState.viewing) return;
+    var p = fdState.viewing;
+    confirmBox('删除文件', '确定删除 ' + p + ' ？此操作不可恢复。', '删除').then(function (ok) {
+      if (!ok) return;
+      req('/api/fs/delete', {
+        method: 'POST',
+        body: JSON.stringify({ path: p })
+      }).then(function (r) {
+        if (!r.data.ok) {
+          toast(r.data.error || '删除失败（目录需为空）', 'err');
+          return;
+        }
+        toast('已删除');
+        $('fd-viewer').classList.add('hidden');
+        loadTree(fdState.path);
+      }).catch(function () {
+        toast('删除失败', 'err');
+      });
+    });
+  });
+
+  $('fd-refresh').addEventListener('click', function () {
+    loadTree(fdState.path);
+  });
+
+  $('fd-newdir').addEventListener('click', function () {
+    var name = prompt('新目录名：');
+    if (!name) return;
+    req('/api/fs/mkdir', {
+      method: 'POST',
+      body: JSON.stringify({ path: fdState.path.replace(/[\\/]+$/, '') + '/' + name })
+    }).then(function (r) {
+      if (!r.data.ok) {
+        toast(r.data.error || '创建失败', 'err');
+        return;
+      }
+      loadTree(fdState.path);
+    }).catch(function () {
+      toast('创建失败', 'err');
+    });
+  });
+
+  $('fd-upload').addEventListener('click', function () {
+    $('fd-file-input').click();
+  });
+
+  $('fd-file-input').addEventListener('change', function () {
+    var files = this.files;
+    if (!files || !files.length || !fdState.path) return;
+    var fd = new FormData();
+    fd.append('path', fdState.path);
+    for (var i = 0; i < files.length; i++) fd.append('file', files[i]);
+    fetch('/api/fs/upload', {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: fd
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; });
+    }).then(function (data) {
+      if (!data.ok) {
+        toast(data.error || '上传失败', 'err');
+        return;
+      }
+      toast('已上传 ' + (data.saved || []).length + ' 个文件');
+      loadTree(fdState.path);
+    }).catch(function () {
+      toast('上传失败', 'err');
+    });
+    this.value = '';
+  });
+
+  document.addEventListener('click', function (e) {
+    var t = e.target.closest ? e.target.closest('[data-close-drawer]') : null;
+    if (t) closeDrawer(t.getAttribute('data-close-drawer'));
+  });
+
+  // ---- 变更查看（claudecodeui 式 diff 面板） ----
+
+  function openChanges() {
+    var s = currentSessionObj();
+    if (!s) {
+      toast('请先选择一个会话', 'err');
+      return;
+    }
+    $('changes-drawer').classList.remove('hidden');
+    $('ch-workspace').textContent = s.workspacePath || '';
+    loadChanges();
+  }
+
+  function loadChanges() {
+    var s = currentSessionObj();
+    if (!s) return;
+    $('ch-status').innerHTML = '<div class="fd-empty">加载中…</div>';
+    $('ch-diff').textContent = '';
+    req('/api/sessions/' + encodeURIComponent(s.id) + '/changes').then(function (r) {
+      if (!r.data.ok) {
+        $('ch-status').innerHTML = '<div class="fd-empty">' + esc(r.data.error || '读取失败') + '</div>';
+        return;
+      }
+      if (r.data.git) {
+        var st = r.data.status || [];
+        $('ch-status').innerHTML = st.length
+          ? '<div class="ch-list">' + st.map(function (i) {
+              return '<div class="ch-item"><b>' + esc(i.status) + '</b> ' + esc(i.path) + '</div>';
+            }).join('') + '</div>'
+          : '<div class="fd-empty">工作区没有未提交的变更</div>';
+        $('ch-diff').textContent = r.data.diff ||
+          '（没有可显示的 diff。新增文件的内容可以在「文件」里查看）';
+        if (r.data.truncated) $('ch-diff').textContent += '\n…（diff 过大已截断）';
+      } else {
+        var files = r.data.files || [];
+        $('ch-status').innerHTML =
+          '<div class="ch-note">该工作区不是 git 仓库：按修改时间列出近期变更的文件，点击可查看内容</div>' +
+          '<div class="ch-list">' + files.map(function (f) {
+            return '<div class="ch-item clickable" data-path="' + esc(f.path) + '"><span class="grow">' +
+              esc(f.path) + '</span><span class="fd-size">' + relTime(f.mtime) + '</span></div>';
+          }).join('') + '</div>';
+        $('ch-diff').textContent = files.length ? '' : '（近期没有修改过的文件）';
+      }
+    }).catch(function () {
+      $('ch-status').innerHTML = '<div class="fd-empty">读取失败</div>';
+    });
+  }
+
+  $('ch-refresh').addEventListener('click', loadChanges);
+
+  $('ch-status').addEventListener('click', function (e) {
+    var it = e.target.closest('.ch-item.clickable');
+    if (!it) return;
+    var p = it.getAttribute('data-path');
+    closeDrawer('changes-drawer');
+    openFiles();
+    openFileViewer(p);
+  });
+
+  // ---- 任务看板（vibe-kanban 式队列 + 并行执行） ----
+
+  function openTasks() {
+    taskOpen = true;
+    openModal('tasks-modal');
+    renderTaskForm();
+    loadTasks();
+    clearInterval(taskTimer);
+    taskTimer = setInterval(function () {
+      if (taskOpen) loadTasks();
+    }, 5000);
+  }
+
+  function renderTaskForm() {
+    var wsSel = $('tk-workspace');
+    var keep = wsSel.value;
+    wsSel.innerHTML = (state.workspaces || []).map(function (w) {
+      var path = w.path || w.workspacePath || w.directory || '';
+      return '<option value="' + esc(path) + '">' + esc(w.name || w.title || path) + '</option>';
+    }).join('') || '<option value="">（无工作区）</option>';
+    if (keep) wsSel.value = keep;
+    renderModelSelects();
+    renderModeSelects();
+  }
+
+  function loadTasks() {
+    if ($('tasks-modal').classList.contains('hidden')) {
+      taskOpen = false;
+      clearInterval(taskTimer);
+      return;
+    }
+    req('/api/tasks').then(function (r) {
+      if (!r.data.ok) return;
+      state.tasks = r.data.tasks || [];
+      renderBoard();
+    }).catch(function () {});
+  }
+
+  function renderBoard() {
+    var tasks = state.tasks || [];
+    var cols = [['queued', '排队中'], ['running', '执行中'],
+                ['done', '已完成'], ['failed', '失败 / 取消']];
+    $('task-board').innerHTML = cols.map(function (c) {
+      var items = tasks.filter(function (t) {
+        return t.status === c[0] || (c[0] === 'failed' && t.status === 'cancelled');
+      });
+      return '<div class="task-col"><div class="task-col-head">' + c[1] +
+        '<span class="task-count">' + items.length + '</span></div>' +
+        items.map(taskCard).join('') + '</div>';
+    }).join('');
+  }
+
+  function taskCard(t) {
+    var cls = t.status === 'done' ? 'ok' : (t.status === 'failed' ? 'err' :
+             (t.status === 'cancelled' ? 'off' : 'run'));
+    var time = relTime(t.started_ms || t.created_ms || 0);
+    var btns = '';
+    if (t.session_id) btns += '<button class="text-btn slim" data-tk-open="' + t.id + '">会话</button>';
+    if (t.status === 'queued' || t.status === 'running') {
+      btns += '<button class="text-btn danger slim" data-tk-cancel="' + t.id + '">取消</button>';
+    } else {
+      btns += '<button class="text-btn slim" data-tk-retry="' + t.id + '">重试</button>' +
+              '<button class="text-btn danger slim" data-tk-del="' + t.id + '">删除</button>';
+    }
+    var body = '';
+    if (t.status === 'failed' && t.error) {
+      body = '<div class="task-err">' + esc(t.error) + '</div>';
+    } else if (t.status === 'done' && t.result) {
+      body = '<div class="task-result">' + esc(String(t.result).slice(0, 280)) + '</div>';
+    }
+    var wsName = String(t.workspace || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+    return '<div class="task-card"><div class="task-title">' + esc(t.title) + '</div>' +
+      '<div class="task-meta"><span class="badge ' + cls + '">' + esc(t.status) + '</span>' +
+      '<span class="fd-size">' + esc(wsName) + '</span>' +
+      '<span class="fd-size">' + time + '</span></div>' + body +
+      '<div class="task-actions">' + btns + '</div></div>';
+  }
+
+  function onTaskUpdated(t) {
+    if (!t || !t.id) return;
+    var prev = (state.tasks || []).filter(function (x) { return x.id === t.id; })[0];
+    state.tasks = (state.tasks || []).filter(function (x) { return x.id !== t.id; });
+    state.tasks.unshift(t);
+    if (!$('tasks-modal').classList.contains('hidden')) renderBoard();
+    if (prev && prev.status !== t.status &&
+        (t.status === 'done' || t.status === 'failed' || t.status === 'cancelled')) {
+      toast('任务「' + (t.title || ('#' + t.id)) + '」' +
+        (t.status === 'done' ? '已完成' : (t.status === 'cancelled' ? '已取消' : '失败')), 
+        t.status === 'done' ? '' : 'err');
+    }
+  }
+
+  $('tk-submit').addEventListener('click', function () {
+    var prompt = $('tk-prompt').value.trim();
+    var ws = $('tk-workspace').value;
+    if (!prompt) {
+      toast('请填写任务内容', 'err');
+      return;
+    }
+    if (!ws) {
+      toast('请选择工作区', 'err');
+      return;
+    }
+    var mv = $('tk-model').value.split('|');
+    var body = {
+      title: $('tk-title').value.trim(),
+      prompt: prompt,
+      workspace: ws,
+      mode: $('tk-mode').value || '',
+      model: (mv.length === 2 && mv[0]) ? { providerId: mv[0], modelId: mv[1] } : null,
+      thoughtLevel: $('tk-thought').value || ''
+    };
+    req('/api/tasks', {
+      method: 'POST',
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.data.ok) {
+        toast(r.data.error || '提交失败', 'err');
+        return;
+      }
+      $('tk-prompt').value = '';
+      $('tk-title').value = '';
+      toast('任务已加入队列');
+      loadTasks();
+    }).catch(function () {
+      toast('提交失败', 'err');
+    });
+  });
+
+  $('task-board').addEventListener('click', function (e) {
+    var b = e.target.closest('button');
+    if (!b) return;
+    var act = null;
+    ['data-tk-open', 'data-tk-cancel', 'data-tk-retry', 'data-tk-del'].forEach(function (k) {
+      if (b.getAttribute(k) !== null) act = { key: k, id: b.getAttribute(k) };
+    });
+    if (!act) return;
+    var tid = act.id;
+    if (act.key === 'data-tk-open') {
+      var t = (state.tasks || []).filter(function (x) { return String(x.id) === String(tid); })[0];
+      if (t && t.session_id) {
+        closeModal('tasks-modal');
+        openSession(t.session_id);
+      }
+    } else if (act.key === 'data-tk-cancel') {
+      req('/api/tasks/' + tid + '/cancel', { method: 'POST' }).then(function (r) {
+        if (!r.data.ok) toast(r.data.error || '取消失败', 'err');
+        loadTasks();
+      }).catch(function () {});
+    } else if (act.key === 'data-tk-retry') {
+      req('/api/tasks/' + tid + '/retry', { method: 'POST' }).then(function (r) {
+        if (!r.data.ok) toast(r.data.error || '重试失败', 'err');
+        loadTasks();
+      }).catch(function () {});
+    } else if (act.key === 'data-tk-del') {
+      req('/api/tasks/' + tid, { method: 'DELETE' }).then(function (r) {
+        if (!r.data.ok) toast(r.data.error || '删除失败', 'err');
+        loadTasks();
+      }).catch(function () {});
+    }
+  });
+
+  $('files-btn').addEventListener('click', openFiles);
+  $('changes-btn').addEventListener('click', openChanges);
+  $('tasks-btn').addEventListener('click', openTasks);
+  $('perm-allow').addEventListener('click', function () { resolvePerm('allow'); });
+  $('perm-deny').addEventListener('click', function () { resolvePerm('deny'); });
+  $('perm-toggle-detail').addEventListener('click', function () {
+    $('perm-detail').classList.toggle('hidden');
+  });
 
   req('/api/me').then(function (r) {
     if (r.data && r.data.ok) {

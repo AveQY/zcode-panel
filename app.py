@@ -5918,10 +5918,15 @@ async def _run_git(ws, args, timeout=12):
 async def handle_session_token_usage(request):
     """这个会话最近一轮的 token 用量，给输入区的「上下文计量条」用。
 
-    口径跟 claudecodeui / vibe-kanban 的 context gauge 一致：取该会话最新一条
-    model_usage，used = 输入 + 缓存读 + 缓存写 + 输出，约等于这轮发给模型的
-    上下文总大小；分母（上下文窗口）由前端从模型目录里取。没有任何记录时
-    返回全 0，前端显示「—」而不是报错。
+    取该会话最新一条 model_usage，约等于这轮发给模型的上下文总大小；
+    分母（上下文窗口）由前端从模型目录里取。没有任何记录时返回全 0，
+    前端显示「—」而不是报错。
+
+    used 的口径要兼容两种记账方式：本库（中转 provider）的 input_tokens
+    已经是「含缓存的总输入」——turn_usage.computed_total_tokens 也是
+    input + output —— 再加缓存就会算两遍，出现 308k/200k 这种假超窗；
+    而 Anthropic 原生口径 input 不含缓存。判别：缓存项没超出 input
+    就当已含，超出了才补加。
     """
     blocked = guard(request)
     if blocked:
@@ -5931,6 +5936,7 @@ async def handle_session_token_usage(request):
         return json_error("非法的会话 ID", 400)
     empty = {"ok": True, "sessionId": sid, "used": 0, "inputTokens": 0,
              "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
+             "inputIncludesCache": False,
              "providerId": None, "modelId": None, "at": 0}
     conn = db_connect()
     try:
@@ -5946,15 +5952,19 @@ async def handle_session_token_usage(request):
     if not row:
         return web.json_response(empty)
     r = dict(row)
-    used = ((r.get("input_tokens") or 0) + (r.get("output_tokens") or 0)
-            + (r.get("cache_read_input_tokens") or 0)
-            + (r.get("cache_creation_input_tokens") or 0))
+    i = r.get("input_tokens") or 0
+    o = r.get("output_tokens") or 0
+    cr = r.get("cache_read_input_tokens") or 0
+    cc = r.get("cache_creation_input_tokens") or 0
+    extra = (cr + cc) if (cr + cc) > i else 0
+    used = i + o + extra
     return web.json_response({
         "ok": True, "sessionId": sid, "used": used,
-        "inputTokens": r.get("input_tokens") or 0,
-        "outputTokens": r.get("output_tokens") or 0,
-        "cacheReadTokens": r.get("cache_read_input_tokens") or 0,
-        "cacheCreationTokens": r.get("cache_creation_input_tokens") or 0,
+        "inputTokens": i,
+        "outputTokens": o,
+        "cacheReadTokens": cr,
+        "cacheCreationTokens": cc,
+        "inputIncludesCache": bool(cr + cc > 0 and extra == 0),
         "providerId": r.get("provider_id"), "modelId": r.get("model_id"),
         "at": r.get("started_at") or 0,
     })

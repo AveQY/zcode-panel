@@ -1119,8 +1119,10 @@
     scrollToBottom();
   }
 
-  function handleTool(d) {
-    var entry = ensureAssistant(d.messageId);
+  function handleTool(d, entry) {
+    // 历史填充要把自己的 entry 显式传进来：ensureAssistant 优先复用
+    // state.cur（直播气泡），历史连播时会把整页工具卡片全堆进第一条消息
+    entry = entry || ensureAssistant(d.messageId);
     var id = d.toolCallId || 'tool';
     var card = entry.body.querySelector('[data-tcid="' + id + '"]');
     if (!card) {
@@ -1395,12 +1397,24 @@
       if (fill) fill.style.width = (pct == null ? 0 : Math.min(100, pct)) + '%';
       $('ctx-gauge-val').textContent = fmtTokens(d.used) +
         (total ? ' / ' + fmtTokens(total) + '（' + pct + '%）' : ' tok');
-      box.title = '最近一轮上下文：输入 ' + fmtTokens(d.inputTokens) +
-        ' · 缓存读 ' + fmtTokens(d.cacheReadTokens) +
-        ' · 缓存写 ' + fmtTokens(d.cacheCreationTokens) +
-        ' · 输出 ' + fmtTokens(d.outputTokens) +
-        (total ? '\n当前模型上下文窗口 ' + fmtTokens(total)
-               : '\n当前模型没有配置上下文窗口大小');
+      // 明细按记账口径显示：input 已含缓存的（中转 provider）分开列会像算两遍
+      var tip = '最近一轮上下文：';
+      if (d.inputIncludesCache) {
+        tip += '输入 ' + fmtTokens(d.inputTokens) +
+          (d.cacheReadTokens ? '（已含缓存读 ' + fmtTokens(d.cacheReadTokens) + '）' : '') +
+          ' · 输出 ' + fmtTokens(d.outputTokens);
+      } else {
+        tip += '输入 ' + fmtTokens(d.inputTokens) +
+          ' · 缓存读 ' + fmtTokens(d.cacheReadTokens) +
+          ' · 缓存写 ' + fmtTokens(d.cacheCreationTokens) +
+          ' · 输出 ' + fmtTokens(d.outputTokens);
+      }
+      tip += total ? '\n当前模型上下文窗口 ' + fmtTokens(total)
+                   : '\n当前模型没有配置上下文窗口大小';
+      if (pct != null && pct > 100) {
+        tip += '\n已超出窗口：即将触发压缩，或目录里登记的窗口大小不准';
+      }
+      box.title = tip;
     }).catch(function () {});
   }
 
@@ -2644,7 +2658,7 @@
           messageId: m.id, toolCallId: p.callID || p.toolCallId,
           toolName: p.tool, state: st.status || 'completed',
           input: st.input, payload: { output: st.output, error: st.error },
-        });
+        }, entry);   // 显式传 entry，避免 ensureAssistant 复用 state.cur 串位
       }
     });
     if (m.error) {
@@ -2672,6 +2686,17 @@
     return !!(m && m.role === 'user' && m.visibleToUser === true);
   }
 
+  // 只有 step-start/step-finish 这类控制标记、没有可展示内容的完成消息，
+  // 不占一行 —— 否则历史里全是「头像 + 署名」的空行
+  function assistantRenderable(m) {
+    if (m.error) return true;
+    return (m.parts || []).some(function (p) {
+      return (p.type === 'text' && p.text) ||
+             (p.type === 'reasoning' && p.text) ||
+             p.type === 'tool';
+    });
+  }
+
   function renderHistoryMessage(m, prepend, beforeEl) {
     if (m.role === 'user') {
       if (!shouldRenderUserMessage(m)) return;
@@ -2681,6 +2706,7 @@
       return;
     }
     if (m.role !== 'assistant') return;
+    if (m.completed !== false && !assistantRenderable(m)) return;
 
     removeThinking();
     hideWelcome();
@@ -2731,6 +2757,7 @@
     var sig = messageSignature(m);
     var old = state.messageMap.get(m.id);
     if (old && old.sig === sig) return;      // 内容没变就别动 DOM，免得闪
+    if (m.completed !== false && !assistantRenderable(m)) return;
     removeThinking();
     hideWelcome();
     state.cur = null;                        // 重建期间别让 part 渲染串到别的气泡

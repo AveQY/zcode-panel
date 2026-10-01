@@ -529,10 +529,12 @@ details.fold > summary:hover { background: var(--sidebar-hover); }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;           /* 放不下就整组换行，别把标签挤成竖排 */
+  gap: 4px 10px;
   min-height: 20px;
   padding: 0 4px;
 }
-#status-text { font-size: 12px; color: var(--text-mute); }
+#status-text { font-size: 12px; color: var(--text-mute); min-width: 0; }
 
 /* ---------------- 提示条 ---------------- */
 
@@ -683,8 +685,9 @@ select { cursor: pointer; }
 .composer-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .composer-picks { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .pick { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text-mute); }
+.pick > span { flex: none; white-space: nowrap; }   /* 「模型/思考」标签永不竖排 */
 .pick select { width: auto; max-width: 210px; padding: 4px 7px; font-size: 12px; }
-.composer-right { display: flex; align-items: center; gap: 10px; }
+.composer-right { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 10px; margin-left: auto; }
 
 /* 连续执行开关：一个带状态点的按钮 */
 .auto-toggle { cursor: pointer; border: 1px solid var(--border); background: #fff;

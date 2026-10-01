@@ -5915,6 +5915,51 @@ async def _run_git(ws, args, timeout=12):
     return text, False
 
 
+async def handle_session_token_usage(request):
+    """这个会话最近一轮的 token 用量，给输入区的「上下文计量条」用。
+
+    口径跟 claudecodeui / vibe-kanban 的 context gauge 一致：取该会话最新一条
+    model_usage，used = 输入 + 缓存读 + 缓存写 + 输出，约等于这轮发给模型的
+    上下文总大小；分母（上下文窗口）由前端从模型目录里取。没有任何记录时
+    返回全 0，前端显示「—」而不是报错。
+    """
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    sid = request.match_info["sid"]
+    if not SESSION_ID_RE.match(sid):
+        return json_error("非法的会话 ID", 400)
+    empty = {"ok": True, "sessionId": sid, "used": 0, "inputTokens": 0,
+             "outputTokens": 0, "cacheReadTokens": 0, "cacheCreationTokens": 0,
+             "providerId": None, "modelId": None, "at": 0}
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT provider_id, model_id, started_at, input_tokens, "
+            "output_tokens, cache_read_input_tokens, cache_creation_input_tokens "
+            "FROM model_usage WHERE session_id = ? "
+            "ORDER BY started_at DESC LIMIT 1", (sid,)).fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        conn.close()
+    if not row:
+        return web.json_response(empty)
+    r = dict(row)
+    used = ((r.get("input_tokens") or 0) + (r.get("output_tokens") or 0)
+            + (r.get("cache_read_input_tokens") or 0)
+            + (r.get("cache_creation_input_tokens") or 0))
+    return web.json_response({
+        "ok": True, "sessionId": sid, "used": used,
+        "inputTokens": r.get("input_tokens") or 0,
+        "outputTokens": r.get("output_tokens") or 0,
+        "cacheReadTokens": r.get("cache_read_input_tokens") or 0,
+        "cacheCreationTokens": r.get("cache_creation_input_tokens") or 0,
+        "providerId": r.get("provider_id"), "modelId": r.get("model_id"),
+        "at": r.get("started_at") or 0,
+    })
+
+
 async def handle_session_changes(request):
     """会话工作区的变更视图：git 仓库给 status + diff；否则按修改时间列文件。"""
     blocked = guard(request)
@@ -6383,6 +6428,7 @@ def make_app():
     app.router.add_post("/api/fs/upload", handle_fs_upload)
     app.router.add_get("/api/fs/download", handle_fs_download)
     app.router.add_get("/api/sessions/{sid}/changes", handle_session_changes)
+    app.router.add_get("/api/sessions/{sid}/token-usage", handle_session_token_usage)
     app.router.add_get("/api/tasks", handle_tasks_list)
     app.router.add_post("/api/tasks", handle_task_create)
     app.router.add_post("/api/tasks/{tid}/cancel", handle_task_cancel)

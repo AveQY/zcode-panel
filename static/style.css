@@ -2060,3 +2060,63 @@ pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
   .allow-add { max-width: none; }
   .ch-foot { flex-wrap: wrap; }
 }
+
+/* ============================ 模型配置借鉴 ============================ */
+/* 上下文计量条（claudecodeui TokenUsageSummary / vibe-kanban ContextUsageGauge）：
+   75% 变警示色，90% 变危险色，阈值同 vibe-kanban 的 low/medium/high/critical 收敛版 */
+.ctx-gauge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-mute);
+  user-select: none;
+  flex: none;
+}
+.ctx-bar {
+  width: 54px;
+  height: 5px;
+  border-radius: 3px;
+  background: var(--border-soft);
+  overflow: hidden;
+  flex: none;
+}
+.ctx-bar i {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--green);
+  border-radius: 3px;
+  transition: width .35s ease, background .2s;
+}
+.ctx-gauge.ctx-warn .ctx-bar i { background: var(--amber); }
+.ctx-gauge.ctx-crit .ctx-bar i { background: var(--red); }
+.ctx-gauge b {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.ctx-gauge.ctx-warn b { color: var(--amber); }
+.ctx-gauge.ctx-crit b { color: var(--red); }
+
+/* 消息级模型署名：「由 glm-4.6 回答 · 时间」跟时间同一行 */
+.msg-model { color: var(--text-mute); }
+.msg-model:hover { color: var(--text-dim); }
+
+/* 队列条目的模型小标：入队那一刻锁定的模型 */
+.sq-model {
+  font-style: normal;
+  font-size: 10px;
+  line-height: 1.4;
+  padding: 1px 4px;
+  margin-left: 5px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  flex: none;
+}
+
+@media (max-width: 760px) {
+  .ctx-bar { width: 34px; }
+  .ctx-gauge b { font-size: 11px; }
+}

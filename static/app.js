@@ -631,6 +631,7 @@
     var p = state.pendingSend;
     if (!p || !wsOpen()) return;
     state.pendingSend = null;
+    if (p.model && p.model.modelId) state.turnModel = p.model.modelId;
     wsSend({
       type: 'send', sessionId: p.sessionId, content: p.content,
       mode: p.mode, model: p.model, thoughtLevel: p.thoughtLevel,
@@ -1054,9 +1055,20 @@
 
   function addMsgTimeEl(entry, timeMs) {
     if (!entry || !entry.body || entry.timeEl) return;
+    var t = fmtMsgTime(timeMs || Date.now());
     var el = document.createElement('div');
     el.className = 'msg-time';
-    el.textContent = fmtMsgTime(timeMs || Date.now());
+    if (entry.modelTag) {
+      // 署名和时间同一行：「由 glm-4.6 回答 · 2026-10-01 12:00」
+      var lbl = document.createElement('span');
+      lbl.className = 'msg-model';
+      lbl.textContent = '由 ' + entry.modelTag + ' 回答';
+      lbl.title = '本条回复由 ' + entry.modelFull + ' 生成';
+      el.appendChild(lbl);
+      el.appendChild(document.createTextNode(' · ' + t));
+    } else {
+      el.textContent = t;
+    }
     entry.body.appendChild(el);
     entry.timeEl = el;
   }
@@ -1236,6 +1248,7 @@
       var el = state.cur.mdEl;
       if (el) el.innerHTML = mdParse(state.cur.raw);
     }
+    if (state.cur && state.turnModel) setMsgModel(state.cur, state.turnModel);
     if (state.cur) addMsgTimeEl(state.cur, d && d.time ? d.time : Date.now());
     state.cur = null;
     loadSessions(true).then(function () {
@@ -1251,6 +1264,9 @@
     if (d && d.usage && d.usage.totalTokens) {
       $('chat-meta').textContent = '本轮 ' + fmtTokens(d.usage.totalTokens) + ' tokens';
     }
+    // 一轮跑完刷新上下文计量条（model_usage 落库比收尾晚一两秒，补一次）
+    refreshCtxGauge();
+    setTimeout(refreshCtxGauge, 2500);
     // 一轮跑完刷新右上角的今日用量（用量行可能晚一两秒落库，再补一次）
     loadUsage(null, true);
     setTimeout(function () { loadUsage(null, true); }, 3000);
@@ -1278,6 +1294,131 @@
     var s = String(mid || '');
     var i = s.lastIndexOf('/');
     return i >= 0 ? s.slice(i + 1) : s;
+  }
+
+  /* ---- 模型配置借鉴：上下文计量 / 按模型记忆思考等级 / 新建会话记忆 ----
+     参考：claudecodeui TokenUsageSummary、vibe-kanban ContextUsageGauge、
+     crystal lastSelectedModel、claudecodeui reconcileStoredEffort。 */
+
+  var LAST_MODEL_KEY = 'zcode-last-model';
+  var LAST_THOUGHT_KEY = 'zcode-last-thought';
+  var THOUGHT_BY_MODEL_KEY = 'zcode-thought-by-model';
+
+  // 'providerId|modelId' -> 模型目录里的完整记录（上下文窗口、reasoning 等级等）
+  function modelMeta(v) {
+    var models = (state.options && state.options.models) || [];
+    if (!v) return null;
+    var p = String(v).split('|');
+    var pid = p[0], mid = p.slice(1).join('|');
+    for (var i = 0; i < models.length; i++) {
+      if (models[i].providerId === pid && models[i].modelId === mid) return models[i];
+    }
+    return null;
+  }
+
+  // 模型声明的 reasoning 等级（形状兼容 [{value,label}] / ['low',...] / {levels:[...]}）；
+  // 没声明返回 null，调用方继续用全局等级列表。
+  function modelReasoningValues(meta) {
+    try {
+      var r = meta && meta.reasoning;
+      if (!r) return null;
+      var lv = Array.isArray(r) ? r : r.levels;
+      if (!Array.isArray(lv) || !lv.length) return null;
+      var out = [];
+      for (var i = 0; i < lv.length; i++) {
+        var it = lv[i];
+        if (typeof it === 'string') out.push(it);
+        else if (it && (it.value || it.label)) out.push(it.value !== undefined ? it.value : it.label);
+      }
+      return out.length ? out : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveThoughtForModel(modelId, value) {
+    if (!modelId) return;
+    try {
+      var m = JSON.parse(localStorage.getItem(THOUGHT_BY_MODEL_KEY) || '{}');
+      m[modelId] = value || '';
+      localStorage.setItem(THOUGHT_BY_MODEL_KEY, JSON.stringify(m));
+    } catch (e) {}
+  }
+
+  // 换模型时把它上次用过的思考等级换回来（vibe-kanban reasoning_by_model）。
+  // 只改界面取值：思考等级是发送时读的，不额外发请求。
+  function restoreThoughtForModel(modelId) {
+    if (!modelId) return;
+    var want = null;
+    try {
+      var m = JSON.parse(localStorage.getItem(THOUGHT_BY_MODEL_KEY) || '{}');
+      want = m[modelId];
+    } catch (e) { return; }
+    if (want == null) return;
+    var sel = $('thought-select');
+    if (!sel) return;
+    for (var i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === want) { sel.value = want; return; }
+    }
+  }
+
+  function rememberNcPicks(modelVal, thoughtVal) {
+    try {
+      if (modelVal) localStorage.setItem(LAST_MODEL_KEY, modelVal);
+      if (thoughtVal != null) localStorage.setItem(LAST_THOUGHT_KEY, thoughtVal);
+    } catch (e) {}
+  }
+
+  // 上下文计量条：最近一轮发给模型的 token 总量 ÷ 当前模型上下文窗口。
+  // 分母来自模型目录；目录里没写上下文大小时只显示用量不显示百分比。
+  function refreshCtxGauge() {
+    var box = $('ctx-gauge');
+    if (!box) return;
+    if (!state.sessionId) { box.classList.add('hidden'); return; }
+    var sid = state.sessionId;
+    req('/api/sessions/' + encodeURIComponent(sid) + '/token-usage').then(function (r) {
+      if (state.sessionId !== sid) return;             // 期间切了会话，丢弃过期结果
+      if (r.status === 401 || !r.data || !r.data.ok || !r.data.used) {
+        box.classList.add('hidden');
+        return;
+      }
+      var d = r.data;
+      var meta = modelMeta($('model-select').value);
+      var total = (meta && Number(meta.context)) || 0;
+      var pct = total ? Math.round(d.used / total * 100) : null;
+      box.classList.remove('hidden', 'ctx-warn', 'ctx-crit');
+      if (pct != null && pct >= 90) box.classList.add('ctx-crit');
+      else if (pct != null && pct >= 75) box.classList.add('ctx-warn');
+      var bar = box.querySelector('.ctx-bar');
+      var fill = $('ctx-bar-fill');
+      if (bar) bar.style.display = pct == null ? 'none' : '';
+      if (fill) fill.style.width = (pct == null ? 0 : Math.min(100, pct)) + '%';
+      $('ctx-gauge-val').textContent = fmtTokens(d.used) +
+        (total ? ' / ' + fmtTokens(total) + '（' + pct + '%）' : ' tok');
+      box.title = '最近一轮上下文：输入 ' + fmtTokens(d.inputTokens) +
+        ' · 缓存读 ' + fmtTokens(d.cacheReadTokens) +
+        ' · 缓存写 ' + fmtTokens(d.cacheCreationTokens) +
+        ' · 输出 ' + fmtTokens(d.outputTokens) +
+        (total ? '\n当前模型上下文窗口 ' + fmtTokens(total)
+               : '\n当前模型没有配置上下文窗口大小');
+    }).catch(function () {});
+  }
+
+  // 消息级模型署名（借鉴 claudecodeui MessageModelLabel）：这条回复是哪个模型答的。
+  // 先把值记在 entry 上，真正渲染并入时间行，保证模型信息先到、时间后到时也不丢。
+  function setMsgModel(entry, modelId) {
+    if (!entry || !modelId) return;
+    entry.modelTag = shortModel(modelId);
+    entry.modelFull = modelId;
+    var el = entry.timeEl;
+    if (el && !el.querySelector('.msg-model')) {
+      var lbl = document.createElement('span');
+      lbl.className = 'msg-model';
+      lbl.textContent = '由 ' + entry.modelTag + ' 回答';
+      lbl.title = '本条回复由 ' + entry.modelFull + ' 生成';
+      el.insertBefore(lbl, el.firstChild);
+      el.insertBefore(document.createTextNode(' · '), lbl.nextSibling);
+    }
   }
 
   function markRunning(sid, on, opts) {
@@ -1400,7 +1541,13 @@
       } else {
         toast('本会话已切到「' + label + '」', 'ok');
       }
-      loadSessions(true);
+      // 等会话列表拿回「新模型已生效」的数据再重建选择器：
+      // 抢跑的话 renderModelSelects 会按旧数据把选择器打回去
+      loadSessions(true).then(function () {
+        renderModelSelects();
+        restoreThoughtForModel(mv.modelId);
+        refreshCtxGauge();
+      });
     }).catch(function () {
       sel.disabled = false;
       toast('网络异常', 'err');
@@ -1428,7 +1575,14 @@
   function enqueueSend(text) {
     if (!state.sessionId || !text) return;
     if (!state.sendQueue.length) state.sendQueueFor = state.sessionId;
-    state.sendQueue.push(text);
+    // 连同入队时的模型 / 思考等级 / 模式一起记下（借鉴 opcode PromptQueue）：
+    // 队列里的消息要等本轮跑完才发，期间选择器可能已经被改到别的模型去了。
+    state.sendQueue.push({
+      text: text,
+      model: currentModelValue(),
+      thoughtLevel: $('thought-select').value || null,
+      mode: $('mode-select').value || null,
+    });
     $('input').value = '';
     $('input').style.height = 'auto';
     renderSendQueue();
@@ -1447,10 +1601,13 @@
     }
     box.classList.remove('hidden');
     var html = '<span class="sq-label">待发送 ' + q.length + ' 条</span>';
-    q.forEach(function (t, i) {
+    q.forEach(function (e, i) {
+      var t = (e && e.text) || '';
       var prev = t.length > 36 ? t.slice(0, 36) + '…' : t;
-      html += '<span class="sq-item" data-sq-edit="' + i + '" title="点击放回输入框编辑">' +
-        esc(prev) +
+      var mName = (e && e.model && e.model.modelId) ? shortModel(e.model.modelId) : '';
+      html += '<span class="sq-item" data-sq-edit="' + i + '" title="点击放回输入框编辑' +
+        (mName ? '；发送时用 ' + esc(mName) : '') + '">' + esc(prev) +
+        (mName ? '<i class="sq-model">' + esc(mName) + '</i>' : '') +
         '<button class="sq-del" data-sq-del="' + i + '" title="移出队列">&times;</button></span>';
     });
     html += '<button class="text-btn slim" data-sq-clear="1">清空</button>';
@@ -1475,7 +1632,8 @@
     if (it) {
       var i = +it.getAttribute('data-sq-edit');
       var input = $('input');
-      input.value = state.sendQueue[i];
+      var en = state.sendQueue[i];
+      input.value = (en && en.text) || '';
       state.sendQueue.splice(i, 1);
       if (!state.sendQueue.length) state.sendQueueFor = null;
       renderSendQueue();
@@ -1489,10 +1647,11 @@
     if (!q.length) return;
     if (state.sendQueueFor !== state.sessionId) return;   // 队列跟着会话走
     if (isRunning(state.sessionId)) return;               // 又开跑了，等下一次收尾
-    var text = q.shift();
+    var e = q.shift();
     if (!q.length) state.sendQueueFor = null;
     renderSendQueue();
-    dispatchSend(text, $('input'));
+    if (typeof e === 'string') dispatchSend(e, $('input'));        // 兼容旧格式
+    else dispatchSend(e.text, $('input'), false, e);
   }
 
   // 手机端发送键被「停止」占着，输入框有字时补一个「队列」小按钮
@@ -1545,6 +1704,7 @@
     }).then(function (r) {
       if (r.data && r.data.ok && r.data.sessionId) {
         prewarm = { sid: r.data.sessionId, wsPath: want };
+        rememberNcPicks($('model-select').value, $('thought-select').value);
       }
     }).catch(function () {});
   }
@@ -1593,6 +1753,7 @@
         throw new Error(r.data.error || '创建会话失败');
       }
       state.sessionId = r.data.sessionId;
+      rememberNcPicks($('model-select').value, $('thought-select').value);
       rememberSession(state.sessionId);
       updatePanelButtons();
       loadSessions(true);
@@ -1610,7 +1771,15 @@
     });
   }
 
-  function dispatchSend(text, input, hideBubble) {
+  function dispatchSend(text, input, hideBubble, opts) {
+    // opts：队列续发时用「入队那一刻」记下的模型/思考等级/模式，
+    // 而不是发送瞬间选择器的值（期间用户可能已经改了选择器）。
+    var mv = (opts && opts.model) || currentModelValue();
+    var th = (opts && opts.thoughtLevel !== undefined)
+      ? opts.thoughtLevel : ($('thought-select').value || null);
+    var md = (opts && opts.mode) || $('mode-select').value;
+    state.turnModel = (mv && mv.modelId) || '';
+
     if (!wsOpen()) {
       // 断线不丢消息：先把消息落到界面，等重连成功后自动补发
       if (!hideBubble) appendUserMessage(text, false, Date.now());
@@ -1621,9 +1790,9 @@
       state.pendingSend = {
         sessionId: state.sessionId,
         content: text,
-        mode: $('mode-select').value,
-        model: currentModelValue(),
-        thoughtLevel: $('thought-select').value || null,
+        mode: md,
+        model: mv,
+        thoughtLevel: th,
       };
       setStatus('连接中断，正在重连，恢复后自动发送…');
       if (!state.ws) forceReconnect();
@@ -1642,9 +1811,9 @@
       type: 'send',
       sessionId: state.sessionId,
       content: text,
-      mode: $('mode-select').value,
-      model: currentModelValue(),
-      thoughtLevel: $('thought-select').value || null,
+      mode: md,
+      model: mv,
+      thoughtLevel: th,
     });
 
     if (!ok) {
@@ -1715,6 +1884,7 @@
         renderSchedBanner();
       }
       renderModelSelects();
+      refreshCtxGauge();
       return r.data;
     }).catch(function () {});
   }
@@ -1733,21 +1903,46 @@
     var opts = models.map(function (m) {
       var v = (m.providerId || '') + '|' + (m.modelId || '');
       var sel = (m.providerId === cur.providerId && m.modelId === cur.modelId);
+      // 选项里带上上下文窗口（借鉴 claudecodeui 模型元数据展示），
+      // 选之前就能看出 128k 和 1m 的差别，不用跑去模型配置页翻
       return '<option value="' + esc(v) + '"' + (sel ? ' selected' : '') + '>' +
         esc(m.label || m.modelId) + (m.providerLabel ? ' · ' + esc(m.providerLabel) : '') +
+        (m.context ? ' · ' + fmtTokens(m.context) : '') +
         '</option>';
     }).join('');
 
     var sel1 = $('model-select');
     var keep1 = sel1.value;
     sel1.innerHTML = opts || '<option value="">（没有可用模型）</option>';
-    if (keep1 && !sel1.value) sel1.value = keep1;
+    // 重建时优先保住选择器当前值（用户刚切的、或会话刚同步的）；
+    // 目录里没有它才落到 cur 标记的默认项
+    if (keep1) {
+      for (var k1 = 0; k1 < sel1.options.length; k1++) {
+        if (sel1.options[k1].value === keep1) { sel1.value = keep1; break; }
+      }
+    }
     lastModelValue = sel1.value;
 
     var sel2 = $('nc-model');
     var keep2 = sel2.value;
     sel2.innerHTML = opts || '<option value="">（没有可用模型）</option>';
-    if (keep2 && !sel2.value) sel2.value = keep2;
+    var k2set = false;
+    if (keep2) {
+      for (var k2 = 0; k2 < sel2.options.length; k2++) {
+        if (sel2.options[k2].value === keep2) { sel2.value = keep2; k2set = true; break; }
+      }
+    }
+    if (!k2set) {
+      // 新建会话表单记住上次用的模型（借鉴 crystal 的 lastSelectedModel）
+      try {
+        var lm = localStorage.getItem(LAST_MODEL_KEY);
+        if (lm) {
+          for (var li = 0; li < sel2.options.length; li++) {
+            if (sel2.options[li].value === lm) { sel2.value = lm; break; }
+          }
+        }
+      } catch (e) {}
+    }
 
     var sel3 = $('tk-model');
     if (sel3) {
@@ -1756,10 +1951,20 @@
       if (keep3) sel3.value = keep3;
     }
 
-    var levels = (o.thoughtLevel || {}).available || [];
+    var levels = ((o.thoughtLevel || {}).available || []).map(function (l) {
+      return (l && typeof l === 'object') ? l : { value: l, label: l };
+    });
+    var gLabel = {};
+    levels.forEach(function (l) { gLabel[l.value] = l.label || l.value; });
+    // 思考等级按当前模型的 reasoning 能力收窄（借鉴 claudecodeui
+    // reconcileStoredEffort）：模型没声明支持的等级发下去会被 app-server
+    // 拒绝，界面干脆不给选；全局标签沿用已有的中文叫法。
+    var mlv = modelReasoningValues(modelMeta(sel1.value));
+    if (mlv) {
+      levels = mlv.map(function (v) { return { value: v, label: gLabel[v] || v }; });
+    }
     var lvOpts = levels.map(function (l) {
-      var v = l.value || l;
-      return '<option value="' + esc(v) + '">' + esc(l.label || v) + '</option>';
+      return '<option value="' + esc(l.value) + '">' + esc(l.label || l.value) + '</option>';
     }).join('');
     if (!lvOpts) lvOpts = '<option value="">默认</option>';
 
@@ -1768,6 +1973,13 @@
       var keep = el.value;
       el.innerHTML = lvOpts;
       var want = keep || (o.thoughtLevel || {}).current || '';
+      if (id === 'nc-thought' && !keep) {
+        // 新建会话表单记住上次用的思考等级
+        try {
+          var lt = localStorage.getItem(LAST_THOUGHT_KEY);
+          if (lt != null) want = lt;
+        } catch (e) {}
+      }
       if (want) {
         var found = false;
         for (var i = 0; i < el.options.length; i++) {
@@ -1854,6 +2066,12 @@
   $('mode-select').addEventListener('change', updateModeDesc);
   // 改了模型就只影响当前这个会话（不重启 app-server、不影响别的会话）
   $('model-select').addEventListener('change', function () { applySessionModel(this); });
+  // 思考等级按模型记忆：发消息时把「当前模型 → 当前等级」存下来，
+  // 下次换回这个模型时自动恢复（借鉴 vibe-kanban reasoning_by_model）
+  $('thought-select').addEventListener('change', function () {
+    var mv = currentModelValue();
+    if (mv) saveThoughtForModel(mv.modelId, this.value);
+  });
 
   // 连续执行：收尾自动续跑 + 出错自动重试；「停止生成」是总闸
   function setAutoRunUI(on) {
@@ -2300,6 +2518,7 @@
           }
         }
         applySessionSettings(s, sm);
+        refreshCtxGauge();
       }
 
       // 实时性：这个会话不管此刻跑没跑，都把「增量尾随」挂上。
@@ -2345,6 +2564,7 @@
     if (!(m && m.providerId && m.modelId)) {
       m = (state.options && state.options.currentModel) || {};
     }
+    var rebuilt = false;
     if (m.providerId && m.modelId) {
       var v = m.providerId + '|' + m.modelId;
       var sel = $('model-select');
@@ -2358,6 +2578,11 @@
         fallback.textContent = shortModel(m.modelId) + '（当前使用，目录中不可用）';
         sel.appendChild(fallback);
         sel.value = v;
+      } else {
+        // 会话的模型定下来了，重建一次选择器：思考等级要按这个模型的
+        // reasoning 能力收窄（直接改 value 不会触发这段逻辑）
+        renderModelSelects();
+        rebuilt = true;
       }
     }
     // 切进来的会话可能带着「下一轮才生效」的模型，也提示一下
@@ -2367,6 +2592,7 @@
                 '，下一轮起用 ' + shortModel(pm.modelId));
     }
     lastModelValue = $('model-select').value;
+    return rebuilt;
   }
 
   // 一条助手消息 -> 一个完整气泡。历史加载、增量尾随、断线对齐都走这里，
@@ -2381,6 +2607,7 @@
                   body: row.querySelector('.assistant-body'), mdEl: null, raw: '' };
     state.messageMap.set(m.id, entry);   // 先登记：part 里的 handleTool 要按 id 查它
     fillAssistantParts(entry, m);
+    if (m.model) setMsgModel(entry, m.model);
     if (m.completed === false) appendLiveCursor(entry);
     else addMsgTimeEl(entry, m.time);
     return entry;
@@ -2981,6 +3208,7 @@
     var model = mv ? { providerId: mv.split('|')[0], modelId: mv.split('|').slice(1).join('|') } : null;
     var mode = $('nc-mode').value;
     var thoughtLevel = $('nc-thought').value || null;
+    rememberNcPicks(mv, $('nc-thought').value);   // 下次打开表单默认沿用
     // 打开弹窗时已经预建好了同一个工作区的会话：直接用，创建变成瞬时
     var ready = takePrewarm(wsPath);
     if (ready) {

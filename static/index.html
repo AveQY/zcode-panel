@@ -6,7 +6,20 @@
 <meta name="robots" content="noindex, nofollow, noarchive">
 <meta name="referrer" content="no-referrer">
 <title>ZCode 对话控制台</title>
-<link rel="stylesheet" href="/static/style.css?v=20261001a">
+<script>
+/* 在样式生效前定好主题，避免深色用户看到一闪的白屏 */
+(function () {
+  try {
+    var t = localStorage.getItem('zcode-theme');
+    if (t !== 'dark' && t !== 'light') {
+      t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+        ? 'dark' : 'light';
+    }
+    document.documentElement.setAttribute('data-theme', t);
+  } catch (e) {}
+})();
+</script>
+<link rel="stylesheet" href="/static/style.css?v=20261001b">
 </head>
 <body>
 
@@ -65,6 +78,7 @@
     <div class="sidebar-foot">
       <div class="foot-row">
         <span id="foot-info" class="foot-info"></span>
+        <button id="theme-btn" class="text-btn" title="切换到深色主题">深色</button>
         <button id="tasks-btn" class="text-btn" title="任务看板：排队 / 并行执行多个任务">任务</button>
         <button id="settings-btn" class="text-btn" title="打开设置">&#9881; 设置</button>
       </div>
@@ -647,6 +661,12 @@
       </div>
     </div>
     <input type="file" id="fd-file-input" multiple class="hidden">
+    <div id="fd-newdir-row" class="fd-newdir hidden">
+      <input id="fd-newdir-name" type="text" placeholder="新目录名，例如 docs"
+             autocomplete="off" spellcheck="false">
+      <button id="fd-newdir-ok" class="primary-btn slim">创建</button>
+      <button id="fd-newdir-cancel" class="ghost-btn slim">取消</button>
+    </div>
     <div class="drawer-body">
       <div id="fd-tree" class="fd-tree"></div>
       <div id="fd-viewer" class="fd-viewer hidden">
@@ -719,6 +739,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js?v=20261001a"></script>
+<script src="/static/app.js?v=20261001b"></script>
 </body>
 </html>

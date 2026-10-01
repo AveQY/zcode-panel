@@ -105,6 +105,42 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  // 面板常年跑在 http://IP:8081（非安全上下文），navigator.clipboard 在这种
+  // 环境下不可用，必须带 execCommand 兜底，否则手机/局域网下根本复制不了。
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '-1000px';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        if (ta.setSelectionRange) ta.setSelectionRange(0, ta.value.length);
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (ok) resolve(); else reject(new Error('execCommand copy failed'));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  function flashCopied(btn) {
+    var old = btn.textContent;
+    btn.textContent = '已复制';
+    btn.classList.add('copied');
+    setTimeout(function () {
+      btn.textContent = old;
+      btn.classList.remove('copied');
+    }, 1400);
+  }
+
   function mdParse(text) {
     var M = window.marked;
     if (!M) return esc(text).replace(/\n/g, '<br>');
@@ -116,13 +152,25 @@
     } catch (e) {
       return esc(text).replace(/\n/g, '<br>');
     }
-    return html
+    html = html
       .replace(/<script[\s\S]*?<\/script>/gi, '')
       .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
       .replace(/\son\w+\s*=\s*"[^"]*"/gi, '')
       .replace(/\son\w+\s*=\s*'[^']*'/gi, '')
       .replace(/\son\w+\s*=\s*[^\s>]+/gi, '')
       .replace(/javascript:/gi, '');
+    // 代码块补「语言标签 + 复制按钮」：所有渲染路径都经过 mdParse，
+    // 在这里统一注入，流式重渲染也不会丢（claudecodeui / OpenHands 的做法）。
+    html = html.replace(/<pre><code([^>]*)>([\s\S]*?)<\/code><\/pre>/g,
+      function (all, attrs, body) {
+        var mm = /class="[^"]*language-([\w+#.-]+)/.exec(attrs);
+        var lang = mm ? mm[1] : 'text';
+        return '<div class="code-block"><div class="code-head">' +
+          '<span class="code-lang">' + esc(lang) + '</span>' +
+          '<button type="button" class="code-copy" data-copy="1">复制</button>' +
+          '</div><pre><code' + attrs + '>' + body + '</code></pre></div>';
+      });
+    return html;
   }
 
   function toast(msg, kind) {
@@ -153,6 +201,18 @@
     if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前';
     if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前';
     if (diff < 604800000) return Math.floor(diff / 86400000) + ' 天前';
+    var d = new Date(ms);
+    return (d.getMonth() + 1) + '/' + d.getDate();
+  }
+
+  // 侧栏窄，用更短的写法（"10 分" 而不是 "10 分钟前"），避免 meta 行被切一半
+  function shortRelTime(ms) {
+    if (!ms) return '';
+    var diff = Date.now() - ms;
+    if (diff < 60000) return '刚刚';
+    if (diff < 3600000) return Math.floor(diff / 60000) + ' 分';
+    if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时';
+    if (diff < 604800000) return Math.floor(diff / 86400000) + ' 天';
     var d = new Date(ms);
     return (d.getMonth() + 1) + '/' + d.getDate();
   }
@@ -230,6 +290,38 @@
   });
 
   document.addEventListener('click', function (e) {
+    var t = e.target.closest ? e.target.closest('[data-copy], [data-copy-msg]') : null;
+    if (!t) return;
+    if (t.hasAttribute('data-copy')) {
+      // 代码块复制：取同容器里的 <code> 原文
+      var block = t.closest('.code-block');
+      var code = block ? block.querySelector('pre code') : null;
+      if (!code) return;
+      copyText(code.textContent || '').then(function () {
+        flashCopied(t);
+      }).catch(function () {
+        toast('复制失败，请长按选择文本', 'err');
+      });
+      return;
+    }
+    // 整条消息复制：优先用渲染时留下的 Markdown 原文，退化为可见文本
+    var row = t.closest('.row');
+    if (!row) return;
+    var rawEl = row.querySelector('[data-raw]');
+    var text = rawEl ? (rawEl.dataset.raw || '') : '';
+    if (!text) {
+      var bubble = row.querySelector('.bubble-user') || row.querySelector('.assistant-body');
+      text = bubble ? bubble.innerText : '';
+    }
+    if (!text) return;
+    copyText(text).then(function () {
+      flashCopied(t);
+    }).catch(function () {
+      toast('复制失败，请长按选择文本', 'err');
+    });
+  });
+
+  document.addEventListener('click', function (e) {
     var t = e.target;
     if (!t || !t.getAttribute) return;
     var c = t.getAttribute('data-close');
@@ -250,6 +342,15 @@
   });
 
   document.addEventListener('keydown', function (e) {
+    // Ctrl/Cmd + Enter：任何输入框里都能直接发（手机外接键盘同样受益）
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      var tag = ((e.target && e.target.tagName) || '').toLowerCase();
+      if (tag === 'textarea' || tag === 'input') {
+        e.preventDefault();
+        send();
+        return;
+      }
+    }
     if (e.key !== 'Escape') return;
     var mods = document.querySelectorAll('.modal:not(.hidden)');
     if (mods.length) {
@@ -260,7 +361,10 @@
         state.confirmResolve = null;
       }
       if (top.id === 'perm-modal') discardPerm();
+      return;
     }
+    // 没有弹窗时 Esc = 停止当前生成（和「发送按钮变停止」配套）
+    if (isRunning(state.sessionId)) stopGeneration();
   });
 
   /* ============================================ 视图切换 */
@@ -1023,6 +1127,10 @@
     timeEl.className = 'msg-time';
     timeEl.textContent = fmtMsgTime(timeMs || Date.now());
     row.appendChild(timeEl);
+    var acts = document.createElement('div');
+    acts.className = 'msg-actions user-actions';
+    acts.innerHTML = '<button type="button" class="msg-copy" data-copy-msg="1" title="复制这条消息">复制</button>';
+    row.appendChild(acts);
     if (prepend) box.insertBefore(row, box.firstChild);
     else if (beforeEl) box.insertBefore(row, beforeEl);
     else { box.appendChild(row); scrollToBottom(true); }
@@ -1125,14 +1233,13 @@
     var on = isRunning(state.sessionId);
     var ext = !!(on && (state.running[state.sessionId] || {}).external);
     state.sending = on;
-    $('send-btn').disabled = on;
+    var sbtn = $('send-btn');
+    // 运行中：发送按钮就地变成停止按钮（不再另摆一个文字按钮）
+    sbtn.disabled = false;
+    sbtn.classList.toggle('is-stop', on);
+    sbtn.title = on ? (ext ? '外部任务执行中，面板无法停止' : '停止生成') : '发送';
     var stop = $('stop-btn');
-    if (stop) {
-      stop.classList.toggle('hidden', !on);
-      // 外部进程在跑的轮次面板停不掉，按钮如实说明，别让用户点了没反应
-      stop.disabled = ext;
-      stop.textContent = ext ? '外部任务执行中' : '停止生成';
-    }
+    if (stop) stop.classList.add('hidden');
     if (on) {
       state.startedAt = (state.running[state.sessionId] || {}).since || Date.now();
       clearInterval(state.statusTimer);
@@ -1206,10 +1313,45 @@
     var text = input.value.trim();
     if (!text || isRunning(state.sessionId)) return;
     if (!state.sessionId) {
-      toast('请先新建会话', 'err');
-      openNewChat();
+      quickStartThenSend(text, input);
       return;
     }
+    dispatchSend(text, input);
+  }
+
+  // 首条消息直接发：自动用「第一个工作区 + 当前选择器设置」建一个会话。
+  // 以前必须先点「新建会话」填一遍表单才能说第一句话，是最高频的别扭点。
+  function quickStartThenSend(text, input) {
+    var list = (state.workspaces || []).filter(function (w) { return w.purpose !== 'task'; });
+    var pick = list[0] || (state.workspaces || [])[0] || null;
+    setStatus('正在创建会话…');
+    setSending(true);
+    req('/api/sessions', {
+      method: 'POST',
+      body: JSON.stringify({
+        workspacePath: pick ? pick.path : '',
+        purpose: 'project',
+        mode: $('mode-select').value || 'build',
+        model: currentModelValue(),
+        thoughtLevel: $('thought-select').value || null,
+      }),
+    }).then(function (r) {
+      if (!r.data.ok || !r.data.sessionId) {
+        throw new Error(r.data.error || '创建会话失败');
+      }
+      state.sessionId = r.data.sessionId;
+      rememberSession(state.sessionId);
+      updatePanelButtons();
+      loadSessions(true);
+      dispatchSend(text, input);
+    }).catch(function (err) {
+      setSending(false);
+      setStatus('');
+      toast(String((err && err.message) || err), 'err');
+    });
+  }
+
+  function dispatchSend(text, input) {
     if (!wsOpen()) {
       // 断线不丢消息：先把消息落到界面，等重连成功后自动补发
       appendUserMessage(text, false, Date.now());
@@ -1252,18 +1394,32 @@
     }
   }
 
-  $('send-btn').addEventListener('click', send);
-
-  $('stop-btn').addEventListener('click', function () {
+  // 停止当前轮次（发送按钮在运行中会变成停止按钮，Esc 也走这里）
+  function stopGeneration() {
     if (!isRunning(state.sessionId)) return;
+    var ext = !!(state.running[state.sessionId] || {}).external;
+    if (ext) {
+      toast('这一轮是外部进程在跑，面板停不掉，请等它自己结束', 'err');
+      return;
+    }
     if (!wsOpen()) {
       toast('连接中断，正在重连，请稍候再停止', 'err');
       return;
     }
-    this.disabled = true;
-    this.textContent = '正在停止…';
+    setStatus('正在停止…');
     wsSend({ type: 'cancel', sessionId: state.sessionId });
+  }
+
+  $('send-btn').addEventListener('click', function () {
+    // 一个按钮两种角色：空闲时发送，运行中变停止（聊天面板的通行做法）
+    if (this.classList.contains('is-stop')) {
+      stopGeneration();
+      return;
+    }
+    send();
   });
+
+  $('stop-btn').addEventListener('click', stopGeneration);
 
   var MQ_COARSE = window.matchMedia ? window.matchMedia('(pointer: coarse)') : null;
   if (MQ_COARSE && MQ_COARSE.matches) {
@@ -1655,7 +1811,9 @@
 
     var sub = document.createElement('div');
     sub.className = 'session-item-sub';
-    var when = s.archived ? relTime(s.archivedAt) : relTime(s.updated || s.created);
+    // 侧栏一行要塞下「时间 + 模型 + 连续 + 执行中」，用短的相对时间，
+    // 否则每段都被 ellipsis 切一半（"10 分…" 这种）。
+    var when = shortRelTime(s.archived ? s.archivedAt : (s.updated || s.created));
     var whenEl = document.createElement('span');
     whenEl.textContent = when;
     sub.appendChild(whenEl);
@@ -1679,11 +1837,11 @@
           ((pick.providerId || '') + '/' + mid);
         sub.appendChild(mt);
       }
-      // 连续执行中的会话给个小标记，一眼知道它会自己续跑
+      // 连续执行中的会话给个小标记，一眼知道它会自己续跑（只留小圆点省横向空间）
       if (s.autoRun) {
         var at = document.createElement('span');
-        at.className = 'model-tag auto';
-        at.textContent = '连续';
+        at.className = 'model-tag auto dot-only';
+        at.innerHTML = '<i class="auto-pip"></i>';
         at.title = '连续执行中：收尾后自动续跑，出错自动重试';
         sub.appendChild(at);
       }
@@ -1947,7 +2105,8 @@
     var row = document.createElement('div');
     row.className = 'row';
     row.innerHTML = '<div class="assistant"><div class="avatar">Z</div>' +
-      '<div class="assistant-body"></div></div>';
+      '<div class="assistant-body"></div></div>' +
+      '<div class="msg-actions"><button type="button" class="msg-copy" data-copy-msg="1" title="复制这条回复">复制</button></div>';
     var entry = { mid: m.id, role: 'assistant', row: row,
                   body: row.querySelector('.assistant-body'), mdEl: null, raw: '' };
     state.messageMap.set(m.id, entry);   // 先登记：part 里的 handleTool 要按 id 查它
@@ -3781,6 +3940,35 @@
 
   /* ============================================ 面板扩展：权限确认 / 文件管理 / 变更 / 任务看板 */
 
+  // ---- 主题（跟随系统 + 手动切换，存 localStorage） ----
+  var THEME_KEY = 'zcode-theme';
+
+  function applyTheme(t) {
+    document.documentElement.setAttribute('data-theme', t === 'dark' ? 'dark' : 'light');
+    var b = $('theme-btn');
+    if (b) {
+      // 用文字而不是 ☾/☀：某些系统字体缺这两个字形，会渲染成奇怪符号
+      b.textContent = t === 'dark' ? '浅色' : '深色';
+      b.title = t === 'dark' ? '切换到浅色主题' : '切换到深色主题';
+    }
+  }
+
+  function initTheme() {
+    var saved = null;
+    try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
+    if (saved !== 'dark' && saved !== 'light') {
+      saved = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches)
+        ? 'dark' : 'light';
+    }
+    applyTheme(saved);
+  }
+
+  $('theme-btn').addEventListener('click', function () {
+    var cur = document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light';
+    applyTheme(cur === 'dark' ? 'light' : 'dark');
+    try { localStorage.setItem(THEME_KEY, cur === 'dark' ? 'light' : 'dark'); } catch (e) {}
+  });
+
   var permQueue = [];
   var permShown = null;
   var permTimer = null;
@@ -3827,15 +4015,34 @@
       det.classList.add('hidden');
       $('perm-toggle-detail').classList.add('hidden');
     }
+    var card = document.querySelector('#perm-modal .perm-card');
+    if (card) card.classList.remove('expired');
+    $('perm-allow').disabled = false;
+    $('perm-deny').disabled = false;
     openModal('perm-modal');
-    var left = 12;
+    var left = state.permTimeout || 12;
     var cd = $('perm-countdown');
     cd.textContent = left + 's';
     clearInterval(permTimer);
     permTimer = setInterval(function () {
       left -= 1;
       cd.textContent = Math.max(0, left) + 's';
-      if (left <= 0) clearInterval(permTimer);
+      if (left > 0) return;
+      // 倒计时归零：服务端会在同一时刻按「拒绝」应答。这里把按钮收掉并自动
+      // 关窗，避免留一个点了必然报 410 的死弹窗挡住整个界面。
+      clearInterval(permTimer);
+      if (card) card.classList.add('expired');
+      $('perm-allow').disabled = true;
+      $('perm-deny').disabled = true;
+      cd.textContent = '已超时';
+      setTimeout(function () {
+        if (permShown === p) {
+          permShown = null;
+          closeModal('perm-modal');
+          toast('确认超时，已自动拒绝这次操作', 'err');
+          showNextPerm();
+        }
+      }, 1200);
     }, 1000);
   }
 
@@ -3876,6 +4083,7 @@
   function refreshPermissions() {
     req('/api/permissions').then(function (r) {
       if (r.data && r.data.ok) {
+        if (r.data.timeout) state.permTimeout = r.data.timeout;
         (r.data.pending || []).forEach(onPermRequest);
       }
     }).catch(function () {});
@@ -4033,8 +4241,27 @@
   });
 
   $('fd-newdir').addEventListener('click', function () {
-    var name = prompt('新目录名：');
-    if (!name) return;
+    // 用抽屉里的内联输入，别再弹浏览器原生 prompt（样式割裂、手机上还容易被拦）
+    $('fd-newdir-row').classList.remove('hidden');
+    var inp = $('fd-newdir-name');
+    inp.value = '';
+    inp.focus();
+  });
+
+  function closeNewDir() {
+    $('fd-newdir-row').classList.add('hidden');
+  }
+
+  function submitNewDir() {
+    var name = $('fd-newdir-name').value.trim();
+    if (!name) {
+      closeNewDir();
+      return;
+    }
+    if (/[\\/]/.test(name)) {
+      toast('目录名里不能有斜杠', 'err');
+      return;
+    }
     req('/api/fs/mkdir', {
       method: 'POST',
       body: JSON.stringify({ path: fdState.path.replace(/[\\/]+$/, '') + '/' + name })
@@ -4043,10 +4270,23 @@
         toast(r.data.error || '创建失败', 'err');
         return;
       }
+      closeNewDir();
       loadTree(fdState.path);
     }).catch(function () {
       toast('创建失败', 'err');
     });
+  }
+
+  $('fd-newdir-ok').addEventListener('click', submitNewDir);
+  $('fd-newdir-cancel').addEventListener('click', closeNewDir);
+  $('fd-newdir-name').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      submitNewDir();
+    } else if (e.key === 'Escape') {
+      e.stopPropagation();   // 别让 Esc 冒泡成「停止生成」
+      closeNewDir();
+    }
   });
 
   $('fd-upload').addEventListener('click', function () {
@@ -4194,9 +4434,13 @@
     }).join('');
   }
 
+  var TASK_STATUS_LABEL = { queued: '排队中', running: '执行中', done: '已完成',
+                            failed: '失败', cancelled: '已取消' };
+
   function taskCard(t) {
     var cls = t.status === 'done' ? 'ok' : (t.status === 'failed' ? 'err' :
              (t.status === 'cancelled' ? 'off' : 'run'));
+    var label = TASK_STATUS_LABEL[t.status] || t.status;
     var time = relTime(t.started_ms || t.created_ms || 0);
     var btns = '';
     if (t.session_id) btns += '<button class="text-btn slim" data-tk-open="' + t.id + '">会话</button>';
@@ -4213,8 +4457,9 @@
       body = '<div class="task-result">' + esc(String(t.result).slice(0, 280)) + '</div>';
     }
     var wsName = String(t.workspace || '').replace(/[\\/]+$/, '').split(/[\\/]/).pop();
-    return '<div class="task-card"><div class="task-title">' + esc(t.title) + '</div>' +
-      '<div class="task-meta"><span class="badge ' + cls + '">' + esc(t.status) + '</span>' +
+    return '<div class="task-card st-' + esc(t.status) + '"><div class="task-title">' +
+      esc(t.title) + '</div>' +
+      '<div class="task-meta"><span class="badge ' + cls + '">' + esc(label) + '</span>' +
       '<span class="fd-size">' + esc(wsName) + '</span>' +
       '<span class="fd-size">' + time + '</span></div>' + body +
       '<div class="task-actions">' + btns + '</div></div>';
@@ -4312,6 +4557,8 @@
   $('perm-toggle-detail').addEventListener('click', function () {
     $('perm-detail').classList.toggle('hidden');
   });
+
+  initTheme();
 
   req('/api/me').then(function (r) {
     if (r.data && r.data.ok) {

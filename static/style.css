@@ -1561,3 +1561,303 @@ select.locked, select:disabled.locked { background: var(--sidebar); color: var(-
   .drawer-panel { width: 100vw; }
   .mid-sel { max-width: none; }
 }
+
+/* ==================== 主题：深色（CSS 变量已有的直接翻转，写死 #fff 的按选择器覆盖） ==================== */
+
+:root {
+  --surface: #ffffff;        /* 卡片/输入框这类「浮在背景之上」的表面色 */
+  --shadow: 0 2px 8px rgba(16, 24, 40, .06);
+}
+
+[data-theme="dark"] {
+  --bg: #0f1115;
+  --sidebar: #15181e;
+  --sidebar-hover: #1e232b;
+  --border: #2a3038;
+  --border-soft: #22272e;
+  --text: #e6e9ee;
+  --text-dim: #a9b2be;
+  --text-mute: #7f8894;
+  --accent: #6ea8fe;
+  --accent-hover: #8dbcff;
+  --accent-soft: #17233a;
+  --accent-border: #2d4570;
+  --green: #5fce8a;
+  --green-soft: #12271b;
+  --amber: #e0b25f;
+  --amber-soft: #2a2114;
+  --red: #f0838d;
+  --red-soft: #2c1619;
+  --code-bg: #161a20;
+  --surface: #171b21;
+  --shadow: 0 2px 10px rgba(0, 0, 0, .45);
+}
+
+[data-theme="dark"] .login-card,
+[data-theme="dark"] .modal-card,
+[data-theme="dark"] .toast,
+[data-theme="dark"] .session-menu,
+[data-theme="dark"] .purpose-card,
+[data-theme="dark"] .prov-card,
+[data-theme="dark"] .fetched-item,
+[data-theme="dark"] .mini-btn,
+[data-theme="dark"] .probe-detail > div,
+[data-theme="dark"] .auto-toggle,
+[data-theme="dark"] .seg-btn.active,
+[data-theme="dark"] #prov-seg .seg-btn,
+[data-theme="dark"] .check-row code,
+[data-theme="dark"] .sched-active-body code,
+[data-theme="dark"] .task-card,
+[data-theme="dark"] .drawer-panel {
+  background: var(--surface);
+}
+
+[data-theme="dark"] .field input,
+[data-theme="dark"] select,
+[data-theme="dark"] input[type="text"],
+[data-theme="dark"] input[type="password"],
+[data-theme="dark"] input[type="number"],
+[data-theme="dark"] #mode-select,
+[data-theme="dark"] .composer-box,
+[data-theme="dark"] .model-row input,
+[data-theme="dark"] .fd-editor,
+[data-theme="dark"] .task-form textarea {
+  background: var(--code-bg);
+  color: var(--text);
+}
+
+[data-theme="dark"] .ghost-btn:hover:not(:disabled),
+[data-theme="dark"] .usage-chip:hover,
+[data-theme="dark"] .purpose-card:hover,
+[data-theme="dark"] .prov-card:hover { border-color: var(--border); }
+
+[data-theme="dark"] .bubble-user { background: #2c4a86; color: #eef3ff; }
+[data-theme="dark"] .send-btn { background: var(--accent); color: #0b1220; }
+[data-theme="dark"] .send-btn:disabled { background: #39414d; color: #8d96a3; }
+[data-theme="dark"] .cursor-blink { background: var(--accent); }
+[data-theme="dark"] .modal-mask,
+[data-theme="dark"] .drawer-mask { background: rgba(0, 0, 0, .55); }
+[data-theme="dark"] .code-block { background: var(--code-bg); border-color: var(--border-soft); }
+[data-theme="dark"] .assistant-body code:not(pre code) { background: #262c36; color: #ffb3c1; }
+[data-theme="dark"] .session-more:hover,
+[data-theme="dark"] .ws-add-session:hover { background: var(--sidebar-hover); }
+
+/* ==================== 代码块：语言标签 + 复制按钮 ==================== */
+
+.code-block {
+  position: relative;
+  margin: 10px 0;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--code-bg);
+  overflow: hidden;
+}
+.code-block > pre {
+  margin: 0;
+  border-radius: 0;
+  background: transparent;
+  overflow-x: auto;
+}
+.code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px 4px 12px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--sidebar);
+}
+.code-lang {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-mute);
+  text-transform: lowercase;
+}
+.code-copy {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 2px 8px;
+  opacity: .55;
+  transition: opacity .15s, background .15s, color .15s;
+}
+.code-block:hover .code-copy { opacity: 1; }
+.code-copy:hover { background: var(--sidebar-hover); color: var(--text); }
+.code-copy.copied { color: var(--green); border-color: var(--green); opacity: 1; }
+
+/* ==================== 消息操作（复制） ==================== */
+
+.row { position: relative; }
+.msg-actions {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity .15s;
+}
+.row:hover .msg-actions,
+.row:focus-within .msg-actions { opacity: 1; }
+.row.user .msg-actions { right: 4px; }
+.msg-copy {
+  font-size: 11.5px;
+  color: var(--text-mute);
+  background: var(--surface);
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  padding: 1px 7px;
+}
+.msg-copy:hover { color: var(--text); border-color: var(--border); }
+.msg-copy.copied { color: var(--green); border-color: var(--green); }
+@media (hover: none) {
+  .msg-actions { opacity: 1; }
+  .code-copy { opacity: 1; }
+}
+
+/* ==================== 发送/停止一体按钮 ==================== */
+
+.send-btn.is-stop { background: var(--red); }
+.send-btn.is-stop:hover { background: #b3202a; }
+.send-btn.is-stop svg { transform: none; }
+
+/* ==================== 动效（尊重 reduced-motion） ==================== */
+
+.modal:not(.hidden) .modal-card { animation: zc-pop .16s ease-out; }
+.drawer:not(.hidden) .drawer-panel { animation: zc-slide .2s ease-out; }
+.toast:not(.hidden) { animation: zc-rise .18s ease-out; }
+@keyframes zc-pop {
+  from { opacity: 0; transform: translateY(6px) scale(.985); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes zc-slide {
+  from { transform: translateX(24px); opacity: .6; }
+  to { transform: none; opacity: 1; }
+}
+@keyframes zc-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .modal:not(.hidden) .modal-card,
+  .drawer:not(.hidden) .drawer-panel,
+  .toast:not(.hidden) { animation: none; }
+  * { transition-duration: .01ms !important; }
+}
+
+/* ==================== 焦点环 / 滚动条 ==================== */
+
+button:focus-visible,
+select:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.messages::-webkit-scrollbar,
+.drawer-body::-webkit-scrollbar,
+.session-list::-webkit-scrollbar,
+.task-col::-webkit-scrollbar { width: 8px; height: 8px; }
+.messages::-webkit-scrollbar-thumb,
+.drawer-body::-webkit-scrollbar-thumb,
+.session-list::-webkit-scrollbar-thumb,
+.task-col::-webkit-scrollbar-thumb {
+  background: var(--border); border-radius: 4px;
+}
+pre::-webkit-scrollbar { height: 8px; }
+pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* ==================== 任务卡：状态色条 + 空列提示 ==================== */
+
+.task-card { border-left: 3px solid var(--border); box-shadow: var(--shadow); }
+.task-card.st-queued { border-left-color: var(--text-mute); }
+.task-card.st-running { border-left-color: var(--accent); }
+.task-card.st-done { border-left-color: var(--green); }
+.task-card.st-failed { border-left-color: var(--red); }
+.task-card.st-cancelled { border-left-color: var(--border); opacity: .75; }
+.task-col:empty::after {
+  content: '暂无任务';
+  color: var(--text-mute);
+  font-size: 12px;
+  padding: 8px 4px;
+}
+.task-card.st-running .badge.run::before {
+  content: '';
+  display: inline-block;
+  width: 6px; height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: zc-blink 1.4s ease-in-out infinite;
+}
+@keyframes zc-blink { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+/* ==================== 权限弹窗超时态 ==================== */
+
+.perm-card.expired { opacity: .72; }
+.perm-card.expired .perm-countdown { background: var(--border-soft); color: var(--text-mute); }
+
+/* ==================== 文件抽屉：内联新建目录 ==================== */
+
+.fd-newdir {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--sidebar);
+}
+.fd-newdir input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 9px;
+  font-size: 12.5px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ==================== 手机端：底部控件不再挤成一团 ==================== */
+
+@media (max-width: 760px) {
+  .messages { padding-left: 12px; padding-right: 12px; }
+  .composer { padding-left: 12px; padding-right: 12px; }
+  .composer-foot {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    gap: 6px 8px;
+  }
+  .composer-picks { flex-wrap: wrap; gap: 6px 8px; }
+  .pick > span { display: none; }          /* 手机上省掉「模型/思考」文字标签 */
+  .pick.auto-toggle > span { display: inline; }  /* 「连续」保留文字，否则只剩一个空胶囊 */
+  .pick select { max-width: 132px; font-size: 11.5px; padding: 3px 6px; }
+  .composer-right { margin-left: auto; gap: 8px; }
+  .code-block { margin-left: -6px; margin-right: -6px; }
+  .drawer-head { padding: 10px 12px; }
+  .drawer-title .drawer-crumb { max-width: 150px; }
+  .task-board { grid-template-columns: 1fr; }
+}
+
+/* 侧栏「连续执行」标记：只留一个小圆点，省横向空间 */
+.model-tag.dot-only { padding: 0 6px; gap: 0; }
+.auto-pip {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: zc-blink 1.6s ease-in-out infinite;
+}
+
+/* 深色下 .md code 的写死前景色会让代码块几乎看不见，这里按主题覆盖 */
+[data-theme="dark"] .md code { color: #d7dee8; }
+[data-theme="dark"] .code-block pre code { color: #d7dee8; }
+[data-theme="dark"] .md pre code { background: none; }
+[data-theme="dark"] .assistant-body code:not(pre code) { background: #262c36; color: #ffb3c1; }
+[data-theme="dark"] .toast { background: #2b313a; color: var(--text); }
+[data-theme="dark"] .toast.err { background: #7f2b2b; color: #ffecec; }
+[data-theme="dark"] .md table th { background: var(--sidebar); }
+[data-theme="dark"] .md table td,
+[data-theme="dark"] .md table th { border-color: var(--border); }

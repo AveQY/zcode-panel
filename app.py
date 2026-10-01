@@ -5466,8 +5466,11 @@ async def handle_ws(request):
     ws = web.WebSocketResponse(heartbeat=60, max_msg_size=4 * 1024 * 1024)
     await ws.prepare(request)
 
-    watched = set()      # 本连接订阅的 sessionId
+    watched = set()      # 本连接订阅的会话
     NOTIFY_SUBSCRIBERS.add(ws)      # 顺带接收全局事件（模型定时切换等）
+    # 实时性排查用：连上/断开都留痕。前端看到的「消息要切界面才出现」几乎都是
+    # WebSocket 没连上（被反代挡住/证书不对），日志里能直接看出是不是从没连进来。
+    log(f"WebSocket 已连接：{ip}（当前在线 {len(NOTIFY_SUBSCRIBERS)}）")
     await safe_send(ws, {"type": "ready", "appServer": bool(zc and zc.proc and zc.proc.returncode is None)})
     if scheduler:
         # 让刚连上的控制台立刻知道定时生效状态，不用等下一次广播
@@ -5588,6 +5591,8 @@ async def handle_ws(request):
             f = feed.get(sid)
             if f:
                 f.remove_subscriber(ws)
+        log(f"WebSocket 已断开：{ip}（剩余在线 {len(NOTIFY_SUBSCRIBERS)}，"
+            f"code={ws.close_code}）")
         try:
             await ws.close()
         except Exception:

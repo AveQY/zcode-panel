@@ -1203,8 +1203,11 @@
       // external：外部进程在跑（面板停不掉它，输入框要如实说明）
       if (opts && opts.external === false) delete state.running[sid].external;
       else if (opts && opts.external) state.running[sid].external = true;
+      if (sid === state.sessionId) ensureTailFallback(sid);
     } else if (state.running[sid]) {
       delete state.running[sid];
+      // 轮次收尾，这一轮不再需要兜底轮询
+      if (state.tail.sid === sid) stopTail();
     }
     if (sid === state.sessionId) syncComposer();
     renderRunningMarks();
@@ -1246,6 +1249,8 @@
       state.statusTimer = setInterval(function () {
         var el = $('thinking-elapsed');
         if (el) el.textContent = ' ' + Math.round((Date.now() - state.startedAt) / 1000) + 's';
+        // 每秒检查一次：WS 断了或长时间没帧就挂上轮询兜底（详见 ensureTailFallback）
+        ensureTailFallback(state.sessionId);
       }, 1000);
     } else {
       clearInterval(state.statusTimer);
@@ -2329,6 +2334,20 @@
     state.tail = { sid: sid, timer: null, cursor: cursor || 0,
                    busy: false, external: false, quiet: 0 };
     scheduleTail(0);
+  }
+
+  // 实时兜底：WebSocket 不可用（被反代挡住 / 断线）或长时间收不到任何帧时，
+  // 靠轮询库里的内容把结果带出来 —— 否则用户得切走再切回来才看得到回复。
+  // tail 自己会看服务端的 wsLive 判定：WS 正常时它只轮询、不覆盖流式内容。
+  var WS_SILENCE_FOR_TAIL = 8000;
+
+  function ensureTailFallback(sid) {
+    if (!sid || sid !== state.sessionId) return;
+    var t = state.tail;
+    if (t.sid === sid && t.timer) return;
+    if (!wsOpen() || Date.now() - (state.wsLastInbound || 0) > WS_SILENCE_FOR_TAIL) {
+      startTail(sid, 0);
+    }
   }
 
   function stopTail() {

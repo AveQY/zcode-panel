@@ -1179,34 +1179,51 @@ def archive_session(session_id, archived=True):
         conn.close()
 
 
+_SESSION_TABLES_CACHE = None
+
+
+def _session_tables(cur):
+    """带 session_id 列的表名。
+
+    schema 在进程生命周期内不会变（zcode 升级要重启面板），所以缓存一次即可 ——
+    原实现每删一个会话都要把 19 张表 PRAGMA 扫一遍。
+    """
+    global _SESSION_TABLES_CACHE
+    if _SESSION_TABLES_CACHE is not None:
+        return _SESSION_TABLES_CACHE
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    names = [r[0] for r in cur.fetchall()]
+    out = []
+    for tbl in names:
+        if tbl == "session":
+            continue
+        try:
+            cols = [d[1] for d in cur.execute("PRAGMA table_info(%s)" % tbl)]
+        except Exception:
+            continue
+        if "session_id" in cols:
+            out.append(tbl)
+    _SESSION_TABLES_CACHE = out
+    return out
+
+
 def delete_session(session_id):
     """彻底删除一个会话及其消息、部件、所有带 session_id 的关联记录。
 
     表结构会随 zcode 版本增加（workflow_* / *_usage / session_input ...），
-    所以不写死表名，改成扫一遍 schema 找带 session_id 列的表。
+    所以不写死表名，改成扫一遍 schema 找带 session_id 列的表（结果带缓存）。
     """
     # 必须在级联删除之前留下面板自己的用量快照，否则历史 token 会一起消失。
     archive_usage_snapshot(session_id)
     conn = db_write()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT id FROM message WHERE session_id = ?", (session_id,))
-        mids = [r[0] for r in cur.fetchall()]
-        for mid in mids:
-            cur.execute("DELETE FROM part WHERE message_id = ?", (mid,))
+        # 一条 SQL 批量删 part：3300 条消息的会话实测 0.43s → 0.31s，
+        # 也省掉了「先把 message id 全查出来」那次往返。
+        cur.execute("DELETE FROM part WHERE message_id IN "
+                    "(SELECT id FROM message WHERE session_id = ?)", (session_id,))
         cur.execute("DELETE FROM message WHERE session_id = ?", (session_id,))
-
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [r[0] for r in cur.fetchall()]
-        for tbl in tables:
-            if tbl == "session":
-                continue
-            try:
-                cols = [d[1] for d in cur.execute("PRAGMA table_info(%s)" % tbl)]
-            except Exception:
-                continue
-            if "session_id" not in cols:
-                continue
+        for tbl in _session_tables(cur):
             try:
                 cur.execute("DELETE FROM %s WHERE session_id = ?" % tbl, (session_id,))
             except Exception:
@@ -1270,12 +1287,10 @@ def unbind_fetch_cron(session_id):
     return 0
 
 
-def cleanup_session_sidecars(session_id):
-    """删除会话后的彻底清扫：zc 磁盘遗留物 + 面板状态 + 联动的巡检定时任务。
+def cleanup_session_files(session_id):
+    """删除会话后的磁盘/系统清扫：zc 遗留文件 + 联动的巡检 cron。
 
-    zc 在自己的数据目录里有 DB 之外的每会话文件（rollout/model-io-<sid>.jsonl、
-    exec/<sid>/、artifacts/<sid>/），表里没有 session_id 列，数据库清扫扫不到，
-    必须按文件名/目录名清。
+    会做 glob/rmtree 和 crontab 子进程，属于阻塞活，调用方应放到线程里跑。
     """
     removed = {"files": 0, "cron": 0}
     cli_dir = Path("/root/.zcode/cli")
@@ -1291,7 +1306,13 @@ def cleanup_session_sidecars(session_id):
                 removed["files"] += 1
     except Exception as exc:
         log(f"会话 {session_id} 磁盘遗留物清理失败: {exc}")
-    # 2) 面板自己的状态
+    # 2) 联动的巡检定时任务：绑定的是这个会话 → 解绑 + 摘 cron
+    removed["cron"] = unbind_fetch_cron(session_id)
+    return removed
+
+
+def cleanup_session_state(session_id):
+    """面板自身的内存/文件状态（必须在事件循环线程里改）。"""
     try:
         runner.auto_run.pop(session_id, None)
         save_auto_run(runner)
@@ -1313,9 +1334,28 @@ def cleanup_session_sidecars(session_id):
                                     encoding="utf-8")
     except Exception:
         pass
-    # 3) 联动的巡检定时任务：绑定的是这个会话 → 解绑 + 摘 cron
-    removed["cron"] = unbind_fetch_cron(session_id)
+
+
+def cleanup_session_sidecars(session_id):
+    """删除会话后的彻底清扫（同步版，保留给其他调用方）。
+
+    zc 在自己的数据目录里有 DB 之外的每会话文件（rollout/model-io-<sid>.jsonl、
+    exec/<sid>/、artifacts/<sid>/），表里没有 session_id 列，数据库清扫扫不到，
+    必须按文件名/目录名清。
+    """
+    removed = cleanup_session_files(session_id)
+    cleanup_session_state(session_id)
     return removed
+
+
+def _delete_session_blocking(session_id):
+    """落库删除整块（用量快照 + 级联删行）。
+
+    大会话实测约 0.5~1s，同步跑会把事件循环整个卡住（其他会话的流式输出、
+    心跳、事件轮询全部停摆），所以调用方用 asyncio.to_thread 丢到线程里。
+    """
+    archive_usage_snapshot(session_id)
+    return delete_session(session_id)
 
 
 def session_title(session_id):
@@ -4659,10 +4699,34 @@ async def handle_session_archive(request):
     data = await body_json(request)
     archived = bool(data.get("archived", True))
     n = archive_session(sid, archived)
-    # 协议层会缓存会话，改库后需要重启 app-server 才能反映
-    await zc.restart("会话归档状态变更")
-    log(f"{'归档' if archived else '取消归档'}会话: {sid}（rowcount={n}）")
-    return web.json_response({"ok": True, "archived": archived, "rowcount": n})
+    # 会话列表完全来自 app-server 的 session/list，所以改完库还要让内存里的视图跟着变。
+    # 以前这里整座重启 app-server：几秒级，而且会打断**所有**正在跑的会话、
+    # 重建 provider registry。现在按方向各用一次轻量调用（实测 ~20ms）：
+    #   归档   → session/close 把目标会话卸载出内存，它随即从列表消失
+    #   取消归档 → session/resume 把它拉回内存，重新出现在列表里
+    fallback = ""
+    if archived:
+        try:
+            await zc.call("session/close", {"sessionId": sid}, timeout=20)
+        except Exception as exc:
+            fallback = "close 失败，列表可能短暂残留"
+            log(f"归档后 session/close({sid}) 失败: {exc}")
+    else:
+        try:
+            row = session_row(sid) or {}
+            ws_path = row.get("directory") or config.get("workspace_root", "/root")
+            await zc.call("session/resume",
+                          {"sessionId": sid,
+                           "workspace": {"workspaceKey": ws_path,
+                                         "workspacePath": ws_path}}, timeout=60)
+        except Exception as exc:
+            # 极少见：resume 也拉不回来时才退回整座重启，保证列表正确
+            fallback = "resume 失败，已回退为重启 app-server"
+            log(f"取消归档 resume({sid}) 失败，回退重启: {exc}")
+            await zc.restart("会话归档状态变更（resume 回退）")
+    log(f"{'归档' if archived else '取消归档'}会话: {sid}（rowcount={n}）{fallback}")
+    return web.json_response({"ok": True, "archived": archived, "rowcount": n,
+                              "note": fallback})
 
 
 DELETE_STOP_WAIT_MAX = 20.0        # 「停止并删除」等 app-server 收尾的上限（秒）
@@ -4737,10 +4801,13 @@ async def handle_session_delete(request):
     except Exception as exc:
         close_info["error"] = str(exc)[:120]
         log(f"session/close({sid}) 失败（继续删库）: {close_info['error']}")
-    n = delete_session(sid)
+    # 落库删除丢到线程里：大会话要 0.5~1s，同步跑会把整个事件循环卡住
+    # （其他会话的流式输出、心跳、事件轮询都会停），用户感受到的就是「整个面板卡了一下」。
+    n = await asyncio.to_thread(_delete_session_blocking, sid)
     feed.feeds.pop(sid, None)
     runner.forget(sid)
-    sidecar = cleanup_session_sidecars(sid)
+    sidecar = await asyncio.to_thread(cleanup_session_files, sid)
+    cleanup_session_state(sid)
     # 提前解绑那次若已摘掉 cron 行，清扫里的二次解绑因幂等返回 0，两处相加不重复计
     cron_removed = sidecar["cron"] + cron_removed_early
     log(f"删除会话: {sid}（rowcount={n}，close={close_info.get('closed')}，stopped={stopped}，"

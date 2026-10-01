@@ -19,7 +19,7 @@
   } catch (e) {}
 })();
 </script>
-<link rel="stylesheet" href="/static/style.css?v=20261001b">
+<link rel="stylesheet" href="/static/style.css?v=20261001e">
 </head>
 <body>
 
@@ -122,9 +122,17 @@
         <button class="text-btn" id="sched-banner-revert">恢复原模型</button>
         <button class="icon-btn" id="sched-banner-detail" title="查看全部定时规则">&#8943;</button>
       </div>
+      <div id="send-queue" class="send-queue hidden"></div>
+      <div id="changes-bar" class="changes-bar hidden">
+        <span id="changes-bar-text" class="cb-text"></span>
+        <button id="changes-bar-open" class="text-btn" type="button">查看</button>
+        <button id="changes-bar-close" class="icon-btn" type="button" title="知道了">&#10005;</button>
+      </div>
       <div class="composer-box">
         <textarea id="input" rows="1" placeholder="输入消息…（Enter 发送，Shift + Enter 换行）"
                   spellcheck="false"></textarea>
+        <button id="queue-btn" class="queue-btn hidden" type="button"
+                title="本轮执行中：把这条消息排进队列，结束后自动发送">队列</button>
         <button id="send-btn" class="send-btn" title="发送">
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
             <path d="M4 12l16-8-6 8 6 8-16-8z" fill="currentColor"/>
@@ -399,6 +407,41 @@
         </div>
         <div class="setting-item">
           <div class="setting-text">
+            <b>工具白名单</b>
+            <span>列出的工具直接放行、不弹确认（按前缀匹配）。在确认弹窗勾「总是允许」也会加进来；配合「自动放行」关闭使用</span>
+            <div id="allow-tools-list" class="allow-list"></div>
+            <div class="allow-add">
+              <input id="allow-tool-input" type="text" placeholder="工具名，如 Bash 或 fs_write"
+                     maxlength="100" autocomplete="off" spellcheck="false">
+              <button id="allow-tool-add" class="ghost-btn slim" type="button">添加</button>
+            </div>
+          </div>
+        </div>
+        <div class="setting-item">
+          <div class="setting-text">
+            <b>声音提醒</b>
+            <span>权限待批准、后台会话/任务完成或出错时播放提示音</span>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="set-notify-sound">
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="setting-item">
+          <div class="setting-text">
+            <b>桌面通知</b>
+            <span>页面在后台时用系统通知提醒（首次开启会请求浏览器授权；需 HTTPS 访问）</span>
+          </div>
+          <div class="row-inline">
+            <button id="set-notify-test" class="text-btn" type="button">试听</button>
+            <label class="switch">
+              <input type="checkbox" id="set-notify-desktop">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="setting-item">
+          <div class="setting-text">
             <b>任务并行数</b>
             <span>任务看板里同时执行的任务数。同一工作区并行跑多个任务可能互相覆盖文件，谨慎调高</span>
           </div>
@@ -634,6 +677,10 @@
       </div>
       <p id="perm-reason" class="confirm-text"></p>
       <pre id="perm-detail" class="code-box perm-detail hidden"></pre>
+      <label class="perm-always" id="perm-always-wrap">
+        <input type="checkbox" id="perm-always">
+        <span id="perm-always-label">总是允许这个工具</span>
+      </label>
     </div>
     <div class="modal-foot">
       <button id="perm-toggle-detail" class="text-btn">详情</button>
@@ -699,7 +746,12 @@
     </div>
     <div class="drawer-body">
       <div id="ch-status" class="ch-status"></div>
+      <div id="ch-files" class="ch-files"></div>
       <pre id="ch-diff" class="ch-diff code-box"></pre>
+    </div>
+    <div class="ch-foot hidden" id="ch-foot">
+      <span class="form-hint grow" id="ch-foot-hint">在文件下写评审意见，点右侧按钮整批发回给 agent</span>
+      <button id="ch-send" class="primary-btn slim" type="button">把评审意见发给 agent</button>
     </div>
   </div>
 </div>
@@ -739,6 +791,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js?v=20261001d"></script>
+<script src="/static/app.js?v=20261001e"></script>
 </body>
 </html>

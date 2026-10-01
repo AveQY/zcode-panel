@@ -204,6 +204,7 @@ DEFAULT_CONFIG = {
     "default_mode": "build",
     "default_thought_level": "",
     "auto_approve": True,
+    "permission_allow_tools": [],
     "workspace_root": "/root",
     "task_parallel": 1,
 }
@@ -1509,10 +1510,18 @@ class ZCodeServer:
         if method == "session/requestRuntimePreferences":
             result = dict(RUNTIME_PREFERENCES)
         elif method == "interaction/requestPermission":
-            allow = bool(config.get("auto_approve", True))
+            # 工具白名单（借鉴 opcode 的「审批前移」）：规则命中的直接放行，
+            # 不进网页确认弹窗。规则按前缀匹配，弹窗里勾「总是允许」会加进来。
+            tool_name = str(params.get("toolName") or "")
+            hit = next((r for r in config.get("permission_allow_tools") or []
+                        if r and tool_name.startswith(r)), None)
+            allow = bool(config.get("auto_approve", True)) or hit is not None
             if allow:
-                result = {"decision": "allow",
-                          "reason": "网页控制台自动放行"}
+                if hit and not config.get("auto_approve", True):
+                    reason = f"命中工具白名单（{hit}）"
+                else:
+                    reason = "网页控制台自动放行"
+                result = {"decision": "allow", "reason": reason}
                 self.permission_events.append({
                     "at": int(time.time() * 1000),
                     "toolName": params.get("toolName"),
@@ -1521,7 +1530,8 @@ class ZCodeServer:
                     "decision": result["decision"],
                 })
                 del self.permission_events[:-50]
-                log(f"权限请求：{params.get('toolName')} risk={params.get('riskLevel')} -> {result['decision']}")
+                log(f"权限请求：{params.get('toolName')} risk={params.get('riskLevel')} -> {result['decision']}"
+                    + (f"（白名单 {hit}）" if hit and not config.get("auto_approve", True) else ""))
                 await self._write({"id": mid, "result": result})
             else:
                 # 交互确认：不能在这里 await 等用户（会卡死 stdio 读线程），
@@ -4940,6 +4950,7 @@ async def handle_settings_security(request):
         "autoApprove": bool(config.get("auto_approve", True)),
         "defaultMode": config.get("default_mode", "build"),
         "workspaceRoot": config.get("workspace_root", "/root"),
+        "allowTools": list(config.get("permission_allow_tools") or []),
         "permissions": (zc.permission_events if zc else [])[-20:],
     })
 
@@ -4988,12 +4999,22 @@ async def handle_settings_misc(request):
                 config["task_parallel"] = n
         except Exception:
             pass
+    if "permissionAllowTools" in data:
+        raw = data["permissionAllowTools"]
+        if isinstance(raw, list):
+            tools = []
+            for t in raw[:50]:
+                t = str(t).strip()[:100]
+                if t and t not in tools:
+                    tools.append(t)
+            config["permission_allow_tools"] = tools
     save_config()
     return web.json_response({"ok": True, "config": {
         "autoApprove": config.get("auto_approve"),
         "maxAttempts": config.get("max_attempts"),
         "defaultMode": config.get("default_mode"),
         "taskParallel": config.get("task_parallel", 1),
+        "permissionAllowTools": list(config.get("permission_allow_tools") or []),
     }})
 
 

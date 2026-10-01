@@ -52,6 +52,12 @@
     // --- 实时尾随（外部进程跑的会话只能靠读库刷新）---
     tail: { sid: null, timer: null, cursor: 0, busy: false, external: false, quiet: 0 },
     localUserMsgs: [],          // 本地已渲染、还没绑上库里 id 的用户消息（防重复）
+    sendQueue: [],              // 轮次执行中排队的消息（收尾自动续发）
+    sendQueueFor: null,         // 队列属于哪个会话
+    allowTools: [],             // 权限工具白名单（服务端 permission_allow_tools）
+    chgBaseline: null,          // 本轮开始时的工作区改动基线 {sid, sig}
+    chgSeq: 0,                  // 基线请求代号：切轮/切会话后丢弃过期结果
+    chgComments: {},            // 变更抽屉里未发送的评审意见 {文件路径: 文本}
   };
 
   var WS_COLLAPSE_KEY = 'zwc_ws_collapsed';
@@ -639,6 +645,75 @@
     return false;
   }
 
+  /* ---- 通知：音效 + 桌面提醒（借鉴 vibe-kanban / claudecodeui） ---- */
+  var NOTIFY_KEY = 'zcode-notify';
+
+  function notifyPrefs() {
+    try { return JSON.parse(localStorage.getItem(NOTIFY_KEY)) || {}; }
+    catch (e) { return {}; }
+  }
+
+  function saveNotifyPrefs(p) {
+    try { localStorage.setItem(NOTIFY_KEY, JSON.stringify(p)); } catch (e) {}
+  }
+
+  function unlockAudio() {
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return null;
+      if (!state.audioCtx) state.audioCtx = new AC();
+      if (state.audioCtx.state === 'suspended') state.audioCtx.resume();
+      return state.audioCtx;
+    } catch (e) { return null; }
+  }
+
+  // done 上行双音（完成）、perm 三连短音（等你处理）、err 下行双音（出错）
+  function beep(kind) {
+    if (!notifyPrefs().sound) return;
+    var ctx = unlockAudio();
+    if (!ctx) return;
+    try {
+      var seq = kind === 'perm' ? [[880, 0], [880, 0.15], [1175, 0.3]]
+               : kind === 'err'  ? [[520, 0], [330, 0.16]]
+               : [[660, 0], [990, 0.14]];
+      var t0 = ctx.currentTime + 0.02;
+      seq.forEach(function (s) {
+        var o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = 'sine';
+        o.frequency.value = s[0];
+        g.gain.setValueAtTime(0.0001, t0 + s[1]);
+        g.gain.exponentialRampToValueAtTime(0.22, t0 + s[1] + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + s[1] + 0.22);
+        o.connect(g);
+        g.connect(ctx.destination);
+        o.start(t0 + s[1]);
+        o.stop(t0 + s[1] + 0.26);
+      });
+    } catch (e) {}
+  }
+
+  function notifyDesktop(title, body) {
+    if (!notifyPrefs().desktop) return;
+    try {
+      if (!('Notification' in window) || Notification.permission !== 'granted') return;
+      var n = new Notification(title, { body: body, tag: 'zcode-panel' });
+      n.onclick = function () { window.focus(); n.close(); };
+    } catch (e) {}
+  }
+
+  function alertUser(title, body, kind) {
+    beep(kind);
+    notifyDesktop(title, body);
+  }
+
+  // 浏览器要求音频先有用户手势：页面第一次交互就把 AudioContext 解锁
+  ['pointerdown', 'keydown'].forEach(function (ev) {
+    document.addEventListener(ev, function once() {
+      if (notifyPrefs().sound) unlockAudio();
+      document.removeEventListener(ev, once);
+    }, { once: true });
+  });
+
   // 切走之后仍在后台跑的会话：只更新它的状态并提示，绝不写进当前视图
   function handleBackgroundEvent(d) {
     var sid = d.sessionId;
@@ -652,6 +727,7 @@
       case 'done':
         markRunning(sid, false);
         toast('「' + titleOf(sid) + '」已在后台执行完成', 'ok');
+        alertUser('后台执行完成', '「' + titleOf(sid) + '」已完成本轮', 'done');
         loadSessions(true);
         loadUsage(null, true);
         break;
@@ -663,6 +739,7 @@
       case 'error':
         markRunning(sid, false);
         toast('「' + titleOf(sid) + '」' + (d.message || '出错了'), 'err');
+        alertUser('后台执行失败', '「' + titleOf(sid) + '」' + (d.message || '出错了'), 'err');
         loadSessions(true);
         break;
       case 'title':
@@ -823,6 +900,9 @@
         }
         setStatus('');
         toast(d.message || '出错了', 'err');
+        if (document.hidden) {
+          alertUser('执行出错', d.message || '「' + titleOf(state.sessionId) + '」本轮出错了', 'err');
+        }
         clearCursors();
         break;
     }
@@ -1174,6 +1254,10 @@
     // 一轮跑完刷新右上角的今日用量（用量行可能晚一两秒落库，再补一次）
     loadUsage(null, true);
     setTimeout(function () { loadUsage(null, true); }, 3000);
+    // 人不在这个标签页时：完成也提醒（在看就别吵）
+    if (document.hidden) {
+      alertUser('生成完成', '「' + titleOf(state.sessionId) + '」本轮已完成', 'done');
+    }
   }
 
   /* ============================================ 状态与发送 */
@@ -1199,15 +1283,25 @@
   function markRunning(sid, on, opts) {
     if (!sid) return;
     if (on) {
+      var fresh = !state.running[sid];
       if (!state.running[sid]) state.running[sid] = { since: Date.now() };
       // external：外部进程在跑（面板停不掉它，输入框要如实说明）
       if (opts && opts.external === false) delete state.running[sid].external;
       else if (opts && opts.external) state.running[sid].external = true;
       if (sid === state.sessionId) ensureTailFallback(sid);
+      // 新一轮开始：收起上一轮的改动提示，并记一份基线，收尾时对比出「这一轮改了什么」
+      if (fresh && sid === state.sessionId) {
+        hideChangesBar();
+        captureChangesBaseline(sid);
+      }
     } else if (state.running[sid]) {
       delete state.running[sid];
       // 轮次收尾，这一轮不再需要兜底轮询
       if (state.tail.sid === sid) stopTail();
+      if (sid === state.sessionId) {
+        // 稍等一下再收尾处理：让库里/工作区的落盘先稳定
+        setTimeout(onTurnSettled, 900);
+      }
     }
     if (sid === state.sessionId) syncComposer();
     renderRunningMarks();
@@ -1256,6 +1350,7 @@
       clearInterval(state.statusTimer);
       state.statusTimer = null;
     }
+    syncQueueBtn();
   }
 
   // 兼容旧调用：不传 sid 就作用于当前会话
@@ -1316,12 +1411,109 @@
   function send() {
     var input = $('input');
     var text = input.value.trim();
-    if (!text || isRunning(state.sessionId)) return;
+    if (!text) return;
+    // 轮次跑着也能接着打字：进队列，收尾自动续发（以前这里直接吞掉输入，最反人类）
+    if (isRunning(state.sessionId)) {
+      enqueueSend(text);
+      return;
+    }
     if (!state.sessionId) {
       quickStartThenSend(text, input);
       return;
     }
     dispatchSend(text, input);
+  }
+
+  /* ---- 消息排队（借鉴 claudecodeui QueuedMessageCard / opcode PromptQueue） ---- */
+  function enqueueSend(text) {
+    if (!state.sessionId || !text) return;
+    if (!state.sendQueue.length) state.sendQueueFor = state.sessionId;
+    state.sendQueue.push(text);
+    $('input').value = '';
+    $('input').style.height = 'auto';
+    renderSendQueue();
+    syncQueueBtn();
+    toast('本轮执行中：已加入待发送队列，结束后自动发送', 'ok');
+  }
+
+  function renderSendQueue() {
+    var box = $('send-queue');
+    if (!box) return;
+    var q = state.sendQueue || [];
+    if (!q.length || state.sendQueueFor !== state.sessionId) {
+      box.classList.add('hidden');
+      box.innerHTML = '';
+      return;
+    }
+    box.classList.remove('hidden');
+    var html = '<span class="sq-label">待发送 ' + q.length + ' 条</span>';
+    q.forEach(function (t, i) {
+      var prev = t.length > 36 ? t.slice(0, 36) + '…' : t;
+      html += '<span class="sq-item" data-sq-edit="' + i + '" title="点击放回输入框编辑">' +
+        esc(prev) +
+        '<button class="sq-del" data-sq-del="' + i + '" title="移出队列">&times;</button></span>';
+    });
+    html += '<button class="text-btn slim" data-sq-clear="1">清空</button>';
+    box.innerHTML = html;
+  }
+
+  $('send-queue').addEventListener('click', function (e) {
+    var del = e.target.closest('[data-sq-del]');
+    if (del) {
+      state.sendQueue.splice(+del.getAttribute('data-sq-del'), 1);
+      if (!state.sendQueue.length) state.sendQueueFor = null;
+      renderSendQueue();
+      return;
+    }
+    if (e.target.closest('[data-sq-clear]')) {
+      state.sendQueue = [];
+      state.sendQueueFor = null;
+      renderSendQueue();
+      return;
+    }
+    var it = e.target.closest('[data-sq-edit]');
+    if (it) {
+      var i = +it.getAttribute('data-sq-edit');
+      var input = $('input');
+      input.value = state.sendQueue[i];
+      state.sendQueue.splice(i, 1);
+      if (!state.sendQueue.length) state.sendQueueFor = null;
+      renderSendQueue();
+      syncQueueBtn();
+      input.focus();
+    }
+  });
+
+  function sendNextQueued() {
+    var q = state.sendQueue || [];
+    if (!q.length) return;
+    if (state.sendQueueFor !== state.sessionId) return;   // 队列跟着会话走
+    if (isRunning(state.sessionId)) return;               // 又开跑了，等下一次收尾
+    var text = q.shift();
+    if (!q.length) state.sendQueueFor = null;
+    renderSendQueue();
+    dispatchSend(text, $('input'));
+  }
+
+  // 手机端发送键被「停止」占着，输入框有字时补一个「队列」小按钮
+  function syncQueueBtn() {
+    var b = $('queue-btn');
+    if (!b) return;
+    var show = isRunning(state.sessionId) && !!$('input').value.trim();
+    b.classList.toggle('hidden', !show);
+  }
+
+  $('queue-btn').addEventListener('click', function () {
+    if (!isRunning(state.sessionId)) { syncQueueBtn(); return; }
+    enqueueSend($('input').value.trim());
+  });
+
+  // 轮次收尾后的统一处理：队列续发 + 把这一轮的工作区改动主动呈现出来
+  function onTurnSettled() {
+    var sid = state.sessionId;
+    if (!sid || isRunning(sid)) return;
+    sendNextQueued();          // 续发会开新一轮，收尾时还会再进来
+    checkWorkspaceChanges(sid);
   }
 
   // 首条消息直接发：自动用「第一个工作区 + 当前选择器设置」建一个会话。
@@ -1504,6 +1696,7 @@
   $('input').addEventListener('input', function () {
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 200) + 'px';
+    syncQueueBtn();
     // 还没开会话（欢迎页）：一动手打字就在后台预建，等按下回车时通常已经就绪，
     // 首条消息的 1~2 秒创建等待就消失了
     if (!state.sessionId) prewarmSession(firstWorkspacePath());
@@ -2062,6 +2255,7 @@
     renderActive();
     // 先按已知状态摆好输入区（这个会话可能正在后台跑，那就不该让再发消息）
     syncComposer();
+    renderSendQueue();
     updatePanelButtons();
 
     clearMessages();
@@ -2133,6 +2327,11 @@
         setStatus('');
       }
       if (isMobileLayout()) setSidebarOpen(false);
+
+      // 切回来时如果它已经空闲：把离开期间攒下的队列续发、改动提示补上
+      setTimeout(function () {
+        if (state.sessionId === sid && !isRunning(sid)) onTurnSettled();
+      }, 700);
     });
   }
 
@@ -2858,6 +3057,13 @@
       $('set-key-input').value = d.key || '';
       $('set-key-input').type = 'password';
       $('set-auto-approve').checked = !!d.autoApprove;
+      state.allowTools = d.allowTools || [];
+      renderAllowTools();
+      // 通知开关存在本机（localStorage）：换浏览器要重新勾一次
+      var np = notifyPrefs();
+      $('set-notify-sound').checked = !!np.sound;
+      $('set-notify-desktop').checked = !!np.desktop &&
+        (!('Notification' in window) || Notification.permission === 'granted');
       $('set-max-attempts').value = d.maxAttempts;
       $('set-ws-root').textContent = d.workspaceRoot || '/root';
       if (d.defaultMode) $('set-default-mode').value = d.defaultMode;
@@ -2880,6 +3086,128 @@
         '<span>' + esc(p.riskLevel || '') + '</span></div>';
     }).join('');
   }
+
+  // ---- 工具白名单（借鉴 opcode「审批前移」）：命中的不再弹确认 ----
+  function renderAllowTools() {
+    var box = $('allow-tools-list');
+    if (!box) return;
+    var list = state.allowTools || [];
+    if (!list.length) {
+      box.innerHTML = '<span class="allow-empty">暂无白名单：确认弹窗里勾「总是允许」，或在右侧输入工具名添加</span>';
+      return;
+    }
+    box.innerHTML = list.map(function (t) {
+      return '<span class="allow-chip"><code>' + esc(t) + '</code>' +
+        '<button class="allow-del" data-tool="' + esc(t) + '" title="移出白名单">&times;</button></span>';
+    }).join('');
+  }
+
+  function saveAllowTools() {
+    return req('/api/settings/misc', {
+      method: 'POST',
+      body: JSON.stringify({ permissionAllowTools: state.allowTools || [] }),
+    }).then(function (r) {
+      if (!r.data.ok) throw new Error(r.data.error || '保存失败');
+      return r;
+    });
+  }
+
+  function addToAllowTools(tool) {
+    tool = String(tool || '').trim();
+    if (!tool) return Promise.resolve();
+    if ((state.allowTools || []).indexOf(tool) >= 0) return Promise.resolve();
+    state.allowTools.push(tool);
+    renderAllowTools();
+    return saveAllowTools().catch(function (e) {
+      // 存不上就把界面退回去，不能让白名单看起来生效了其实没有
+      state.allowTools = state.allowTools.filter(function (x) { return x !== tool; });
+      renderAllowTools();
+      toast('白名单保存失败：' + (e.message || '网络异常'), 'err');
+      throw e;
+    });
+  }
+
+  $('allow-tool-add').addEventListener('click', function () {
+    var v = $('allow-tool-input').value.trim();
+    if (!v) return;
+    addToAllowTools(v).then(function () {
+      toast('已加入白名单：这类工具将直接放行', 'ok');
+    }).catch(function () {});
+    $('allow-tool-input').value = '';
+  });
+
+  $('allow-tool-input').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      $('allow-tool-add').click();
+    }
+  });
+
+  $('allow-tools-list').addEventListener('click', function (e) {
+    var b = e.target.closest('.allow-del');
+    if (!b) return;
+    var t = b.getAttribute('data-tool');
+    var prev = (state.allowTools || []).slice();
+    state.allowTools = prev.filter(function (x) { return x !== t; });
+    renderAllowTools();
+    saveAllowTools().catch(function () {
+      state.allowTools = prev;
+      renderAllowTools();
+      toast('白名单保存失败', 'err');
+    });
+  });
+
+  // ---- 通知开关（音效 / 桌面提醒）----
+  $('set-notify-sound').addEventListener('change', function () {
+    var p = notifyPrefs();
+    p.sound = this.checked ? 1 : 0;
+    saveNotifyPrefs(p);
+    if (this.checked) {
+      unlockAudio();
+      beep('done');
+      toast('已开启声音提醒', 'ok');
+    }
+  });
+
+  $('set-notify-desktop').addEventListener('change', function () {
+    var cb = this;
+    if (!cb.checked) {
+      var p0 = notifyPrefs();
+      p0.desktop = 0;
+      saveNotifyPrefs(p0);
+      return;
+    }
+    if (!('Notification' in window)) {
+      toast('这个浏览器不支持桌面通知', 'err');
+      cb.checked = false;
+      return;
+    }
+    Notification.requestPermission().then(function (perm) {
+      var p = notifyPrefs();
+      if (perm === 'granted') {
+        p.desktop = 1;
+        saveNotifyPrefs(p);
+        notifyDesktop('通知已开启', '任务完成、权限待批时会用系统通知提醒你');
+        toast('桌面通知已开启', 'ok');
+      } else {
+        p.desktop = 0;
+        saveNotifyPrefs(p);
+        cb.checked = false;
+        toast('浏览器未授权桌面通知', 'err');
+      }
+    });
+  });
+
+  $('set-notify-test').addEventListener('click', function () {
+    unlockAudio();
+    var p = notifyPrefs();
+    p.sound = 1;
+    saveNotifyPrefs(p);
+    $('set-notify-sound').checked = true;
+    beep('perm');
+    notifyDesktop('测试通知', '这是一条来自 ZCode 面板的测试提醒');
+  });
+
 
   $('set-general-save').addEventListener('click', function () {
     var btn = this;
@@ -4117,7 +4445,16 @@
     if (card) card.classList.remove('expired');
     $('perm-allow').disabled = false;
     $('perm-deny').disabled = false;
+    // 「总是允许」勾选框：每次显示都复位，并把工具名写进文案
+    var always = $('perm-always');
+    if (always) {
+      always.checked = false;
+      $('perm-always-label').textContent = '总是允许「' + (p.toolName || '该工具') + '」，之后不再询问';
+    }
     openModal('perm-modal');
+    // 12 秒窗口很短，人可能不在这个标签页：声音 + 系统通知拉回来
+    alertUser('操作确认待处理',
+      (p.toolName || '工具调用') + '：' + (p.reason || '等待你的批准'), 'perm');
     var left = state.permTimeout || 12;
     var cd = $('perm-countdown');
     cd.textContent = left + 's';
@@ -4153,14 +4490,24 @@
   function resolvePerm(decision) {
     if (!permShown) return;
     var pid = permShown.id;
+    var tool = permShown.toolName || '';
+    var always = decision === 'allow' && tool &&
+      $('perm-always') && $('perm-always').checked;
     permShown = null;
     clearInterval(permTimer);
     closeModal('perm-modal');
-    req('/api/permissions/' + encodeURIComponent(pid), {
-      method: 'POST',
-      body: JSON.stringify({ decision: decision })
+    // 勾了「总是允许」：先把工具写进白名单（失败不拦着本次放行），再应答本次
+    var chain = always
+      ? addToAllowTools(tool).catch(function () {})
+      : Promise.resolve();
+    chain.then(function () {
+      return req('/api/permissions/' + encodeURIComponent(pid), {
+        method: 'POST',
+        body: JSON.stringify({ decision: decision })
+      });
     }).then(function (r) {
       if (!r.data.ok) toast(r.data.error || '确认请求已过期', 'err');
+      else if (always) toast('已允许，并把「' + tool + '」加入了白名单', 'ok');
       else toast(decision === 'allow' ? '已允许本次操作' : '已拒绝本次操作');
       showNextPerm();
     }).catch(function () {
@@ -4439,6 +4786,9 @@
     if (!s) return;
     $('ch-status').innerHTML = '<div class="fd-empty">加载中…</div>';
     $('ch-diff').textContent = '';
+    $('ch-diff').classList.remove('hidden');
+    $('ch-files').innerHTML = '';
+    $('ch-foot').classList.add('hidden');
     req('/api/sessions/' + encodeURIComponent(s.id) + '/changes').then(function (r) {
       if (!r.data.ok) {
         $('ch-status').innerHTML = '<div class="fd-empty">' + esc(r.data.error || '读取失败') + '</div>';
@@ -4451,9 +4801,9 @@
               return '<div class="ch-item"><b>' + esc(i.status) + '</b> ' + esc(i.path) + '</div>';
             }).join('') + '</div>'
           : '<div class="fd-empty">工作区没有未提交的变更</div>';
-        $('ch-diff').textContent = r.data.diff ||
-          '（没有可显示的 diff。新增文件的内容可以在「文件」里查看）';
-        if (r.data.truncated) $('ch-diff').textContent += '\n…（diff 过大已截断）';
+        // git 模式：按文件切成卡片 + 评审意见输入框（评论会整批发回给 agent）
+        $('ch-diff').classList.add('hidden');
+        renderDiffFiles(r.data.diff || '', r.data.truncated);
       } else {
         var files = r.data.files || [];
         $('ch-status').innerHTML =
@@ -4462,12 +4812,158 @@
             return '<div class="ch-item clickable" data-path="' + esc(f.path) + '"><span class="grow">' +
               esc(f.path) + '</span><span class="fd-size">' + relTime(f.mtime) + '</span></div>';
           }).join('') + '</div>';
+        $('ch-files').innerHTML = '';
+        $('ch-foot').classList.add('hidden');
         $('ch-diff').textContent = files.length ? '' : '（近期没有修改过的文件）';
       }
     }).catch(function () {
       $('ch-status').innerHTML = '<div class="fd-empty">读取失败</div>';
     });
   }
+
+  // 按文件切分 unified diff，一文件一卡（可折叠），卡下带评审意见输入框
+  function renderDiffFiles(diff, truncated) {
+    var box = $('ch-files');
+    if (!diff.trim()) {
+      box.innerHTML = '<div class="fd-empty">没有可显示的 diff（新增文件的内容可以在「文件」里查看）</div>';
+      $('ch-foot').classList.add('hidden');
+      return;
+    }
+    var chunks = [];
+    var re = /^diff --git a\/(.+?) b\/(.+)$/gm;
+    var ms = [], m;
+    while ((m = re.exec(diff))) ms.push({ path: m[2], idx: m.index });
+    if (!ms.length) {
+      chunks = [{ path: '（工作区改动）', body: diff }];
+    } else {
+      ms.forEach(function (s, i) {
+        var end = i + 1 < ms.length ? ms[i + 1].idx : diff.length;
+        chunks.push({ path: s.path, body: diff.slice(s.idx, end).replace(/\n+$/, '') });
+      });
+    }
+    box.innerHTML = chunks.map(function (c) {
+      var add = 0, del = 0;
+      c.body.split('\n').forEach(function (l) {
+        if (l.charAt(0) === '+' && l.slice(0, 3) !== '+++') add++;
+        else if (l.charAt(0) === '-' && l.slice(0, 3) !== '---') del++;
+      });
+      var cmt = state.chgComments[c.path] || '';
+      return '<div class="ch-file">' +
+        '<div class="ch-file-head"><span class="ch-caret">&#9662;</span>' +
+        '<code class="grow">' + esc(c.path) + '</code>' +
+        '<span class="ch-add">+' + add + '</span><span class="ch-del">&minus;' + del + '</span></div>' +
+        '<div class="ch-file-bodywrap">' +
+        '<pre class="ch-file-body code-box" data-chdiff="' + esc(c.path) + '">' + esc(c.body) + '</pre>' +
+        '<textarea class="ch-comment" data-chcmt="' + esc(c.path) + '" rows="2" ' +
+        'placeholder="给这个文件的评审意见（点 diff 里的行可自动带上行号）…">' + esc(cmt) + '</textarea>' +
+        '</div></div>';
+    }).join('') + (truncated ? '<div class="ch-note">diff 过大已截断，只显示了前一部分</div>' : '');
+    $('ch-foot').classList.remove('hidden');
+    updateChFootHint();
+  }
+
+  // 点 diff 正文的某一行 → 换算成该行在新（删除行取原）文件里的行号
+  function diffLineAt(pre, x, y) {
+    var node = null, offset = 0;
+    try {
+      if (document.caretRangeFromPoint) {
+        var r = document.caretRangeFromPoint(x, y);
+        if (r) { node = r.startContainer; offset = r.startOffset; }
+      } else if (document.caretPositionFromPoint) {
+        var p = document.caretPositionFromPoint(x, y);
+        if (p) { node = p.offsetNode; offset = p.offset; }
+      }
+    } catch (e) { return null; }
+    if (!node || node.nodeType !== 3 || !pre.contains(node)) return null;
+    var idx = node.nodeValue.slice(0, offset).split('\n').length;
+    return annotateDiffLine(pre.textContent, idx);
+  }
+
+  function annotateDiffLine(text, n) {
+    var lines = text.split('\n');
+    var target = n - 1;
+    var newNo = null, oldNo = null;
+    for (var i = 0; i < lines.length; i++) {
+      var l = lines[i];
+      var hm = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+      if (hm) { oldNo = +hm[1]; newNo = +hm[2]; continue; }
+      if (newNo === null) continue;            // 文件头（diff/---/+++）行还没进 hunk
+      if (i === target) {
+        if (l.charAt(0) === '-') return '原第 ' + oldNo + ' 行：';
+        return '第 ' + newNo + ' 行：';
+      }
+      var c = l.charAt(0);
+      if (c === '+') newNo++;
+      else if (c === '-') oldNo++;
+      else { newNo++; oldNo++; }
+    }
+    return null;
+  }
+
+  function updateChFootHint() {
+    var n = 0;
+    var c = state.chgComments || {};
+    Object.keys(c).forEach(function (k) { if (String(c[k] || '').trim()) n++; });
+    var el = $('ch-foot-hint');
+    if (!el) return;
+    el.textContent = n
+      ? '已写 ' + n + ' 个文件的评审意见，发送后整批发给 agent'
+      : '在文件下写评审意见，点右侧按钮整批发回给 agent';
+  }
+
+  $('ch-files').addEventListener('click', function (e) {
+    var head = e.target.closest('.ch-file-head');
+    if (head) {
+      head.parentNode.classList.toggle('collapsed');
+      return;
+    }
+    var body = e.target.closest('.ch-file-body');
+    if (!body) return;
+    var info = diffLineAt(body, e.clientX, e.clientY);
+    if (!info) return;
+    var file = body.closest('.ch-file');
+    var ta = file && file.querySelector('.ch-comment');
+    if (!ta) return;
+    ta.value = ta.value.trim() ? ta.value.replace(/\s+$/, '') + '\n' + info : info;
+    state.chgComments[ta.getAttribute('data-chcmt')] = ta.value;
+    updateChFootHint();
+    ta.focus();
+  });
+
+  $('ch-files').addEventListener('input', function (e) {
+    var ta = e.target.closest('.ch-comment');
+    if (!ta) return;
+    state.chgComments[ta.getAttribute('data-chcmt')] = ta.value;
+    updateChFootHint();
+  });
+
+  // 评审闭环（借鉴 vibe-kanban 行内评论回灌）：意见整批发回当前会话
+  $('ch-send').addEventListener('click', function () {
+    var s = currentSessionObj();
+    if (!s || state.sessionId !== s.id) {
+      toast('请先选择一个会话', 'err');
+      return;
+    }
+    var cmts = state.chgComments || {};
+    var parts = [];
+    Object.keys(cmts).forEach(function (p) {
+      var v = String(cmts[p] || '').trim();
+      if (v) parts.push('### ' + p + '\n' + v);
+    });
+    if (!parts.length) {
+      toast('先在文件下写点评审意见', 'err');
+      return;
+    }
+    var msg = '请按以下评审意见修改工作区的改动（文件与行号如下）：\n\n' + parts.join('\n\n');
+    state.chgComments = {};
+    closeDrawer('changes-drawer');
+    if (isRunning(state.sessionId)) {
+      enqueueSend(msg);        // 正在跑：排队，收尾自动续发
+    } else {
+      dispatchSend(msg, $('input'));
+    }
+    toast('评审意见已发送', 'ok');
+  });
 
   $('ch-refresh').addEventListener('click', loadChanges);
 
@@ -4479,6 +4975,65 @@
     openFiles();
     openFileViewer(p);
   });
+
+  // ---- 「这一轮改了什么」自动呈现（借鉴 OpenHands：结果推到眼前，别让用户自己翻） ----
+  function hideChangesBar() {
+    var b = $('changes-bar');
+    if (b) b.classList.add('hidden');
+  }
+
+  function chgSig(d) {
+    if (!d || !d.ok) return '';
+    if (d.git) {
+      var st = (d.status || []).map(function (i) { return i.status + ' ' + i.path; }).join('\n');
+      return 'git|' + st + '|' + (d.diff || '');
+    }
+    return 'fs|' + (d.files || []).map(function (f) { return f.path + ':' + f.mtime; }).join('\n');
+  }
+
+  function captureChangesBaseline(sid) {
+    var seq = ++state.chgSeq;
+    state.chgBaseline = null;
+    req('/api/sessions/' + encodeURIComponent(sid) + '/changes').then(function (r) {
+      if (seq !== state.chgSeq || state.sessionId !== sid) return;
+      if (!r.data.ok) return;
+      state.chgBaseline = { sid: sid, sig: chgSig(r.data) };
+    }).catch(function () {});
+  }
+
+  function checkWorkspaceChanges(sid) {
+    var base = state.chgBaseline;
+    if (!sid || !base || base.sid !== sid) return;   // 没有本轮基线：不拿旧改动冒充本轮
+    req('/api/sessions/' + encodeURIComponent(sid) + '/changes').then(function (r) {
+      if (state.sessionId !== sid || isRunning(sid)) return;
+      if (!r.data.ok) return;
+      var sig = chgSig(r.data);
+      if (!sig || sig === base.sig) return;          // 这一轮没动出新东西
+      var text;
+      if (r.data.git) {
+        var st = r.data.status || [];
+        var add = 0, del = 0;
+        (r.data.diff || '').split('\n').forEach(function (l) {
+          if (l.charAt(0) === '+' && l.slice(0, 3) !== '+++') add++;
+          else if (l.charAt(0) === '-' && l.slice(0, 3) !== '---') del++;
+        });
+        text = '工作区有新改动：' + st.length + ' 个文件未提交（+' + add + ' −' + del + '）';
+      } else {
+        var fs2 = r.data.files || [];
+        if (!fs2.length) return;
+        text = '本轮改了 ' + fs2.length + ' 个文件（按修改时间统计）';
+      }
+      $('changes-bar-text').textContent = text;
+      $('changes-bar').classList.remove('hidden');
+      state.chgBaseline = { sid: sid, sig: sig };
+    }).catch(function () {});
+  }
+
+  $('changes-bar-open').addEventListener('click', function () {
+    hideChangesBar();
+    openChanges();
+  });
+  $('changes-bar-close').addEventListener('click', hideChangesBar);
 
   // ---- 任务看板（vibe-kanban 式队列 + 并行执行） ----
 
@@ -4572,8 +5127,14 @@
     if (prev && prev.status !== t.status &&
         (t.status === 'done' || t.status === 'failed' || t.status === 'cancelled')) {
       toast('任务「' + (t.title || ('#' + t.id)) + '」' +
-        (t.status === 'done' ? '已完成' : (t.status === 'cancelled' ? '已取消' : '失败')), 
+        (t.status === 'done' ? '已完成' : (t.status === 'cancelled' ? '已取消' : '失败')),
         t.status === 'done' ? '' : 'err');
+      // 任务多半是在你看别的页面时跑完的：声音 + 桌面通知拉回来
+      if (t.status !== 'cancelled') {
+        alertUser('任务' + (t.status === 'done' ? '完成' : '失败'),
+          '「' + (t.title || ('#' + t.id)) + '」' + (t.status === 'done' ? '已完成' : '失败'),
+          t.status === 'done' ? 'done' : 'err');
+      }
     }
   }
 

@@ -51,6 +51,13 @@ WORKSPACE_PATH = DATA_DIR / "workspaces.json"
 SCHEDULE_PATH = DATA_DIR / "model_schedules.json"
 AUTO_RUN_PATH = DATA_DIR / "auto_run.json"
 
+# ---- 图片附件 --------------------------------------------------------------
+# zcode 协议的附件是按「本地文件路径」读的（CLI 的 --attach 就是这个口径），
+# 所以网页端传上来的图片先落到面板自己的目录，再把路径交给 app-server。
+ATTACH_DIR = DATA_DIR / "attachments"
+MAX_IMAGE_BYTES = 20 * 1024 * 1024          # 与协议上限一致
+MAX_IMAGES_PER_SEND = 6
+
 # ---- 自动续跑 / 失败自动重试 ------------------------------------------------
 # 「连续执行」开着时：一轮正常收尾 → 延迟几秒自动发续跑消息开下一轮；
 # 一轮以错误收场（如模型 API 连不上）→ 自动重发同一条消息，指数退避。
@@ -2292,7 +2299,7 @@ class TurnManager:
         await self.apply_settings(session_id, mode, model, thought_level)
 
     async def send(self, session_id, content, mode=None, model=None, thought_level=None,
-                   auto=False):
+                   auto=False, attachments=None):
         async with self.lock:
             if session_id in self.running:
                 raise RuntimeError("这个会话正在执行中，请稍候")
@@ -2323,6 +2330,9 @@ class TurnManager:
             input_prefix = "panel-auto-" if auto else "panel-manual-"
             payload = {"sessionId": session_id, "content": content,
                        "inputId": input_prefix + secrets.token_hex(12)}
+            if attachments:
+                # zcode 的附件按本地路径读（同 CLI 的 --attach）
+                payload["attachments"] = attachments
             try:
                 res = await zc.call("session/send", payload, timeout=60)
             except Exception as exc:
@@ -5559,17 +5569,20 @@ async def handle_ws(request):
 
             sid = data.get("sessionId") or None
             content = str(data.get("content") or data.get("message") or "").strip()
+            atts = normalize_send_attachments(data.get("attachments"))
             if not sid:
                 await safe_send(ws, {"type": "error",
                                      "message": "请先新建会话再发送消息"})
                 continue
-            if not content:
+            if not content and not atts:
                 await safe_send(ws, {"type": "error", "message": "消息不能为空"})
                 continue
-            if len(content) > MAX_MESSAGE_CHARS:
+            if not atts and len(content) > MAX_MESSAGE_CHARS:
                 await safe_send(ws, {"type": "error",
                                      "message": f"消息过长（上限 {MAX_MESSAGE_CHARS} 字）"})
                 continue
+            if atts and len(content) > MAX_MESSAGE_CHARS:
+                content = content[:MAX_MESSAGE_CHARS]
             if sid and not SESSION_ID_RE.match(sid):
                 await safe_send(ws, {"type": "error", "message": "非法的会话 ID"})
                 continue
@@ -5598,7 +5611,8 @@ async def handle_ws(request):
                 f = await feed.ensure_subscription(sid)
                 f.add_subscriber(ws)
                 watched.add(sid)
-                await runner.send(sid, content, mode=mode, model=model, thought_level=tl)
+                await runner.send(sid, content, mode=mode, model=model, thought_level=tl,
+                                  attachments=atts or None)
                 await safe_send(ws, {"type": "accepted", "sessionId": sid})
             except Exception as exc:
                 log(f"发送失败: {exc}")
@@ -5967,6 +5981,166 @@ async def handle_session_token_usage(request):
         "inputIncludesCache": bool(cr + cc > 0 and extra == 0),
         "providerId": r.get("provider_id"), "modelId": r.get("model_id"),
         "at": r.get("started_at") or 0,
+    })
+
+
+IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png", ".png"),
+    (b"\xff\xd8\xff", "image/jpeg", ".jpg"),
+    (b"GIF87a", "image/gif", ".gif"),
+    (b"GIF89a", "image/gif", ".gif"),
+)
+
+
+def sniff_image(data):
+    """按魔数认图片类型：不信任浏览器给的 Content-Type。"""
+    for magic, mime, ext in IMAGE_MAGIC:
+        if data.startswith(magic):
+            return mime, ext
+    if len(data) > 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    return None, None
+
+
+def safe_attachment_name(raw, ext):
+    """只留文件名本身，去掉目录与怪字符，并强制用嗅探出来的后缀。"""
+    name = os.path.basename(str(raw or "")).strip() or "image"
+    name = re.sub(r"[^\w.\-]+", "_", name, flags=re.UNICODE)[:60] or "image"
+    stem = name.rsplit(".", 1)[0] or "image"
+    return stem + ext
+
+
+def attachment_in_store(path):
+    """附件路径必须落在面板自己的附件目录里（不拿调用方给的任意路径去读文件）。"""
+    try:
+        p = Path(str(path)).resolve()
+        return p == ATTACH_DIR.resolve() or ATTACH_DIR.resolve() in p.parents
+    except Exception:
+        return False
+
+
+def normalize_send_attachments(raw):
+    """网页端传来的附件清单 -> zcode 协议的 attachments。
+
+    路径、大小、类型全部重新核一遍：这条通道只用来发面板目录里的图片，
+    不能变成「让 app-server 读任意本地文件」的入口。
+    """
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw[:MAX_IMAGES_PER_SEND]:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "")
+        if not path or not attachment_in_store(path) or not os.path.isfile(path):
+            continue
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size <= 0 or size > MAX_IMAGE_BYTES:
+            continue
+        mime = str(item.get("mime") or "")
+        if not mime.startswith("image/"):
+            continue
+        out.append({
+            "kind": "image",
+            "filename": str(item.get("fileName") or os.path.basename(path)),
+            "mimeType": mime,
+            "sizeBytes": size,
+            "localPath": path,
+        })
+    return out
+
+
+async def handle_session_attachment_upload(request):
+    """网页端把图片传上来。落盘到面板的附件目录，返回服务器上的路径，
+    发送时由 session/send 的 attachments 带过去。"""
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    sid = request.match_info["sid"]
+    if not SESSION_ID_RE.match(sid):
+        return json_error("非法的会话 ID", 400)
+    body = await request.read()
+    if not body:
+        return json_error("空文件", 400)
+    if len(body) > MAX_IMAGE_BYTES:
+        return json_error("图片太大（上限 %dMB）" % (MAX_IMAGE_BYTES // (1024 * 1024)), 413)
+    mime, ext = sniff_image(body)
+    if not mime:
+        return json_error("只支持 PNG / JPEG / GIF / WebP 图片", 415)
+    name = safe_attachment_name(request.headers.get("X-File-Name"), ext)
+    folder = ATTACH_DIR / sid
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / (secrets.token_hex(8) + "-" + name)
+        path.write_bytes(body)
+    except OSError as exc:
+        log(f"图片保存失败: {exc}")
+        return json_error("图片保存失败", 500)
+    return web.json_response({"ok": True, "path": str(path), "fileName": name,
+                              "mime": mime, "bytes": len(body)})
+
+
+async def handle_session_attachment_get(request):
+    """把消息里的图片取出来给 <img> 用。
+
+    路径不从请求里取 —— 客户端只给「哪条消息的第几个 part」，路径回库查，
+    这样面板不会变成任意文件读取器。
+    """
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    sid = request.match_info["sid"]
+    if not SESSION_ID_RE.match(sid):
+        return json_error("非法的会话 ID", 400)
+    mid = request.query.get("mid") or ""
+    idx = request.query.get("i") or "0"
+    if not mid.isalnum() and not re.match(r"^[\w.\-]+$", mid):
+        return json_error("非法的消息 ID", 400)
+    if not idx.isdigit():
+        return json_error("非法的附件序号", 400)
+    conn = db_connect()
+    try:
+        if not conn.execute("SELECT 1 FROM message WHERE id = ? AND session_id = ?",
+                            (mid, sid)).fetchone():
+            return json_error("消息不存在", 404)
+        rows = conn.execute("SELECT data FROM part WHERE message_id = ? ORDER BY sequence",
+                            (mid,)).fetchall()
+    except sqlite3.Error:
+        return json_error("读取附件失败", 500)
+    finally:
+        conn.close()
+    i = int(idx)
+    if i >= len(rows):
+        return json_error("附件不存在", 404)
+    try:
+        part = json.loads(rows[i]["data"] or "{}")
+    except ValueError:
+        return json_error("附件数据损坏", 500)
+    if part.get("type") != "file":
+        return json_error("不是文件附件", 404)
+    mime = str(part.get("mime") or "")
+    if not mime.startswith("image/"):
+        return json_error("不是图片附件", 404)
+    # url 有两种形态：可能是本地路径，也可能是 app-server 内部的
+    # zcode-artifact:// 标识；真正可读的路径在 source.path / metadata.originalUrl
+    cands = [part.get("url"),
+             (part.get("source") or {}).get("path") if isinstance(part.get("source"), dict) else None,
+             (part.get("metadata") or {}).get("originalUrl") if isinstance(part.get("metadata"), dict) else None]
+    src = None
+    for c in cands:
+        if not c or not isinstance(c, str) or "://" in c:
+            continue
+        if os.path.isfile(c):
+            src = c
+            break
+    if not src:
+        return json_error("图片文件已不存在", 404)
+    return web.FileResponse(src, headers={
+        "Content-Type": mime,
+        "Cache-Control": "private, max-age=600",
     })
 
 
@@ -6439,6 +6613,8 @@ def make_app():
     app.router.add_get("/api/fs/download", handle_fs_download)
     app.router.add_get("/api/sessions/{sid}/changes", handle_session_changes)
     app.router.add_get("/api/sessions/{sid}/token-usage", handle_session_token_usage)
+    app.router.add_post("/api/sessions/{sid}/attachment", handle_session_attachment_upload)
+    app.router.add_get("/api/sessions/{sid}/attachment", handle_session_attachment_get)
     app.router.add_get("/api/tasks", handle_tasks_list)
     app.router.add_post("/api/tasks", handle_task_create)
     app.router.add_post("/api/tasks/{tid}/cancel", handle_task_cancel)

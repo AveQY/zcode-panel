@@ -54,6 +54,7 @@
     localUserMsgs: [],          // 本地已渲染、还没绑上库里 id 的用户消息（防重复）
     sendQueue: [],              // 轮次执行中排队的消息（收尾自动续发）
     sendQueueFor: null,         // 队列属于哪个会话
+    pendingImages: [],          // 待发送的图片 [{file, url, name, size}]
     allowTools: [],             // 权限工具白名单（服务端 permission_allow_tools）
     chgBaseline: null,          // 本轮开始时的工作区改动基线 {sid, sig}
     chgSeq: 0,                  // 基线请求代号：切轮/切会话后丢弃过期结果
@@ -636,6 +637,7 @@
     wsSend({
       type: 'send', sessionId: p.sessionId, content: p.content,
       mode: p.mode, model: p.model, thoughtLevel: p.thoughtLevel,
+      attachments: p.attachments,
     });
   }
 
@@ -1218,7 +1220,123 @@
     try { return JSON.stringify(input, null, 2); } catch (e) { return String(input); }
   }
 
-  function appendUserMessage(text, prepend, timeMs, beforeEl) {
+  /* ---------- 图片附件：粘贴 / 拖入 / 选图 ---------- */
+  /* 发送链路：网页把图传给面板（POST /attachment，落面板自己的目录）→
+     发送时带 attachments（zcode 协议按本地路径读，同 CLI 的 --attach）。 */
+
+  var IMG_MIMES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+  var MAX_IMG_BYTES = 20 * 1024 * 1024;
+  var MAX_IMG_COUNT = 6;
+
+  function fmtBytes(n) {
+    n = Number(n) || 0;
+    if (n < 1024) return n + 'B';
+    if (n < 1024 * 1024) return Math.round(n / 1024) + 'KB';
+    return (n / 1024 / 1024).toFixed(1) + 'MB';
+  }
+
+  function imageReject(file) {
+    if (!file) return '图片无效';
+    if (IMG_MIMES.indexOf(file.type) < 0) return '只支持 PNG / JPEG / WebP / GIF';
+    if (file.size > MAX_IMG_BYTES) return '图片太大（上限 20MB）';
+    if (!file.size) return '图片是空的';
+    return '';
+  }
+
+  function addPendingImages(files) {
+    var list = [].slice.call(files || []);
+    if (!list.length) return;
+    var room = MAX_IMG_COUNT - (state.pendingImages || []).length;
+    if (room <= 0) { toast('一次最多带 ' + MAX_IMG_COUNT + ' 张图', 'err'); return; }
+    if (list.length > room) {
+      toast('一次最多带 ' + MAX_IMG_COUNT + ' 张图，多余的已忽略', 'err');
+      list = list.slice(0, room);
+    }
+    list.forEach(function (f) {
+      var bad = imageReject(f);
+      if (bad) { toast((f.name || '图片') + '：' + bad, 'err'); return; }
+      state.pendingImages.push({ file: f, url: URL.createObjectURL(f),
+                                 name: f.name || 'image', size: f.size });
+    });
+    renderAttachStrip();
+  }
+
+  function removePendingImage(i) {
+    var it = (state.pendingImages || [])[i];
+    if (!it) return;
+    if (it.url && it.url.indexOf('blob:') === 0) URL.revokeObjectURL(it.url);
+    state.pendingImages.splice(i, 1);
+    renderAttachStrip();
+  }
+
+  function clearPendingImages() {
+    (state.pendingImages || []).forEach(function (it) {
+      // 已经画进气泡 / 存进队列的，blob URL 还得继续用，不能撤销
+      if (it.used) return;
+      if (it.url && it.url.indexOf('blob:') === 0) URL.revokeObjectURL(it.url);
+    });
+    state.pendingImages = [];
+    renderAttachStrip();
+  }
+
+  function renderAttachStrip() {
+    var strip = $('attach-strip');
+    if (!strip) return;
+    var list = state.pendingImages || [];
+    if (!list.length) {
+      strip.classList.add('hidden');
+      strip.innerHTML = '';
+      return;
+    }
+    strip.classList.remove('hidden');
+    strip.innerHTML = list.map(function (it, i) {
+      return '<span class="attach-item" title="' + esc(it.name + ' · ' + fmtBytes(it.size)) + '">' +
+        '<img src="' + esc(it.url) + '" alt="">' +
+        '<button type="button" class="attach-del" data-attach-del="' + i + '" title="移除">&times;</button>' +
+        '</span>';
+    }).join('') + '<span class="attach-tip">待发送 ' + list.length + ' 张</span>';
+  }
+
+  // 上传到面板，拿回服务器路径（发送时随 attachments 交给 app-server）
+  function uploadImages(sid, list) {
+    var jobs = (list || []).map(function (it) {
+      return fetch('/api/sessions/' + encodeURIComponent(sid) + '/attachment', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': it.file.type || 'application/octet-stream',
+          'X-File-Name': encodeURIComponent(it.name || 'image'),
+        },
+        body: it.file,
+      }).then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (d) {
+          if (!r.ok || !d.ok) throw new Error(d.error || ('上传失败（' + r.status + '）'));
+          return d;
+        });
+      });
+    });
+    return Promise.all(jobs);
+  }
+
+  // 库里那条用户消息 -> 正文 + 图片（图片 part 的类型是 "file"）
+  function attachmentUrl(sid, mid, i) {
+    return '/api/sessions/' + encodeURIComponent(sid) + '/attachment?mid=' +
+      encodeURIComponent(mid) + '&i=' + i;
+  }
+
+  function splitUserParts(m, sid) {
+    var text = '';
+    var images = [];
+    (m.parts || []).forEach(function (p, i) {
+      if (p.type === 'text') text += (p.text || '');
+      else if (p.type === 'file' && String(p.mime || '').indexOf('image/') === 0) {
+        images.push({ url: attachmentUrl(sid, m.id, i), name: p.filename || '图片' });
+      }
+    });
+    return { text: text, images: images };
+  }
+
+  function appendUserMessage(text, prepend, timeMs, beforeEl, images) {
     hideWelcome();
     var box = $('messages');
     var row = document.createElement('div');
@@ -1226,7 +1344,29 @@
     row.dataset.t = timeMs || 0;
     var bubble = document.createElement('div');
     bubble.className = 'bubble-user';
-    bubble.textContent = text;
+    if (images && images.length) {
+      var wrap = document.createElement('div');
+      wrap.className = 'bubble-imgs';
+      images.forEach(function (im) {
+        var a = document.createElement('a');
+        a.className = 'bubble-img';
+        a.href = im.url;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        var img = document.createElement('img');
+        img.src = im.url;
+        img.alt = im.name || '图片';
+        a.appendChild(img);
+        wrap.appendChild(a);
+      });
+      bubble.appendChild(wrap);
+    }
+    if (text) {
+      var txt = document.createElement('div');
+      txt.className = 'bubble-text';
+      txt.textContent = text;
+      bubble.appendChild(txt);
+    }
     row.appendChild(bubble);
     var timeEl = document.createElement('div');
     timeEl.className = 'msg-time';
@@ -1585,7 +1725,8 @@
   function send() {
     var input = $('input');
     var text = input.value.trim();
-    if (!text) return;
+    // 只发图片（不带文字）也允许
+    if (!text && !(state.pendingImages || []).length) return;
     // 轮次跑着也能接着打字：进队列，收尾自动续发（以前这里直接吞掉输入，最反人类）
     if (isRunning(state.sessionId)) {
       enqueueSend(text);
@@ -1600,7 +1741,8 @@
 
   /* ---- 消息排队（借鉴 claudecodeui QueuedMessageCard / opcode PromptQueue） ---- */
   function enqueueSend(text) {
-    if (!state.sessionId || !text) return;
+    var imgs = (state.pendingImages || []).slice();
+    if (!state.sessionId || (!text && !imgs.length)) return;
     if (!state.sendQueue.length) state.sendQueueFor = state.sessionId;
     // 连同入队时的模型 / 思考等级 / 模式一起记下（借鉴 opcode PromptQueue）：
     // 队列里的消息要等本轮跑完才发，期间选择器可能已经被改到别的模型去了。
@@ -1609,7 +1751,10 @@
       model: currentModelValue(),
       thoughtLevel: $('thought-select').value || null,
       mode: $('mode-select').value || null,
+      images: imgs,
     });
+    imgs.forEach(function (it) { it.used = true; });   // 队列续发时还要用这些缩略图
+    clearPendingImages();
     $('input').value = '';
     $('input').style.height = 'auto';
     renderSendQueue();
@@ -1630,11 +1775,14 @@
     var html = '<span class="sq-label">待发送 ' + q.length + ' 条</span>';
     q.forEach(function (e, i) {
       var t = (e && e.text) || '';
+      var nImg = (e && e.images && e.images.length) || 0;
+      if (!t && nImg) t = '（' + nImg + ' 张图片）';
       var prev = t.length > 36 ? t.slice(0, 36) + '…' : t;
       var mName = (e && e.model && e.model.modelId) ? shortModel(e.model.modelId) : '';
       html += '<span class="sq-item" data-sq-edit="' + i + '" title="点击放回输入框编辑' +
         (mName ? '；发送时用 ' + esc(mName) : '') + '">' + esc(prev) +
         (mName ? '<i class="sq-model">' + esc(mName) + '</i>' : '') +
+        (nImg ? '<i class="sq-model sq-img">图 ' + nImg + '</i>' : '') +
         '<button class="sq-del" data-sq-del="' + i + '" title="移出队列">&times;</button></span>';
     });
     html += '<button class="text-btn slim" data-sq-clear="1">清空</button>';
@@ -1661,6 +1809,11 @@
       var input = $('input');
       var en = state.sendQueue[i];
       input.value = (en && en.text) || '';
+      if (en && en.images && en.images.length) {   // 图也一起放回待发送区
+        clearPendingImages();
+        state.pendingImages = en.images.slice();
+        renderAttachStrip();
+      }
       state.sendQueue.splice(i, 1);
       if (!state.sendQueue.length) state.sendQueueFor = null;
       renderSendQueue();
@@ -1685,7 +1838,8 @@
   function syncQueueBtn() {
     var b = $('queue-btn');
     if (!b) return;
-    var show = isRunning(state.sessionId) && !!$('input').value.trim();
+    var show = isRunning(state.sessionId) &&
+      (!!$('input').value.trim() || (state.pendingImages || []).length > 0);
     b.classList.toggle('hidden', !show);
   }
 
@@ -1747,9 +1901,10 @@
 
   function quickStartThenSend(text, input) {
     var pick = firstWorkspacePath();
+    var imgs = (state.pendingImages || []).slice();
     // 先把消息落到界面上：创建会话要 1~2 秒，让用户立刻看到自己发出去的话，
     // 而不是盯着一个空输入框怀疑没点上。失败时再把这个气泡回滚掉。
-    var row = appendUserMessage(text, false, Date.now());
+    var row = appendUserMessage(text, false, Date.now(), null, imgs);
     input.value = '';
     input.style.height = 'auto';
     setStatus('正在创建会话…');
@@ -1762,7 +1917,7 @@
       rememberSession(ready);
       updatePanelButtons();
       loadSessions(true);
-      dispatchSend(text, input, true);
+      dispatchSend(text, input, true, { images: imgs });
       return;
     }
 
@@ -1784,7 +1939,7 @@
       rememberSession(state.sessionId);
       updatePanelButtons();
       loadSessions(true);
-      dispatchSend(text, input, true);
+      dispatchSend(text, input, true, { images: imgs });
     }).catch(function (err) {
       if (row && row.parentNode) row.parentNode.removeChild(row);
       state.localUserMsgs = (state.localUserMsgs || []).filter(function (m) {
@@ -1807,47 +1962,66 @@
     var md = (opts && opts.mode) || $('mode-select').value;
     state.turnModel = (mv && mv.modelId) || '';
 
-    if (!wsOpen()) {
-      // 断线不丢消息：先把消息落到界面，等重连成功后自动补发
-      if (!hideBubble) appendUserMessage(text, false, Date.now());
-      input.value = '';
-      input.style.height = 'auto';
+    // 图片：opts.images 是本轮要发的（队列/快速开始路径传进来的），
+    // opts.attachments 是已经上传好的服务器路径
+    var imgs = (opts && opts.images) || (state.pendingImages || []).slice();
+    var ready = (opts && opts.attachments) || null;
+
+    var finish = function (atts) {
+      var payloadAtts = (atts && atts.length) ? atts : undefined;
+      if (!wsOpen()) {
+        // 断线不丢消息：先把消息落到界面，等重连成功后自动补发
+        setSending(true);
+        showThinking();
+        state.pendingSend = {
+          sessionId: state.sessionId,
+          content: text,
+          mode: md,
+          model: mv,
+          thoughtLevel: th,
+          attachments: payloadAtts,
+        };
+        setStatus('连接中断，正在重连，恢复后自动发送…');
+        if (!state.ws) forceReconnect();
+        return;
+      }
       setSending(true);
       showThinking();
-      state.pendingSend = {
+      var ok = wsSend({
+        type: 'send',
         sessionId: state.sessionId,
         content: text,
         mode: md,
         model: mv,
         thoughtLevel: th,
-      };
-      setStatus('连接中断，正在重连，恢复后自动发送…');
-      if (!state.ws) forceReconnect();
-      return;
-    }
+        attachments: payloadAtts,
+      });
+      if (!ok) {
+        setSending(false);
+        removeThinking();
+        toast('发送失败，请刷新页面', 'err');
+      }
+    };
 
     // hideBubble：调用方已经乐观地把消息画上去了（快速开始那条路径），别再画一遍
-    if (!hideBubble) appendUserMessage(text, false, Date.now());
+    // 乐观渲染用本地 blob 缩略图，不等上传
+    if (!hideBubble) appendUserMessage(text, false, Date.now(), null, imgs);
+    imgs.forEach(function (it) { it.used = true; });   // 气泡要用这些 blob URL
+    clearPendingImages();
     input.value = '';
     input.style.height = 'auto';
 
-    setSending(true);
-    showThinking();
+    if (ready || !imgs.length || !state.sessionId) { finish(ready); return; }
 
-    var ok = wsSend({
-      type: 'send',
-      sessionId: state.sessionId,
-      content: text,
-      mode: md,
-      model: mv,
-      thoughtLevel: th,
-    });
-
-    if (!ok) {
+    setStatus('正在上传图片…');
+    uploadImages(state.sessionId, imgs).then(function (atts) {
+      finish(atts);
+    }).catch(function (err) {
       setSending(false);
       removeThinking();
-      toast('发送失败，请刷新页面', 'err');
-    }
+      setStatus('');
+      toast('图片上传失败：' + String((err && err.message) || err), 'err');
+    });
   }
 
   // 停止当前轮次（发送按钮在运行中会变成停止按钮，Esc 也走这里）
@@ -1865,6 +2039,62 @@
     setStatus('正在停止…');
     wsSend({ type: 'cancel', sessionId: state.sessionId });
   }
+
+  /* ---- 图片：选图 / 粘贴 / 拖入 ---- */
+  $('attach-btn').addEventListener('click', function () { $('attach-input').click(); });
+  $('attach-input').addEventListener('change', function () {
+    addPendingImages(this.files);
+    this.value = '';                 // 同一个文件可以连续选两次
+  });
+  $('attach-strip').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-attach-del]');
+    if (b) removePendingImage(+b.getAttribute('data-attach-del'));
+  });
+  $('input').addEventListener('paste', function (e) {
+    var items = (e.clipboardData && e.clipboardData.items) || [];
+    var files = [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].kind !== 'file') continue;
+      var f = items[i].getAsFile();
+      if (f) files.push(f);
+    }
+    if (files.length) {
+      e.preventDefault();
+      addPendingImages(files);
+    }
+  });
+
+  var dragDepth = 0;
+  function dragHasFiles(e) {
+    var dt = e.dataTransfer;
+    if (!dt) return false;
+    if (dt.types && dt.types.indexOf && dt.types.indexOf('Files') >= 0) return true;
+    return !!(dt.files && dt.files.length);
+  }
+  ['dragenter', 'dragover'].forEach(function (ev) {
+    $('composer').addEventListener(ev, function (e) {
+      if (!dragHasFiles(e)) return;
+      e.preventDefault();
+      if (ev === 'dragenter') dragDepth += 1;
+      this.classList.add('dragging');
+    });
+  });
+  ['dragleave', 'drop'].forEach(function (ev) {
+    $('composer').addEventListener(ev, function (e) {
+      if (!dragHasFiles(e) && ev === 'drop') return;
+      e.preventDefault();
+      if (ev === 'dragleave') {
+        dragDepth = Math.max(0, dragDepth - 1);
+        if (dragDepth) return;
+      } else {
+        dragDepth = 0;
+      }
+      this.classList.remove('dragging');
+      if (ev === 'drop' && e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) {
+        addPendingImages(e.dataTransfer.files);
+      }
+    });
+  });
 
   $('send-btn').addEventListener('click', function () {
     // 一个按钮两种角色：空闲时发送，运行中变停止（聊天面板的通行做法）
@@ -2647,7 +2877,7 @@
   }
 
   function fillAssistantParts(entry, m) {
-    (m.parts || []).forEach(function (p) {
+    (m.parts || []).forEach(function (p, pi) {
       if (p.type === 'text' && p.text) {
         var el = mdElOf(entry);
         entry.raw += p.text;
@@ -2678,6 +2908,15 @@
           toolName: p.tool, state: st.status || 'completed',
           input: st.input, payload: { output: st.output, error: st.error },
         }, entry);   // 显式传 entry，避免 ensureAssistant 复用 state.cur 串位
+      } else if (p.type === 'file' && String(p.mime || '').indexOf('image/') === 0 && m.id) {
+        // 助手侧带出来的图片（工具截图等）：同样走面板的附件端点回读
+        var img = document.createElement('img');
+        img.className = 'msg-img';
+        img.loading = 'lazy';
+        img.alt = p.filename || '图片';
+        img.src = attachmentUrl(state.sessionId, m.id, pi);
+        entry.body.appendChild(img);
+        entry.mdEl = null;
       }
     });
     if (m.error) {
@@ -2719,9 +2958,10 @@
   function renderHistoryMessage(m, prepend, beforeEl) {
     if (m.role === 'user') {
       if (!shouldRenderUserMessage(m)) return;
-      var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
-        .map(function (p) { return p.text || ''; }).join('');
-      if (texts) appendUserMessage(texts, prepend, m.time, beforeEl);
+      var up = splitUserParts(m, state.sessionId);
+      if (up.text || up.images.length) {
+        appendUserMessage(up.text, prepend, m.time, beforeEl, up.images);
+      }
       return;
     }
     if (m.role !== 'assistant') return;
@@ -2899,20 +3139,19 @@
     if (m.role === 'user') {
       if (!shouldRenderUserMessage(m)) return;
       if (state.messageMap.get(m.id)) return;
-      var texts = (m.parts || []).filter(function (p) { return p.type === 'text'; })
-        .map(function (p) { return p.text || ''; }).join('');
-      if (!texts) return;
+      var up = splitUserParts(m, state.sessionId);
+      if (!up.text && !up.images.length) return;
       // 自己刚发出去、本地已经渲染过的那条：认领它，别出现两条一样的
       var locals = state.localUserMsgs || [];
       for (var i = 0; i < locals.length; i++) {
-        if (!locals[i].bound && locals[i].text === texts) {
+        if (!locals[i].bound && locals[i].text === up.text) {
           locals[i].bound = true;
           locals[i].row.dataset.mid = m.id;
           state.messageMap.set(m.id, { mid: m.id, role: 'user', row: locals[i].row });
           return;
         }
       }
-      var row = appendUserMessage(texts, false, m.time);
+      var row = appendUserMessage(up.text, false, m.time, null, up.images);
       if (row) {
         row.dataset.mid = m.id;
         state.messageMap.set(m.id, { mid: m.id, role: 'user', row: row });

@@ -19,12 +19,12 @@
   } catch (e) {}
 })();
 </script>
-<link rel="icon" href="/static/favicon.ico?v=20261001j" sizes="any">
-<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=20261001j">
-<link rel="apple-touch-icon" href="/static/apple-touch-icon.png?v=20261001j">
+<link rel="icon" href="/static/favicon.ico?v=20261001k" sizes="any">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=20261001k">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png?v=20261001k">
 <meta name="theme-color" content="#2563eb" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#15181e" media="(prefers-color-scheme: dark)">
-<link rel="stylesheet" href="/static/style.css?v=20261001j">
+<link rel="stylesheet" href="/static/style.css?v=20261001k">
 </head>
 <body>
 
@@ -120,7 +120,7 @@
       </div>
     </div>
 
-    <div class="composer">
+    <div class="composer" id="composer">
       <div id="sched-banner" class="sched-banner hidden">
         <span class="sched-banner-icon">&#128336;</span>
         <span class="sched-banner-text" id="sched-banner-text"></span>
@@ -133,7 +133,21 @@
         <button id="changes-bar-open" class="text-btn" type="button">查看</button>
         <button id="changes-bar-close" class="icon-btn" type="button" title="知道了">&#10005;</button>
       </div>
+      <div id="attach-strip" class="attach-strip hidden"></div>
       <div class="composer-box">
+        <button id="attach-btn" class="attach-btn" type="button"
+                title="添加图片（也可以直接粘贴或拖进来）">
+          <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" fill="none"
+                  stroke="currentColor" stroke-width="1.7"/>
+            <circle cx="9" cy="10" r="1.7" fill="currentColor"/>
+            <path d="M5 17l4.6-4.6L13 16l3-3 3.2 3.2" fill="none"
+                  stroke="currentColor" stroke-width="1.7" stroke-linecap="round"
+                  stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <input type="file" id="attach-input" class="hidden" multiple
+               accept="image/png,image/jpeg,image/webp,image/gif">
         <textarea id="input" rows="1" placeholder="输入消息…（Enter 发送，Shift + Enter 换行）"
                   spellcheck="false"></textarea>
         <button id="queue-btn" class="queue-btn hidden" type="button"
@@ -801,6 +815,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js?v=20261001j"></script>
+<script src="/static/app.js?v=20261001k"></script>
 </body>
 </html>

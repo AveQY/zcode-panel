@@ -19,12 +19,12 @@
   } catch (e) {}
 })();
 </script>
-<link rel="icon" href="/static/favicon.ico?v=20261001k" sizes="any">
-<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=20261001k">
-<link rel="apple-touch-icon" href="/static/apple-touch-icon.png?v=20261001k">
+<link rel="icon" href="/static/favicon.ico?v=20261001m" sizes="any">
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v=20261001m">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png?v=20261001m">
 <meta name="theme-color" content="#2563eb" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#15181e" media="(prefers-color-scheme: dark)">
-<link rel="stylesheet" href="/static/style.css?v=20261001k">
+<link rel="stylesheet" href="/static/style.css?v=20261001m">
 </head>
 <body>
 
@@ -277,6 +277,16 @@
           <option value="project">项目</option>
           <option value="task">任务</option>
         </select>
+      </div>
+
+      <div class="form-row hidden" id="wsm-sessions-row">
+        <label class="form-label" for="wsm-sessions">目录下的会话</label>
+        <select id="wsm-sessions" class="narrow">
+          <option value="keep">保留（只把这一组从侧栏移除）</option>
+          <option value="archive">归档（移到「归档」页）</option>
+          <option value="delete">一起删除会话记录</option>
+        </select>
+        <div class="form-hint" id="wsm-sessions-hint"></div>
       </div>
 
       <div class="form-row hidden" id="wsm-danger-row">
@@ -815,6 +825,6 @@
 <div id="toast" class="toast hidden"></div>
 
 <script src="/static/marked.js"></script>
-<script src="/static/app.js?v=20261001k"></script>
+<script src="/static/app.js?v=20261001m"></script>
 </body>
 </html>

@@ -2502,6 +2502,7 @@
         w = { path: g.path, name: g.name, purpose: 'project', unregistered: true, dir: {} };
       }
       if (!w) { toast('请先刷新工作区列表', 'err'); return; }
+      w = Object.assign({}, w, { sessions: (g.items || []).length });   // 移除时要提示会话数
       openWsModal('edit', w);
     });
     head.appendChild(more);
@@ -3510,10 +3511,18 @@
     $('wsm-path').readOnly = isEdit;
     $('wsm-purpose-row').classList.toggle('hidden', isEdit);
     $('wsm-save').textContent = isEdit ? '保存名称' : '创建';
-    // 未登记的目录（别的途径建的会话带出来的）只能「保存名称」把它登记进来；
+    // 未登记的目录（别的途径建的会话带出来的）也能从侧栏移除（=隐藏这一组）；
     // 工作区根目录不允许移除，避免把 /root 从列表里弄掉。
-    var canDelete = isEdit && !ws.unregistered && !ws.isRoot;
+    var canDelete = isEdit && !ws.isRoot;
+    var nSess = ws.sessions || 0;
     $('wsm-delete').classList.toggle('hidden', !canDelete);
+    $('wsm-delete').textContent = ws.unregistered ? '从侧栏移除' : '删除工作区';
+    $('wsm-sessions-row').classList.toggle('hidden', !(canDelete && nSess > 0));
+    $('wsm-sessions').value = 'keep';
+    $('wsm-sessions-hint').textContent = nSess
+      ? '这个目录下有 ' + nSess + ' 个会话。选「保留」时侧栏不再列这一组，' +
+        '会话仍在库里（重新添加该目录就能看到）。'
+      : '';
     $('wsm-danger-row').classList.toggle('hidden', !(isEdit && !ws.unregistered));
     $('wsm-danger-row').querySelector('.check-row').classList.toggle('hidden', !canDelete);
     $('wsm-purge').checked = false;
@@ -3590,25 +3599,44 @@
     var ws = state.wsEditing;
     if (!ws) return;
     var purge = $('wsm-purge').checked;
+    var mode = $('wsm-sessions').value || 'keep';     // keep | archive | delete
     var st = ws.dir || {};
-    var text = '确定要移除工作区「' + (ws.name || ws.path) + '」吗？\n';
+    var nSess = ws.sessions || 0;
+    var text = '确定要' + (purge ? '删除' : '移除') + '工作区「' + (ws.name || ws.path) + '」吗？\n';
+    if (nSess) {
+      text += '目录下的 ' + nSess + ' 个会话：' +
+        (mode === 'delete' ? '会一起删除，无法恢复。\n'
+          : mode === 'archive' ? '会归档到「归档」页。\n'
+            : '保留在库里，但侧栏不再显示这一组。\n');
+    }
     if (purge) {
       text += '磁盘目录 ' + ws.path + '（' + st.entries + (st.truncated ? '+' : '') +
         ' 项）会被彻底删除，无法恢复。\n';
     } else {
-      text += '只会从左侧列表移除，磁盘上的 ' + ws.path + ' 原样保留。\n';
+      text += '磁盘上的 ' + ws.path + ' 原样保留。\n';
     }
-    if (ws.sessions) {
-      text += '该工作区下的 ' + ws.sessions + ' 个会话记录不会被一起删除。';
-    }
-    confirmBox(purge ? '删除工作区目录' : '移除工作区', text, purge ? '删除' : '移除')
+    confirmBox(purge ? '删除工作区目录' : (mode === 'delete' ? '删除工作区与会话' : '移除工作区'),
+               text, purge ? '删除' : '移除')
       .then(function (ok) {
         if (!ok) return;
+        var q = [];
+        if (purge) {
+          q.push('purge=1');
+          q.push('confirm=' + encodeURIComponent(ws.path));
+        }
+        if (nSess) q.push('sessions=' + encodeURIComponent(mode));
+        if (ws.unregistered) q.push('path=' + encodeURIComponent(ws.path));
         var url = '/api/workspaces/' + encodeURIComponent(ws.id) +
-          (purge ? '?purge=1&confirm=' + encodeURIComponent(ws.path) : '');
+          (q.length ? '?' + q.join('&') : '');
         req(url, { method: 'DELETE' }).then(function (r) {
           if (!r.data.ok) { toast(r.data.error || '删除失败', 'err'); return; }
-          toast(purge ? '工作区与磁盘目录已删除' : '已移出工作区列表', 'ok');
+          var d = r.data.sessions || {};
+          var extra = '';
+          if (mode === 'delete' && d.deleted) extra = '，已删除 ' + d.deleted + ' 个会话';
+          else if (mode === 'archive' && d.archived) extra = '，已归档 ' + d.archived + ' 个会话';
+          else if (nSess) extra = '，会话保留在库里';
+          toast(purge ? ('工作区与磁盘目录已删除' + extra)
+                      : ((ws.unregistered ? '已从侧栏移除' : '已移出工作区列表') + extra), 'ok');
           closeModal('ws-modal');
           loadWorkspaces().then(function () {
             loadSessions(true);

@@ -372,30 +372,54 @@ class TokenStore:
 
 # ---------------------------------------------------------------- 工作区注册表
 
-def load_workspaces():
+def load_workspace_store():
+    """{"workspaces": [...], "hidden": ["/path", ...]}
+
+    hidden 是「从侧栏隐藏」的目录：会话仍在库里，但侧栏不再按目录把这一组列出来。
+    没有它的话，移除工作区后只要目录下还有会话，分组会立刻重新出现 ——
+    用户看到的就是「删不掉」。
+    """
     if WORKSPACE_PATH.exists():
         try:
             d = json.loads(WORKSPACE_PATH.read_text(encoding="utf-8"))
-            return d.get("workspaces") or []
+            return {"workspaces": d.get("workspaces") or [],
+                    "hidden": [p for p in (d.get("hidden") or []) if isinstance(p, str)]}
         except Exception:
-            return []
-    return []
+            pass
+    return {"workspaces": [], "hidden": []}
 
 
-def save_workspaces(items):
+def save_workspace_store(workspaces, hidden):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     tmp = WORKSPACE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"workspaces": items}, ensure_ascii=False, indent=2),
-                   encoding="utf-8")
+    tmp.write_text(json.dumps({"workspaces": workspaces, "hidden": sorted(set(hidden))},
+                              ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(WORKSPACE_PATH)
 
 
+def load_workspaces():
+    return load_workspace_store()["workspaces"]
+
+
+def save_workspaces(items):
+    save_workspace_store(items, load_workspace_store()["hidden"])
+
+
+def unhide_path(path):
+    """目录被重新登记 / 改名时取消隐藏（隐藏只是「不列出来」，不是删除）。"""
+    store = load_workspace_store()
+    if path in store["hidden"]:
+        save_workspace_store(store["workspaces"], [p for p in store["hidden"] if p != path])
+
+
 def ensure_workspace_registered(path, purpose="project", name=None):
-    """确保某个目录在注册表里；返回登记项。"""
+    """确保某个目录在注册表里；返回登记项。登记即视为「不再隐藏」。"""
     path = os.path.abspath(path)
-    items = load_workspaces()
+    store = load_workspace_store()
+    items = store["workspaces"]
     for it in items:
         if it.get("path") == path:
+            unhide_path(path)
             return it
     it = {
         "id": "ws_" + hashlib.sha1(path.encode()).hexdigest()[:12],
@@ -405,7 +429,7 @@ def ensure_workspace_registered(path, purpose="project", name=None):
         "createdAt": int(time.time() * 1000),
     }
     items.append(it)
-    save_workspaces(items)
+    save_workspace_store(items, [p for p in store["hidden"] if p != path])
     return it
 
 
@@ -4323,10 +4347,12 @@ async def handle_workspaces(request):
         out.append({**it, "sessions": counts.get(path, 0),
                     "dir": workspace_dir_stat(path),
                     "isRoot": os.path.abspath(path) == root})
-    # 把有会话但没登记过的目录也带出来（比如别人手工建的会话）
+    # 把有会话但没登记过的目录也带出来（比如别人手工建的会话）；
+    # 被「从侧栏隐藏」的目录不再出现（会话还在库里，只是不列出来）
     known = {it["path"] for it in items}
+    hidden = set(load_workspace_store()["hidden"])
     for p, n in counts.items():
-        if p and p not in known:
+        if p and p not in known and p not in hidden:
             out.append({
                 "id": "ws_" + hashlib.sha1(p.encode()).hexdigest()[:12],
                 "name": os.path.basename(p.rstrip("/")) or p,
@@ -4413,6 +4439,7 @@ async def handle_workspace_create(request):
         # 在里面开会话会被判定「模型不可用」。启动时也会推，这里补一次让它立刻可用。
         asyncio.create_task(push_registry("新建工作区", [path]))
 
+    unhide_path(path)          # 重新登记 = 取消隐藏
     return web.json_response({"ok": True, "workspace": it, "created": not existed,
                               "dir": workspace_dir_stat(path)})
 
@@ -4439,17 +4466,82 @@ async def handle_workspace_update(request):
     return web.json_response({"ok": True, "workspace": it})
 
 
+async def sessions_under_dir(path):
+    """该目录下的会话 id：库里的 + app-server 内存里的。
+
+    刚建、还没跑过第一轮的会话只存在于 app-server 内存里（要等第一轮跑完才落库），
+    只查库会漏掉，删除工作区时就会把它留成孤儿。
+    """
+    sids = set()
+    try:
+        conn = db_connect()
+        try:
+            for r in conn.execute("SELECT id FROM session WHERE directory = ?", (path,)):
+                sids.add(r["id"])
+        finally:
+            conn.close()
+    except Exception as exc:
+        log(f"查库统计工作区会话失败: {exc}")
+    try:
+        res = await zc.call("session/list", {}, timeout=40)
+        for s in ((res or {}).get("sessions") or []):
+            p = ((s.get("workspace") or {}).get("workspacePath")) or ""
+            if p and os.path.abspath(p) == path:
+                sid = s.get("sessionId")
+                if sid:
+                    sids.add(sid)
+    except Exception as exc:
+        log(f"统计工作区会话失败: {exc}")
+    return sorted(sids)
+
+
+async def purge_session_now(sid):
+    """删一个会话：先让 app-server 卸载，再删库行（同单条删除的口径）。"""
+    try:
+        await zc.call("session/close", {"sessionId": sid}, timeout=20)
+    except Exception as exc:
+        log(f"session/close({sid}) 失败（继续删库）: {exc}")
+    await asyncio.to_thread(_delete_session_blocking, sid)
+    feed.feeds.pop(sid, None)
+    runner.forget(sid)
+    try:
+        await asyncio.to_thread(cleanup_session_files, sid)
+    except Exception as exc:
+        log(f"清理会话文件失败 {sid}: {exc}")
+    cleanup_session_state(sid)
+
+
 async def handle_workspace_delete(request):
-    """移出工作区列表。purge=1 时**连磁盘目录一起删**，必须带 confirm=<路径> 二次确认。"""
+    """移除工作区。
+
+    - wid 或 ?path=<目录>：后者用于「有会话但没登记过」的目录分组
+    - sessions=keep|archive|delete：目录下的会话怎么处理
+      * keep（默认）：会话留在库里；同时把这个目录加进隐藏表，
+        否则侧栏马上又会按目录把这一组显示出来（看起来像没删掉）
+      * archive：归档这些会话（移到「归档」页）
+      * delete：连会话记录一起删
+    - purge=1 时连磁盘目录一起删，必须带 confirm=<路径> 二次确认
+    """
     blocked = guard(request)
     if blocked:
         return blocked
     wid = request.match_info["wid"]
+    want_path = request.query.get("path")
     purge = request.query.get("purge") == "1"
+    mode = (request.query.get("sessions") or "keep").lower()
+    if mode not in ("keep", "archive", "delete"):
+        return json_error("sessions 只能是 keep / archive / delete", 400)
     root = os.path.abspath(config.get("workspace_root", "/root"))
 
-    items = load_workspaces()
+    store = load_workspace_store()
+    items = store["workspaces"]
+    hidden = list(store["hidden"])
     it = next((x for x in items if x.get("id") == wid), None)
+    if it is None and want_path:
+        # 未登记目录分组：只按路径操作
+        it = {"id": wid, "path": os.path.abspath(want_path),
+              "name": os.path.basename(os.path.abspath(want_path).rstrip("/")) or want_path,
+              "unregistered": True}
     if it is None:
         return json_error("工作区不存在", 404)
 
@@ -4472,24 +4564,53 @@ async def handle_workspace_delete(request):
         except Exception as exc:
             return json_error(f"删除目录失败: {exc}")
 
-    keep = [x for x in items if x.get("id") != wid]
-    save_workspaces(keep)
-    log(f"移除工作区: {it.get('name')} ({path})" +
-        ("，并已删除磁盘目录" if purged else "，磁盘目录保留"))
+    # 目录下的会话：先停掉在跑的，再按选择处理
+    sids = await sessions_under_dir(path)
+    handled = {"archived": 0, "deleted": 0, "kept": 0}
+    for sid in sids:
+        if runner.is_running(sid):
+            try:
+                await runner.cancel(sid, strict=True)
+            except Exception as exc:
+                log(f"移除工作区时停止会话失败 {sid}: {exc}")
+        if mode == "delete":
+            try:
+                await purge_session_now(sid)
+                handled["deleted"] += 1
+            except Exception as exc:
+                log(f"移除工作区时删除会话失败 {sid}: {exc}")
+                handled["kept"] += 1
+        elif mode == "archive":
+            try:
+                await asyncio.to_thread(archive_session, sid, True)
+                handled["archived"] += 1
+            except Exception as exc:
+                log(f"移除工作区时归档会话失败 {sid}: {exc}")
+                handled["kept"] += 1
+        else:
+            handled["kept"] += 1
 
-    # 目录没了，但会话记录还在库里，这里顺带告诉前端还剩多少条
-    left = 0
-    try:
-        conn = db_connect()
-        try:
-            left = conn.execute("SELECT COUNT(*) FROM session WHERE directory = ?",
-                                (path,)).fetchone()[0]
-        finally:
-            conn.close()
-    except Exception:
-        pass
+    if mode == "delete":
+        # 会话都没了，隐藏表里也不需要留这个目录
+        hidden = [p for p in hidden if p != path]
+    elif mode == "archive":
+        # 归档后活跃列表里自然就没有了；不隐藏，万一有没归档成功的还能看见、可重试
+        hidden = [p for p in hidden if p != path]
+    elif handled["kept"] > 0:
+        # 会话留在库里：隐藏这个目录，否则分组立刻复活（用户看到的就是「删不掉」）
+        if path not in hidden:
+            hidden.append(path)
+
+    keep = [x for x in items if x.get("id") != wid and x.get("path") != path]
+    save_workspace_store(keep, hidden)
+    log(f"移除工作区: {it.get('name')} ({path})，会话 {mode}"
+        f"（归档 {handled['archived']} / 删除 {handled['deleted']} / 保留 {handled['kept']}）"
+        + ("，并已删除磁盘目录" if purged else "，磁盘目录保留"))
+
+    left = len(await sessions_under_dir(path))
     return web.json_response({"ok": True, "path": path, "purged": purged,
-                              "sessionsLeft": left})
+                              "sessions": handled, "sessionsLeft": left,
+                              "hidden": mode != "delete"})
 
 
 # ---------------------------------------------------------------- 路由：会话

@@ -12,6 +12,8 @@ venv/
 # 本地验证产物
 *.log
 *.png
+# 站点图标是交付物，不算验证产物
+!static/apple-touch-icon.png
 # 根目录交付报告（静态页面源码仍需纳入版本控制）
 /zcode-chat-console.html
 

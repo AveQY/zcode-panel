@@ -2123,3 +2123,45 @@ pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
   .ctx-bar { width: 34px; }
   .ctx-gauge b { font-size: 11px; }
 }
+
+/* ============================ 轮次折叠 ============================ */
+/* 一轮执行完，中间步骤收进「执行过程」折叠块，外面只留最终结果 */
+.turn-fold-row { padding-bottom: 10px; }
+.turn-steps {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--sidebar);
+  overflow: hidden;
+}
+.turn-steps > summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  font-size: 12px;
+  color: var(--text-mute);
+  user-select: none;
+}
+.turn-steps > summary::-webkit-details-marker { display: none; }
+.turn-steps > summary:hover { color: var(--text-dim); }
+.ts-caret { font-size: 9px; line-height: 1; transition: transform .15s ease; }
+.ts-caret::before { content: '\25B6'; }
+.turn-steps[open] > summary .ts-caret { transform: rotate(90deg); }
+.ts-body {
+  padding: 10px 12px 4px;
+  border-top: 1px dashed var(--border);
+}
+/* 折叠块里的步骤行：去掉外层留白、头像缩小、不再有悬停操作条 */
+.ts-body .row { padding: 0 0 12px; max-width: none; margin: 0; }
+.ts-body .row:last-child { padding-bottom: 2px; }
+.ts-body .avatar { width: 20px; height: 20px; border-radius: 6px; font-size: 10px; }
+.ts-body .msg-actions { display: none; }
+.ts-body .bubble-user { max-width: 100%; }
+.ts-body .tool { margin: 6px 0; }
+
+@media (max-width: 760px) {
+  .turn-steps > summary { padding: 7px 10px; font-size: 11.5px; }
+  .ts-body { padding: 8px 10px 2px; }
+}

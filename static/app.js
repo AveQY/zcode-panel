@@ -618,6 +618,7 @@
         (r.data.messages || []).forEach(function (m) { renderHistoryMessage(m); });
         clearCursors();
         scrollToBottom(true);
+        scheduleFold();
       }
     }).catch(function () {}).then(function () {
       if (state.sessionId !== sid) return;
@@ -964,6 +965,7 @@
       var msgs = r.data.messages || [];
       // msgs 是时间正序；逐条“插到最上面”必须从新到旧遍历，否则整页顺序颠倒
       for (var i = msgs.length - 1; i >= 0; i--) renderHistoryMessage(msgs[i], true);
+      foldTurnGroups();      // 同步折叠：高度定下来后再补偿滚动位置，视口才不会跳
       p.rendered += msgs.length;
       p.hasMore = !!r.data.hasMore;
       p.oldestSeq = (msgs.length ? msgs[0].seq : null);
@@ -1012,7 +1014,10 @@
     // 若按 ID 严格比对，一条长回答会被渲染成两个（甚至三个）气泡。
     // 因此只要本轮气泡还活着（state.cur 非空）就直接复用，顺便把真实 ID 补上。
     if (state.cur) {
-      if (state.cur.mid === 'live' && mid !== 'live') state.cur.mid = mid;
+      if (state.cur.mid === 'live' && mid !== 'live') {
+        state.cur.mid = mid;
+        if (state.cur.row) state.cur.row.dataset.mid = mid;
+      }
       return state.cur;
     }
     var entry = state.messageMap.get(mid);
@@ -1037,6 +1042,11 @@
     box.appendChild(row);
 
     entry = { mid: mid, role: 'assistant', row: row, body: body, mdEl: null, raw: '' };
+    // 直播气泡还不知道真实 seq：给个「永远排最后」的序号，
+    // 万一被折进「执行过程」，还原时也不会插到历史前面去
+    row.dataset.mid = mid === 'live' ? '' : mid;
+    row.dataset.seq = 999999999;
+    row.dataset.t = Date.now();
     state.messageMap.set(mid, entry);
     state.cur = entry;
     scrollToBottom();
@@ -1213,6 +1223,7 @@
     var box = $('messages');
     var row = document.createElement('div');
     row.className = 'row user';
+    row.dataset.t = timeMs || 0;
     var bubble = document.createElement('div');
     bubble.className = 'bubble-user';
     bubble.textContent = text;
@@ -1231,6 +1242,7 @@
     // 记一笔：库里那条同样的用户消息稍后会被尾随取回来，靠它认领，别重复渲染
     state.localUserMsgs.push({ text: text, row: row, bound: false });
     if (state.localUserMsgs.length > 30) state.localUserMsgs.shift();
+    scheduleFold();          // 新的一轮开始了，上一轮该折起来
     return row;
   }
 
@@ -1253,6 +1265,7 @@
     if (state.cur && state.turnModel) setMsgModel(state.cur, state.turnModel);
     if (state.cur) addMsgTimeEl(state.cur, d && d.time ? d.time : Date.now());
     state.cur = null;
+    scheduleFold();          // 这一轮收尾了：把过程折起来，只留最终结果
     loadSessions(true).then(function () {
       if (state.tab === 'active') renderActive();
       var item = document.querySelector('.session-item[data-sid="' + state.sessionId + '"]');
@@ -2505,6 +2518,7 @@
       }
       var msgs = r.data.messages || [];
       msgs.forEach(function (m) { renderHistoryMessage(m); });
+      scheduleFold();                       // 历史里的旧轮次收进「执行过程」
       state.msgPage.rendered = msgs.length;
       state.msgPage.total = r.data.total || msgs.length;
       state.msgPage.hasMore = !!r.data.hasMore;
@@ -2614,6 +2628,11 @@
   function buildAssistantRow(m) {
     var row = document.createElement('div');
     row.className = 'row';
+    // 折叠分组用：id 认领、seq 还原顺序、time 算这轮耗时
+    row.dataset.mid = m.id || '';
+    row.dataset.seq = m.seq != null ? m.seq : '';
+    row.dataset.t = m.time || 0;
+    if (m.completed === false) row.dataset.live = '1';   // 没收尾的一轮不折叠
     row.innerHTML = '<div class="assistant"><div class="avatar">Z</div>' +
       '<div class="assistant-body"></div></div>' +
       '<div class="msg-actions"><button type="button" class="msg-copy" data-copy-msg="1" title="复制这条回复">复制</button></div>';
@@ -2717,6 +2736,156 @@
     else box.insertBefore(entry.row, beforeEl || $('thinking-row') || null);
   }
 
+  /* ---------- 轮次折叠：一轮的中间步骤收进「执行过程」，只留最终结果 ---------- */
+  /* 一轮 = 一条用户消息之后的所有助手步骤（zcode 会把一个 turn 拆成多个
+     step 消息）。收尾后把中间步骤、以及最终气泡自己的思考过程/工具卡片
+     收进折叠块，外面只留最后一段有正文的回复。
+     实现上每次都是「先还原、再分组、再折叠」，因此对增量更新是幂等的。 */
+
+  var expandedTurns = {};     // 用户手动展开过的轮次（重建折叠块时保持展开）
+
+  function messageRows() {
+    var box = $('messages'), out = [];
+    if (!box) return out;
+    for (var i = 0; i < box.children.length; i++) {
+      var el = box.children[i];
+      if (!el.classList) continue;
+      if (el.classList.contains('row') && !el.classList.contains('turn-fold-row')) out.push(el);
+    }
+    return out;
+  }
+
+  // 最终气泡里属于「过程」的节点：思考过程折叠块、工具卡片
+  function processNodesOf(row) {
+    var body = row.querySelector('.assistant-body');
+    if (!body) return [];
+    return [].slice.call(body.children).filter(function (ch) {
+      return ch.classList.contains('tool') ||
+             (ch.classList.contains('fold') && ch.dataset.kind === 'reason');
+    });
+  }
+
+  function rowHasText(row) {
+    var md = row.querySelector('.assistant-body > .md');
+    return !!(md && md.textContent.trim());
+  }
+
+  // 折叠块里借来的过程节点，如果所属气泡已经重新渲染出自己的副本，旧副本作废
+  function dropStaleAdopted(fold) {
+    [].slice.call(fold.querySelectorAll('[data-folded-for]')).forEach(function (n) {
+      var owner = state.messageMap.get(n.getAttribute('data-folded-for'));
+      var row = owner && owner.row;
+      if (row && row.isConnected && processNodesOf(row).length) {
+        if (n.parentNode) n.parentNode.removeChild(n);
+      }
+    });
+  }
+
+  // 还原：把折叠块里的步骤行按 seq 放回消息流，借来的节点还给所属气泡
+  function unfoldTurns() {
+    var box = $('messages');
+    if (!box) return;
+    var wraps = [].slice.call(box.querySelectorAll('.turn-fold-row'));
+    if (!wraps.length) return;
+    var rows = [];
+    wraps.forEach(function (w) {
+      var det = w.querySelector('.turn-steps');
+      if (det) {
+        dropStaleAdopted(det);
+        [].slice.call(det.querySelectorAll('[data-folded-for]')).forEach(function (n) {
+          var owner = state.messageMap.get(n.getAttribute('data-folded-for'));
+          var body = owner && owner.row && owner.row.querySelector('.assistant-body');
+          if (body) body.insertBefore(n, body.firstChild);
+          else if (n.parentNode) n.parentNode.removeChild(n);
+        });
+        [].slice.call(det.querySelectorAll('.ts-body > .row')).forEach(function (r) { rows.push(r); });
+      }
+      if (w.parentNode) w.parentNode.removeChild(w);
+    });
+    rows.sort(function (a, b) { return (+a.dataset.seq || 0) - (+b.dataset.seq || 0); });
+    rows.forEach(function (r) {
+      var seq = +r.dataset.seq || 0, anchor = null;
+      for (var i = 0; i < box.children.length; i++) {
+        var el = box.children[i];
+        if (!el.classList || !el.classList.contains('row')) continue;
+        if ((+el.dataset.seq || 0) > seq) { anchor = el; break; }
+      }
+      box.insertBefore(r, anchor);
+    });
+  }
+
+  function foldTurnGroups() {
+    if (!$('messages')) return;
+    unfoldTurns();
+    var groups = [], cur = null;
+    messageRows().forEach(function (r) {
+      if (r.classList.contains('user')) { cur = null; return; }   // 用户消息 = 新一轮
+      if (!r.querySelector('.assistant-body')) return;
+      if (!cur) { cur = []; groups.push(cur); }
+      cur.push(r);
+    });
+    // 正在跑的那一轮先摊开，等收尾再折
+    var running = isRunning(state.sessionId);
+    groups.forEach(function (g, idx) {
+      if (running && idx === groups.length - 1) return;
+      if (g.some(function (r) {
+        return r.dataset.live === '1' || !!r.querySelector('.cursor-blink');
+      })) return;
+      foldOneTurn(g);
+    });
+  }
+
+  function foldOneTurn(rows) {
+    var result = null;
+    for (var i = rows.length - 1; i >= 0; i--) {
+      if (rowHasText(rows[i])) { result = rows[i]; break; }
+    }
+    if (!result) return;                       // 一轮里没有正文，没什么可当结果
+    // 只在知道 seq 的行之间重排；不知道 seq 的行留在原地，避免还原时插错位置
+    var procs = rows.filter(function (r) { return r !== result && r.dataset.seq !== ''; });
+    var inner = processNodesOf(result);
+    if (!procs.length && !inner.length) return;
+
+    var tools = 0;
+    procs.forEach(function (r) { tools += r.querySelectorAll('.tool').length; });
+    inner.forEach(function (n) { if (n.classList.contains('tool')) tools += 1; });
+
+    var t0 = +rows[0].dataset.t || 0, t1 = +rows[rows.length - 1].dataset.t || 0;
+    var dur = (t0 && t1 && t1 > t0) ? t1 - t0 : 0;
+    var key = result.dataset.mid || ('seq' + result.dataset.seq);
+
+    var wrap = document.createElement('div');
+    wrap.className = 'row turn-fold-row';
+    var det = document.createElement('details');
+    det.className = 'turn-steps';
+    if (expandedTurns[key]) det.open = true;
+    det.addEventListener('toggle', function () {
+      if (det.open) expandedTurns[key] = 1;
+      else delete expandedTurns[key];
+    });
+    var sum = document.createElement('summary');
+    sum.innerHTML = '<span class="ts-caret"></span>执行过程 · ' + rows.length + ' 步' +
+      (tools ? ' · 工具 ' + tools + ' 次' : '') +
+      (dur ? ' · 耗时 ' + fmtDuration(dur) : '');
+    var sb = document.createElement('div');
+    sb.className = 'ts-body';
+    procs.forEach(function (r) { sb.appendChild(r); });
+    inner.forEach(function (n) {
+      n.setAttribute('data-folded-for', result.dataset.mid || '');
+      sb.appendChild(n);
+    });
+    det.appendChild(sum);
+    det.appendChild(sb);
+    wrap.appendChild(det);
+    if (result.parentNode) result.parentNode.insertBefore(wrap, result);
+  }
+
+  var foldTimer = null;
+  function scheduleFold() {
+    if (foldTimer) clearTimeout(foldTimer);
+    foldTimer = setTimeout(function () { foldTimer = null; foldTurnGroups(); }, 250);
+  }
+
   /* ---------- 实时尾随：外部进程跑的会话只能靠读库刷新 ---------- */
 
   function messageSignature(m) {
@@ -2774,6 +2943,7 @@
     }
     if (m.completed === false) state.cur = entry;
     scrollToBottom();
+    scheduleFold();          // 外部进程跑的会话：尾随补齐后同样折起来
   }
 
   function startTail(sid, cursor) {

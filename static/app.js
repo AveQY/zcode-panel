@@ -755,6 +755,21 @@
     }
   }
 
+  // 后端进程（app-server）自愈通知：看门狗重启后让界面自动接回来
+  function handleBackendState(d) {
+    if (d.state === 'restarting') {
+      setStatus(d.message || '后端进程已退出，正在自动重启…');
+      return;
+    }
+    if (d.state === 'ready') {
+      toast('后端已自动重启，正在恢复…', 'ok');
+      setStatus('');
+      loadSessions(true).then(function () {
+        reconcileAfterReconnect();     // 正在跑的话重新拉一遍消息，补上重启期间的内容
+      });
+    }
+  }
+
   function handleEvent(d) {
     // 会话级事件只渲染给「当前正在看的那个会话」——后台会话的输出绝不能
     // 混进当前视图，否则切回来会发现两个会话的内容串在一起。
@@ -763,6 +778,9 @@
       return;
     }
     switch (d.type) {
+      case 'backend':
+        handleBackendState(d);
+        break;
       case 'ready':
         break;
 

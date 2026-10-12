@@ -144,6 +144,11 @@ EVENT_POLL_INTERVAL = 0.35     # 拉取事件的间隔
 EVENT_FAIL_MAX = 40            # 连续拉取失败多少次就放弃跟随（连接已废时别无限刷日志）
 APP_SERVER_CALL_TIMEOUT = 90
 MAX_RPC_LINE = 32 * 1024 * 1024   # app-server 单行 JSON 上限（默认 64KB 会把读线程打死）
+# app-server 意外退出后的自愈：看门狗等一会儿再拉起（退避翻倍，封顶 60s），
+# 拉起期间来请求最多等 25s 再报错，避免重启窗口里正好发消息直接失败
+APP_SERVER_REVIVE_DELAY = 3.0
+APP_SERVER_REVIVE_DELAY_MAX = 60.0
+APP_SERVER_REVIVE_WAIT = 25.0
 TURN_IDLE_TIMEOUT = 900        # 事件连续静默多久就向 app-server 求证一次
 TURN_ABSOLUTE_MAX = 12 * 3600  # 单轮硬上限（求证后仍然在跑也不能无限跟下去）
 # app-server 侧「还在执行」的状态值。会话列表里查不到时保守认为还在跑：
@@ -1425,6 +1430,8 @@ class ZCodeServer:
         self.restart_lock = asyncio.Lock()
         # 配置文件是「读-改-写」，两个请求交错会丢更新，串行化一下
         self.config_lock = asyncio.Lock()
+        self.watch_task = None     # 看门狗：子进程死了自己拉起来
+        self.stopping = False      # 面板自己在停（别让看门狗又拉起来）
 
     async def start(self):
         env = {**os.environ, "HOME": "/root", "TERM": "dumb"}
@@ -1444,8 +1451,12 @@ class ZCodeServer:
         )
         self.ready.clear()
         self.reader_dead = False
+        self.stopping = False
         self.reader_task = asyncio.create_task(self._reader())
         self.stderr_task = asyncio.create_task(self._drain_stderr())
+        if self.watch_task and not self.watch_task.done():
+            self.watch_task.cancel()
+        self.watch_task = asyncio.create_task(self._watch_process())
         # 这里**故意不同步等待握手**：app-server 在我们发第一个请求之前不会说任何话，
         # 而第一个请求本来就要等 MCP 初始化（冷启动十几秒）。
         # 同步等只会让「归档 / 改配置」这类要重启 app-server 的操作白白卡 25 秒。
@@ -1647,6 +1658,14 @@ class ZCodeServer:
         if self.reader_dead:
             # 连接已废：立刻如实报错，别让调用方白等 30~90 秒才拿到超时
             raise RuntimeError("app-server 连接已失效（读线程退出），请稍候重试")
+        if self.proc is None or self.proc.returncode is not None:
+            # 进程没了：看门狗一般几秒内就把它拉起来。这里等一下，
+            # 别让「重启窗口内刚好来了一次请求」直接吃错误。
+            if not self.stopping:
+                if await self.wait_alive(APP_SERVER_REVIVE_WAIT):
+                    self.ready.clear()      # 新进程要重新握手，让第一个请求去等
+            if self.proc is None or self.proc.returncode is not None:
+                raise RuntimeError("app-server 未运行")
         self.seq += 1
         rid = "r%d" % self.seq
         fut = asyncio.get_running_loop().create_future()
@@ -1661,7 +1680,65 @@ class ZCodeServer:
             self.pending.pop(rid, None)
             raise RuntimeError(f"调用 {method} 超时（{timeout}s）")
 
+    async def watch_alive(self, timeout):
+        """等 app-server 重新可用（看门狗拉起期间用）。返回是否等到。"""
+        deadline = time.monotonic() + max(0, timeout)
+        while time.monotonic() < deadline:
+            if self.proc is not None and self.proc.returncode is None:
+                return True
+            await asyncio.sleep(0.3)
+        return self.proc is not None and self.proc.returncode is None
+
+    async def _watch_process(self):
+        """看门狗：app-server 进程一没就自己拉起来。
+
+        没有它的时候，进程一死（内存不够被 OOM 杀 / 被外部 kill / 崩了），
+        面板只会每 2 秒刷一条「app-server 未运行」，一直瘫痪到面板自己
+        被 systemd 重启为止（实测有过 27 分钟）。
+        """
+        delay = APP_SERVER_REVIVE_DELAY
+        while not self.stopping:
+            proc = self.proc
+            if proc is not None and proc.returncode is None:
+                try:
+                    # 活着的期间每 30s 醒一次：既重置退避，也能兜住「proc 已被换掉」
+                    await asyncio.wait_for(proc.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    delay = APP_SERVER_REVIVE_DELAY
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                code = proc.returncode
+            else:
+                code = proc.returncode if proc is not None else None
+            if self.stopping or proc is not self.proc:
+                continue
+            self.ready.clear()
+            log(f"app-server 进程已退出（code={code}），{delay:.0f}s 后自动拉起")
+            await notify_global({"type": "backend", "state": "restarting",
+                                 "message": "后端进程已退出，正在自动重启…"})
+            await asyncio.sleep(delay)
+            if self.stopping:
+                return
+            # 关键：restart() 里的 stop() 会 cancel self.watch_task —— 那正是
+            # 当前这个协程，会把自己的重启打断。先摘掉指针再重启。
+            self.watch_task = None
+            try:
+                await self.restart(reason="进程意外退出（看门狗自动拉起）")
+            except Exception as exc:
+                log(f"看门狗拉起 app-server 失败: {exc}")
+                delay = min(delay * 2, APP_SERVER_REVIVE_DELAY_MAX)
+                self.watch_task = asyncio.current_task()
+                continue
+            log("app-server 已由看门狗拉起")
+            await notify_global({"type": "backend", "state": "ready",
+                                 "message": "后端已重启，正在恢复"})
+            return      # 新进程由 start() 里新建的看门狗接管
+
     async def stop(self):
+        self.stopping = True
+        if self.watch_task and not self.watch_task.done():
+            self.watch_task.cancel()
         for t in (self.reader_task, self.stderr_task):
             if t and not t.done():
                 t.cancel()
@@ -1884,7 +1961,8 @@ class SessionFeedManager:
                                                       "已停止接收输出（结果以刷新后的历史为准）"})
                         outcome = "failed"
                         break
-                    log(f"拉取事件失败 {session_id}: {exc}")
+                    if fails == 1:      # 只记第一次：进程死了会连续失败，别刷屏
+                        log(f"拉取事件失败 {session_id}: {exc}")
                     await asyncio.sleep(1.5)
                     continue
                 fails = 0
@@ -6756,4 +6834,9 @@ if __name__ == "__main__":
                 host=config.get("bind", "0.0.0.0"),
                 port=int(config.get("port", 8081)),
                 access_log=None,
-                print=None)
+                print=None,
+                # 收到 SIGTERM 时别拖着已连接的 WebSocket 不放：aiohttp 默认
+                # 等处理器结束（最长 60s），systemd 的 TimeoutStopSec 一到就
+                # SIGKILL —— 之前每次重启都以 SIGKILL 收场就是这里。
+                shutdown_timeout=5,
+                handler_cancellation=True)

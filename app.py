@@ -149,6 +149,15 @@ MAX_RPC_LINE = 32 * 1024 * 1024   # app-server 单行 JSON 上限（默认 64KB 
 APP_SERVER_REVIVE_DELAY = 3.0
 APP_SERVER_REVIVE_DELAY_MAX = 60.0
 APP_SERVER_REVIVE_WAIT = 25.0
+# 熔断：短时间内反复重启说明不是偶发（典型是内存不够被 OOM），
+# 这时每几秒拉起一次会把整机拖进内存抖动。窗口内超过阈值就退到长冷却，
+# 并且只在可用内存够的时候才真的拉起。
+REVIVE_WINDOW = 300.0          # 统计窗口：5 分钟
+REVIVE_MAX_IN_WINDOW = 3       # 窗口内最多自动拉起 3 次
+REVIVE_COOLDOWN = 300.0        # 超过阈值后的冷却时间
+REVIVE_MIN_FREE_MB = 900       # 可用内存低于这个数就先不拉（留给系统喘气）
+BOOTSTRAP_MIN_INTERVAL = 60.0  # 模型目录预热的最小间隔（反复拉起时别每次都重推）
+_last_bootstrap_at = 0.0
 TURN_IDLE_TIMEOUT = 900        # 事件连续静默多久就向 app-server 求证一次
 TURN_ABSOLUTE_MAX = 12 * 3600  # 单轮硬上限（求证后仍然在跑也不能无限跟下去）
 # app-server 侧「还在执行」的状态值。会话列表里查不到时保守认为还在跑：
@@ -1432,6 +1441,7 @@ class ZCodeServer:
         self.config_lock = asyncio.Lock()
         self.watch_task = None     # 看门狗：子进程死了自己拉起来
         self.stopping = False      # 面板自己在停（别让看门狗又拉起来）
+        self.revive_history = []   # 自动拉起的时间戳（熔断用）
 
     async def start(self):
         env = {**os.environ, "HOME": "/root", "TERM": "dumb"}
@@ -1689,12 +1699,24 @@ class ZCodeServer:
             await asyncio.sleep(0.3)
         return self.proc is not None and self.proc.returncode is None
 
+    def mem_available_mb(self):
+        """系统可用内存（MB）。读不到就返回 -1（当成「不确定」，不拦）。"""
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        return int(line.split()[1]) // 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return -1
+
     async def _watch_process(self):
         """看门狗：app-server 进程一没就自己拉起来。
 
         没有它的时候，进程一死（内存不够被 OOM 杀 / 被外部 kill / 崩了），
         面板只会每 2 秒刷一条「app-server 未运行」，一直瘫痪到面板自己
         被 systemd 重启为止（实测有过 27 分钟）。
+        但拉起必须克制：短时间内反复死说明根因是内存，猛拉只会拖垮整机。
         """
         delay = APP_SERVER_REVIVE_DELAY
         while not self.stopping:
@@ -1714,12 +1736,34 @@ class ZCodeServer:
             if self.stopping or proc is not self.proc:
                 continue
             self.ready.clear()
-            log(f"app-server 进程已退出（code={code}），{delay:.0f}s 后自动拉起")
+            # 熔断判断：窗口内重启次数 + 当前可用内存
+            now = time.time()
+            hist = [t for t in self.revive_history if now - t < REVIVE_WINDOW]
+            self.revive_history = hist
+            free_mb = self.mem_available_mb()
+            too_many = len(hist) >= REVIVE_MAX_IN_WINDOW
+            low_mem = 0 <= free_mb < REVIVE_MIN_FREE_MB
+            if too_many or low_mem:
+                why = []
+                if too_many:
+                    why.append(f"{REVIVE_WINDOW:.0f}s 内已重启 {len(hist)} 次")
+                if low_mem:
+                    why.append(f"可用内存仅 {free_mb}MB")
+                log("看门狗暂缓拉起 app-server（" + "，".join(why) +
+                    f"），{REVIVE_COOLDOWN:.0f}s 后再试 —— 多半是内存不足被 OOM")
+                await notify_global({"type": "backend", "state": "waiting",
+                                     "message": "后端反复退出（疑似内存不足），"
+                                                "已暂缓自动重启，稍后再试"})
+                await asyncio.sleep(REVIVE_COOLDOWN)
+                continue
+            log(f"app-server 进程已退出（code={code}），{delay:.0f}s 后自动拉起"
+                + (f"（可用内存 {free_mb}MB）" if free_mb >= 0 else ""))
             await notify_global({"type": "backend", "state": "restarting",
                                  "message": "后端进程已退出，正在自动重启…"})
             await asyncio.sleep(delay)
             if self.stopping:
                 return
+            self.revive_history.append(time.time())
             # 关键：restart() 里的 stop() 会 cancel self.watch_task —— 那正是
             # 当前这个协程，会把自己的重启打断。先摘掉指针再重启。
             self.watch_task = None
@@ -1764,8 +1808,14 @@ class ZCodeServer:
                 await feed.reset_all(reason)
             _options_cache.clear()
             # 新进程的 provider registry 与 MCP 都要重建，后台先做好，
-            # 别让用户点开界面干等，也别让老会话因为「模型不可用」而发不出消息
-            asyncio.create_task(bootstrap_catalog(reason))
+            # 别让用户点开界面干等，也别让老会话因为「模型不可用」而发不出消息。
+            # 但刚推过就别再推（看门狗反复拉起时这一步很重，会加剧内存压力）。
+            global _last_bootstrap_at
+            if time.time() - _last_bootstrap_at >= BOOTSTRAP_MIN_INTERVAL:
+                _last_bootstrap_at = time.time()
+                asyncio.create_task(bootstrap_catalog(reason))
+            else:
+                log("模型目录刚预热过，跳过这次 bootstrap")
 
 
 # ---------------------------------------------------------------- 会话事件流
@@ -4344,6 +4394,8 @@ def build_runtime_model(ws_path, provider_id=None, model_id=None):
 
 async def bootstrap_catalog(reason=""):
     """推 registry + 预热模型目录。app-server 每次重启都要重来一遍。"""
+    global _last_bootstrap_at
+    _last_bootstrap_at = time.time()
     try:
         await push_registry(reason)
     except Exception as exc:

@@ -761,6 +761,12 @@
       setStatus(d.message || '后端进程已退出，正在自动重启…');
       return;
     }
+    if (d.state === 'waiting') {
+      // 看门狗熔断：反复退出时先别猛拉，界面要说清楚
+      setStatus(d.message || '后端反复退出，已暂缓自动重启');
+      toast(d.message || '后端反复退出（疑似内存不足），已暂缓自动重启', 'err');
+      return;
+    }
     if (d.state === 'ready') {
       toast('后端已自动重启，正在恢复…', 'ok');
       setStatus('');

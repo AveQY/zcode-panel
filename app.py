@@ -2039,6 +2039,10 @@ class SessionFeedManager:
                         await f.broadcast({"type": "error", "sessionId": session_id,
                                            "message": "与 app-server 的连接已中断，"
                                                       "已停止接收输出（结果以刷新后的历史为准）"})
+                        # 再补一个 done：前端收到后会去库里核实轮次是否真的结束，
+                        # 还在写库就自动切到增量尾随，不用用户刷新页面。
+                        await f.broadcast({"type": "done", "sessionId": session_id,
+                                           "degraded": True})
                         outcome = "failed"
                         break
                     if fails == 1:      # 只记第一次：进程死了会连续失败，别刷屏

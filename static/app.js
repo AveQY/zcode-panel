@@ -946,6 +946,12 @@
 
       case 'done':
         finishTurn(d);
+        // done 不一定代表真的跑完了：app-server 重启 / 事件流断供时后端也会
+        // 补发 done，此时轮次可能还在往库里写。核实一次，还在写就自动切到
+        // 增量尾随继续跟 —— 不用用户刷新页面才能看到后续输出。
+        if (state.sessionId && (d.degraded || d.reset)) {
+          verifyTurnAfterDone(state.sessionId);
+        }
         break;
 
       case 'error':
@@ -1475,6 +1481,23 @@
     for (var i = 0; i < cursors.length; i++) {
       if (cursors[i].parentNode) cursors[i].parentNode.removeChild(cursors[i]);
     }
+  }
+
+  // 收到 done 后核实库里这个会话是否真的收尾了。事件流断供/后端重启时
+  // done 只是「面板不跟了」的信号，轮次可能还在往库里写 —— 这时就地转成
+  // 增量尾随继续跟，不要求用户刷新页面（线上实测的不实时就出在这）。
+  function verifyTurnAfterDone(sid) {
+    if (!sid || sid !== state.sessionId) return;
+    req('/api/sessions/' + encodeURIComponent(sid) + '/tail?after=0').then(function (r) {
+      if (state.sessionId !== sid) return;
+      var d = r.data || {};
+      if (!d.ok) return;
+      if (d.dbLive && d.active && !isRunning(sid)) {
+        markRunning(sid, true, { external: true });
+        ensureTailFallback(sid);
+        setStatus('输出改为增量同步中…');
+      }
+    }).catch(function () {});
   }
 
   function finishTurn(d) {
@@ -3420,9 +3443,19 @@
     clearCursors();
     removeThinking();
     setStatus('');
-    if (state.cur && state.cur.raw) {
-      var el = state.cur.mdEl;
-      if (el) el.innerHTML = mdParse(state.cur.raw);
+    if (state.cur) {
+      var fin = state.cur;
+      if (fin.mdTimer) { clearTimeout(fin.mdTimer); fin.mdTimer = null; }
+      var hasBody = !!(fin.raw && fin.raw.trim());
+      var hasProcess = !!fin.body.querySelector('.tool, details.fold');
+      if (!hasBody && !hasProcess) {
+        // 空壳行（只有头像+光标）直接拆掉，别留假输入态
+        if (fin.row && fin.row.parentNode) fin.row.parentNode.removeChild(fin.row);
+        if (fin.mid) state.messageMap.delete(fin.mid);
+      } else if (fin.raw) {
+        var el = fin.mdEl;
+        if (el) el.innerHTML = mdParse(fin.raw);
+      }
     }
     state.cur = null;
     if (wasExternal && wasRunning) toast('「' + titleOf(sid) + '」已完成', 'ok');

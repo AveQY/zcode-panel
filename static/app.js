@@ -263,7 +263,10 @@
     var s = ms / 1000;
     if (s < 60) return s.toFixed(1) + 's';
     var m = Math.floor(s / 60);
-    return m + 'm' + Math.round(s - m * 60) + 's';
+    if (m < 60) return m + 'm' + Math.round(s - m * 60) + 's';
+    var h = Math.floor(m / 60);
+    if (h < 24) return h + 'h' + (m - h * 60) + 'm';
+    return Math.floor(h / 24) + 'd' + (h - Math.floor(h / 24) * 24) + 'h';
   }
 
   function scrollToBottom(force) {
@@ -1105,7 +1108,8 @@
     row.appendChild(wrap);
     box.appendChild(row);
 
-    entry = { mid: mid, role: 'assistant', row: row, body: body, mdEl: null, raw: '' };
+    entry = { mid: mid, role: 'assistant', row: row, body: body, mdEl: null, raw: '',
+              pendingRaw: undefined, mdTimer: null };
     // 直播气泡还不知道真实 seq：给个「永远排最后」的序号，
     // 万一被折进「执行过程」，还原时也不会插到历史前面去
     row.dataset.mid = mid === 'live' ? '' : mid;
@@ -1151,9 +1155,26 @@
     if (!text) return;
     var entry = ensureAssistant(messageId);
     entry.raw += text;
+    // 流式分片可能一行来好几次：每次都整段重跑 marked 是 O(n²)，长回复会
+    // 越到后面越卡。这里只记下待渲染文本，80ms 窗口统一刷一次 DOM。
+    entry.pendingRaw = entry.raw;
+    if (!entry.mdTimer) {
+      entry.mdTimer = setTimeout(function () {
+        entry.mdTimer = null;
+        flushMd(entry, true);
+      }, MD_FLUSH_MS);
+    }
+  }
+
+  var MD_FLUSH_MS = 80;
+
+  function flushMd(entry, live) {
+    if (entry.mdTimer) { clearTimeout(entry.mdTimer); entry.mdTimer = null; }
+    if (entry.pendingRaw === undefined) return;
+    entry.pendingRaw = undefined;
     var el = mdElOf(entry);
     el.dataset.raw = entry.raw;
-    el.innerHTML = mdParse(entry.raw) + '<span class="cursor-blink"></span>';
+    el.innerHTML = mdParse(entry.raw) + (live ? '<span class="cursor-blink"></span>' : '');
     scrollToBottom();
   }
 
@@ -1162,12 +1183,8 @@
     var entry = ensureAssistant(messageId);
     // 短回复上游不吐分片，整段文本只在 final / turnEnd 里出现一次；
     // 这里做「对账」：和已流出的文本不一致就用权威文本整段替换。
-    if (text === entry.raw) return;
     entry.raw = text;
-    var el = mdElOf(entry);
-    el.dataset.raw = text;
-    el.innerHTML = mdParse(text);
-    scrollToBottom();
+    flushMd(entry, false);          // 取消挂着的节流器，直接渲染权威全文
   }
 
   function appendReasoning(messageId, text) {
@@ -2449,6 +2466,19 @@
       }
       var list = r.data.sessions || [];
       if (state.tab === 'archived') state.archived = list; else state.sessions = list;
+      // 轮询大多是「什么都没变」：先比签名，没变就别重建整棵 DOM（几十个
+      // 会话时重建会引起可见的闪烁，也白耗 CPU）。
+      var sig = list.map(function (s) {
+        return [s.id, s.title, s.updated, s.status, s.autoRun ? 1 : 0,
+                (s.pendingModel || s.model || {}).modelId || '', s.archived ? 1 : 0]
+          .join('\u0001');
+      }).join('\u0002');
+      if (sig === state.listSig && !state.forceListRender) {
+        renderRunningMarks();    // 状态仍要校准（本页有会话刚开始跑的瞬间）
+        return;
+      }
+      state.listSig = sig;
+      state.forceListRender = false;
       renderSessions(list);
     }).catch(function () {
       if (!silent) toast('网络异常，无法获取会话列表', 'err');
@@ -2780,6 +2810,7 @@
     var b = e.target.closest ? e.target.closest('.seg-btn') : null;
     if (!b) return;
     state.tab = b.dataset.tab;
+    state.listSig = null;          // 归档/活跃两个列表内容不同，必须强制重绘
     var btns = this.querySelectorAll('.seg-btn');
     for (var i = 0; i < btns.length; i++) btns[i].classList.toggle('active', btns[i] === b);
     loadSessions(true);
@@ -2930,7 +2961,8 @@
       '<div class="assistant-body"></div></div>' +
       '<div class="msg-actions"><button type="button" class="msg-copy" data-copy-msg="1" title="复制这条回复">复制</button></div>';
     var entry = { mid: m.id, role: 'assistant', row: row,
-                  body: row.querySelector('.assistant-body'), mdEl: null, raw: '' };
+                  body: row.querySelector('.assistant-body'), mdEl: null, raw: '',
+                  pendingRaw: undefined, mdTimer: null };
     state.messageMap.set(m.id, entry);   // 先登记：part 里的 handleTool 要按 id 查它
     fillAssistantParts(entry, m);
     if (m.model) setMsgModel(entry, m.model);
@@ -3166,10 +3198,16 @@
       if (det.open) expandedTurns[key] = 1;
       else delete expandedTurns[key];
     });
+    // 摘要行学 zcode 桌面端：一条细线 + 左边小圆点图标 +「思考 · 持续了 Xs」，
+    // 右侧一个会转向的箭头。没有边框盒子，视觉上轻得多。
+    var parts = [];
+    if (tools) parts.push('工具 ' + tools + ' 次');
+    if (dur) parts.push('持续了 ' + fmtDuration(dur));
     var sum = document.createElement('summary');
-    sum.innerHTML = '<span class="ts-caret"></span>执行过程 · ' + rows.length + ' 步' +
-      (tools ? ' · 工具 ' + tools + ' 次' : '') +
-      (dur ? ' · 耗时 ' + fmtDuration(dur) : '');
+    sum.innerHTML =
+      '<span class="ts-dot"></span>' +
+      '<span class="ts-label">思考' + (parts.length ? ' · ' + parts.join(' · ') : '') + '</span>' +
+      '<span class="ts-arrow"></span>';
     var sb = document.createElement('div');
     sb.className = 'ts-body';
     procs.forEach(function (r) { sb.appendChild(r); });
@@ -3231,6 +3269,7 @@
     if (m.completed !== false && !assistantRenderable(m)) return;
     removeThinking();
     hideWelcome();
+    if (old && old.mdTimer) { clearTimeout(old.mdTimer); old.mdTimer = null; }  // 别让旧节流器写到已拆掉的 DOM
     state.cur = null;                        // 重建期间别让 part 渲染串到别的气泡
     var entry = buildAssistantRow(m);
     entry.sig = sig;
@@ -3469,6 +3508,7 @@
     return req('/api/workspaces').then(function (r) {
       if (!r.data.ok) return;
       state.workspaces = r.data.workspaces || [];
+      state.forceListRender = true;   // 工作区分组依赖这份清单，变了就得重绘侧栏
       if (r.data.root) state.wsRoot = r.data.root;
       var sel = $('nc-workspace');
       var keep = sel.value;

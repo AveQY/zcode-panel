@@ -892,6 +892,9 @@ def load_messages(session_id, limit=None, before=None):
     limit: 只取最近 limit 条；before: 只取 sequence < before 的更早一段。
     两者配合实现「默认最近 50 条 + 上滑加载更早消息」的分页，避免长会话
     一次性全量拉库导致打开慢、内存涨。
+
+    part 用一次 IN 批量查询取回（以前是每条消息查一次，50 条消息 = 51 次
+    查询，SQLite 上虽然每次都不慢，但在 2 核小机器上能省好几毫秒是一毫秒）。
     """
     conn = db_connect()
     try:
@@ -917,26 +920,53 @@ def load_messages(session_id, limit=None, before=None):
         cur.execute(sql, params)
         # 倒序取再反转，等价于时间正序的「最后 limit 条」
         rows = list(cur.fetchall())[::-1]
-        return [message_payload(cur, r) for r in rows]
+        return build_payloads(cur, rows)
     finally:
         conn.close()
 
 
-def message_payload(cur, row):
+def build_payloads(cur, rows):
+    """批量组装 message_payload：一次把这一页所有 part 查回来再按消息分组。
+
+    结果与逐条调用 message_payload 完全一致；单条路径（tail 增量等）仍走
+    message_payload 本身。
+    """
+    if not rows:
+        return []
+    ids = [r["id"] for r in rows]
+    marks = ",".join("?" for _ in ids)
+    cur.execute(f"SELECT message_id, data, sequence, time_updated FROM part "
+                f"WHERE message_id IN ({marks}) ORDER BY sequence", ids)
+    by_msg = {}
+    part_updated = {}
+    for p in cur.fetchall():
+        by_msg.setdefault(p["message_id"], []).append(p)
+    out = []
+    for r in rows:
+        group = by_msg.get(r["id"]) or []
+        payload = message_payload(cur, r, parts_rows=group)
+        out.append(payload)
+    return out
+
+
+def message_payload(cur, row, parts_rows=None):
     """一行 message + 它的 part，拼成前端要的结构（历史与增量共用）。
 
     completed / updated 两个字段是「实时化」补上的：前端靠 completed 判断
     这条助手消息是「正在生成」还是「已收尾」，靠 updated 推进增量游标。
+    parts_rows: 批量路径（build_payloads）预取好的 part 行；不传就自己查一条。
     """
     try:
         meta = json.loads(row["data"] or "{}")
     except Exception:
         meta = {}
-    cur.execute("SELECT data, sequence, time_updated FROM part "
-                "WHERE message_id = ? ORDER BY sequence", (row["id"],))
+    if parts_rows is None:
+        cur.execute("SELECT data, sequence, time_updated FROM part "
+                    "WHERE message_id = ? ORDER BY sequence", (row["id"],))
+        parts_rows = cur.fetchall()
     parts = []
     updated = int(row["time_updated"] or row["time_created"] or 0)
-    for p in cur.fetchall():
+    for p in parts_rows:
         updated = max(updated, int(p["time_updated"] or 0))
         try:
             parts.append(json.loads(p["data"] or "{}"))
@@ -1012,7 +1042,7 @@ def load_messages_since(session_id, since_ms, limit=TAIL_LIMIT):
                 "ORDER BY sequence DESC LIMIT ?",
                 (session_id, int(limit)))
             rows = list(cur.fetchall())[::-1]
-        return [message_payload(cur, r) for r in rows]
+        return build_payloads(cur, rows)
     finally:
         conn.close()
 

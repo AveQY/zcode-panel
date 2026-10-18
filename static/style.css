@@ -618,6 +618,10 @@ select { cursor: pointer; }
 .sidebar-foot { display: block; padding: 10px 12px 12px; }
 .foot-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 #settings-btn { font-size: 12.5px; }
+/* 空间不够时让 IP 信息截断，按钮绝不能被压窄 —— 否则中文会在字与字之间
+   换行，「深色」变成上「深」下「色」竖排（线上实测）。 */
+.foot-row .text-btn { flex: none; white-space: nowrap; }
+.foot-row .foot-info { flex: 1 1 auto; min-width: 0; }
 .text-btn.subtle { display: block; width: 100%; text-align: left; margin-top: 2px; color: var(--text-mute); }
 .text-btn.subtle:hover { color: var(--text); }
 

@@ -351,46 +351,57 @@ input, textarea, select {
 .dots i:nth-child(3) { animation-delay: 0.36s; }
 @keyframes blink { 0%, 60%, 100% { opacity: 0.25; } 30% { opacity: 1; } }
 
+/* 思考过程与轮次折叠同款视觉：上细线 + 圆点 + 单行标签 + 转向箭头，
+   去掉边框盒子（线上反馈要求所有「过程类」UI 归一到 zcode 那种轻样式） */
 details.fold {
-  margin: 8px 0;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--sidebar);
-  overflow: hidden;
+  margin: 2px 0 8px;
+  border-top: 1px solid var(--border);
 }
 details.fold > summary {
-  padding: 8px 12px;
+  padding: 8px 4px;
   font-size: 12.5px;
-  color: var(--text-dim);
+  color: var(--text-mute);
   cursor: pointer;
   user-select: none;
   list-style: none;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
 }
 details.fold > summary::-webkit-details-marker { display: none; }
-details.fold > summary::before {
-  content: "";
-  width: 0; height: 0;
-  border-left: 5px solid var(--text-mute);
-  border-top: 4px solid transparent;
-  border-bottom: 4px solid transparent;
-  transition: transform 0.15s;
-}
-details.fold[open] > summary::before { transform: rotate(90deg); }
-details.fold > summary:hover { background: var(--sidebar-hover); }
+details.fold > summary:hover .ts-label { color: var(--text); }
+details.fold .ts-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; transition: color .15s; }
 .fold-body {
-  padding: 10px 14px 12px;
+  padding: 2px 4px 8px;
   font-size: 12.5px;
   line-height: 1.75;
   color: var(--text-dim);
   white-space: pre-wrap;
   word-break: break-word;
-  border-top: 1px solid var(--border-soft);
   max-height: 340px;
   overflow-y: auto;
 }
+
+/* ---------------- 工具卡片 ---------------- */
+/* 也是 details 折叠：单行摘要（圆点+工具名+描述+状态+箭头），展开看命令与输出 */
+details.tool {
+  margin: 2px 0 8px;
+  border-top: 1px solid var(--border);
+}
+details.tool > summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 4px;
+  font-size: 12.5px;
+  color: var(--text-mute);
+}
+details.tool > summary::-webkit-details-marker { display: none; }
+details.tool > summary:hover .tool-name { color: var(--text); }
+details.tool > summary .ts-label { display: none; }   /* 复用折叠行骨架，工具卡不需要标签位 */
 
 .tool {
   margin: 8px 0;
@@ -399,18 +410,12 @@ details.fold > summary:hover { background: var(--sidebar-hover); }
   overflow: hidden;
   background: #fff;
 }
-.tool-head {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 12px;
-  background: var(--sidebar);
-  border-bottom: 1px solid var(--border-soft);
-  font-size: 12.5px;
-}
-.tool-name { font-weight: 600; font-family: var(--mono); color: var(--text); }
+.tool-name { font-weight: 600; font-family: var(--mono); color: var(--text-dim); flex: none; transition: color .15s; }
 .tool-desc {
-  flex: 1; min-width: 0; color: var(--text-dim);
+  flex: 1 1 auto; min-width: 0; color: var(--text-mute);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   font-size: 12px;
+  font-family: var(--mono);
 }
 .tool-status {
   font-size: 11px; padding: 1px 8px; border-radius: 20px;
@@ -419,7 +424,7 @@ details.fold > summary:hover { background: var(--sidebar-hover); }
 .tool-status.running { background: var(--amber-soft); color: var(--amber); }
 .tool-status.error { background: var(--red-soft); color: var(--red); }
 .tool-body {
-  padding: 9px 12px;
+  padding: 6px 4px 10px;
   font-family: var(--mono);
   font-size: 12px;
   line-height: 1.65;
@@ -428,9 +433,9 @@ details.fold > summary:hover { background: var(--sidebar-hover); }
   word-break: break-word;
   max-height: 260px;
   overflow-y: auto;
-  background: var(--code-bg);
+  background: transparent;
 }
-.tool-body.out { border-top: 1px solid var(--border-soft); color: #57606a; }
+.tool-body.out { padding-top: 0; color: var(--text-mute); }
 
 /* ---------------- Markdown ---------------- */
 
@@ -2183,7 +2188,7 @@ pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 .ts-body .avatar { width: 20px; height: 20px; border-radius: 6px; font-size: 10px; }
 .ts-body .msg-actions { display: none; }
 .ts-body .bubble-user { max-width: 100%; }
-.ts-body .tool { margin: 6px 0; }
+.ts-body .tool { margin: 2px 0 6px; }
 
 @media (max-width: 760px) {
   .turn-steps > summary { padding: 7px 2px; font-size: 12px; }

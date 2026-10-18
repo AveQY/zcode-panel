@@ -1195,12 +1195,10 @@
       var fold = document.createElement('details');
       fold.className = 'fold';
       fold.dataset.kind = 'reason';
-      var sum = document.createElement('summary');
-      sum.textContent = '思考过程';
-      var fb = document.createElement('div');
-      fb.className = 'fold-body';
-      fold.appendChild(sum);
-      fold.appendChild(fb);
+      // 与轮次折叠同款视觉：圆点 + 单行标签 + 转向箭头
+      fold.innerHTML = '<summary><span class="ts-dot"></span>' +
+        '<span class="ts-label">思考过程</span><span class="ts-arrow"></span></summary>' +
+        '<div class="fold-body"></div>';
       entry.body.appendChild(fold);
       entry.mdEl = null;
       last = fold;
@@ -1217,12 +1215,17 @@
     var id = d.toolCallId || 'tool';
     var card = entry.body.querySelector('[data-tcid="' + id + '"]');
     if (!card) {
-      card = document.createElement('div');
+      card = document.createElement('details');
       card.className = 'tool';
       card.dataset.tcid = id;
+      // 与思考/轮次折叠同款视觉：圆点 + 工具名 + 描述 + 状态徽标 + 转向箭头；
+      // 命令与输出收进展开体。执行中的工具自动展开看进展，收尾后收起。
       card.innerHTML =
-        '<div class="tool-head"><span class="tool-name"></span>' +
-        '<span class="tool-desc"></span><span class="tool-status"></span></div>';
+        '<summary><span class="ts-dot"></span>' +
+        '<span class="tool-name"></span>' +
+        '<span class="tool-desc"></span>' +
+        '<span class="tool-status"></span>' +
+        '<span class="ts-arrow"></span></summary>';
       entry.body.appendChild(card);
       entry.mdEl = null;
     }
@@ -1249,6 +1252,8 @@
     statEl.className = 'tool-status' +
       (d.state === 'completed' || d.state === 'result' ? '' :
         (d.state === 'failed' || d.state === 'error' ? ' error' : ' running'));
+    // 执行中摊开看进展；收尾收起，保持和 zcode 一样的「过程默认收起」
+    card.open = !(d.state === 'completed' || d.state === 'result');
 
     if (d.payload) {
       var out = extractToolOutput(d.payload);
@@ -2984,12 +2989,10 @@
           var fold = document.createElement('details');
           fold.className = 'fold';
           fold.dataset.kind = 'reason';
-          var sum = document.createElement('summary');
-          sum.textContent = '思考过程';
-          var fb = document.createElement('div');
-          fb.className = 'fold-body';
-          fold.appendChild(sum);
-          fold.appendChild(fb);
+          // 与轮次折叠同款视觉：圆点 + 单行标签 + 转向箭头
+          fold.innerHTML = '<summary><span class="ts-dot"></span>' +
+            '<span class="ts-label">思考过程</span><span class="ts-arrow"></span></summary>' +
+            '<div class="fold-body"></div>';
           entry.body.appendChild(fold);
           entry.mdEl = null;
           last = fold;
@@ -3015,10 +3018,13 @@
       }
     });
     if (m.error) {
-      var ed = document.createElement('div');
+      var ed = document.createElement('details');
       ed.className = 'tool';
-      ed.innerHTML = '<div class="tool-head"><span class="tool-name">错误</span>' +
-        '<span class="tool-status error">失败</span></div>' +
+      ed.open = true;   // 错误默认展开，用户必须看到
+      ed.innerHTML = '<summary><span class="ts-dot"></span>' +
+        '<span class="tool-name">错误</span>' +
+        '<span class="tool-status error">失败</span>' +
+        '<span class="ts-arrow"></span></summary>' +
         '<div class="tool-body out">' + esc(typeof m.error === 'string'
           ? m.error : JSON.stringify(m.error)) + '</div>';
       entry.body.appendChild(ed);

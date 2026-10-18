@@ -393,6 +393,7 @@
     state.wsEnabled = true;
     syncComposer();
     connectWs();
+    checkBackend();
     loadOptions();
     loadUsage('today');
     loadSchedules();
@@ -574,6 +575,7 @@
   });
 
   function onWsReady() {
+    checkBackend();     // WS 能连上不代表后端活着，每次连上都确认一次
     // 断线期间用户发过消息：直接补发，不走 watch（那一轮还没开始，回放会串内容）
     if (state.pendingSend) {
       setStatus('已重新连接，正在提交…');
@@ -774,6 +776,42 @@
         reconcileAfterReconnect();     // 正在跑的话重新拉一遍消息，补上重启期间的内容
       });
     }
+  }
+
+  // 页面壳由面板进程提供，后端（app-server）却可能已经被 OOM 杀掉、看门狗
+  // 正在退避重启。这时页面能打开但什么都发不出去，用户看到的就是「打不开」。
+  // 启动和重连时主动查一次，把状态说清楚，恢复后自动接回来。
+  var backendDown = false;
+  var backendProbeTimer = null;
+
+  function stopBackendProbe() {
+    if (backendProbeTimer) { clearInterval(backendProbeTimer); backendProbeTimer = null; }
+  }
+
+  function checkBackend() {
+    req('/healthz').then(function (r) {
+      if (r.data && r.data.appServer) {
+        stopBackendProbe();
+        if (backendDown) {
+          backendDown = false;
+          setStatus('');
+          toast('后端已恢复', 'ok');
+          loadSessions(true).then(function () { reconcileAfterReconnect(); });
+        }
+        return;
+      }
+      backendDown = true;
+      setStatus('后端进程正在重启（可能内存不足被系统回收），请稍候…');
+      if (!backendProbeTimer) {
+        backendProbeTimer = setInterval(checkBackend, 3000);
+      }
+    }).catch(function () {
+      backendDown = true;
+      setStatus('无法连接服务，正在重试…');
+      if (!backendProbeTimer) {
+        backendProbeTimer = setInterval(checkBackend, 3000);
+      }
+    });
   }
 
   function handleEvent(d) {

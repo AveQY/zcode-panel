@@ -1672,7 +1672,7 @@ class ZCodeServer:
             # 进程没了：看门狗一般几秒内就把它拉起来。这里等一下，
             # 别让「重启窗口内刚好来了一次请求」直接吃错误。
             if not self.stopping:
-                if await self.wait_alive(APP_SERVER_REVIVE_WAIT):
+                if await self.watch_alive(APP_SERVER_REVIVE_WAIT):
                     self.ready.clear()      # 新进程要重新握手，让第一个请求去等
             if self.proc is None or self.proc.returncode is not None:
                 raise RuntimeError("app-server 未运行")

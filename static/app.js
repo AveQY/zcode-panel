@@ -1482,13 +1482,28 @@
     removeThinking();
     setSending(false);
     setStatus('');
-    if (state.cur && state.cur.raw) {
-      var el = state.cur.mdEl;
-      if (el) el.innerHTML = mdParse(state.cur.raw);
+    if (state.cur) {
+      var fin = state.cur;
+      if (fin.mdTimer) { clearTimeout(fin.mdTimer); fin.mdTimer = null; }
+      // 一轮收尾时这个气泡还没有任何可展示的内容（正文/思考/工具都没有）
+      // —— 它只是被 started 事件提前画出来的空壳。拆掉，别留一行
+      // 「头像 + 光标」假装还在输入（线上实测的闪烁来源）。
+      var hasBody = !!(fin.raw && fin.raw.trim());
+      var hasProcess = !!fin.body.querySelector('.tool, details.fold');
+      if (!hasBody && !hasProcess) {
+        if (fin.row && fin.row.parentNode) fin.row.parentNode.removeChild(fin.row);
+        if (fin.mid) state.messageMap.delete(fin.mid);
+        state.cur = null;
+      } else {
+        if (fin.raw) {
+          var el = fin.mdEl;
+          if (el) el.innerHTML = mdParse(fin.raw);
+        }
+        if (state.turnModel) setMsgModel(fin, state.turnModel);
+        addMsgTimeEl(fin, d && d.time ? d.time : Date.now());
+        state.cur = null;
+      }
     }
-    if (state.cur && state.turnModel) setMsgModel(state.cur, state.turnModel);
-    if (state.cur) addMsgTimeEl(state.cur, d && d.time ? d.time : Date.now());
-    state.cur = null;
     scheduleFold();          // 这一轮收尾了：把过程折起来，只留最终结果
     loadSessions(true).then(function () {
       if (state.tab === 'active') renderActive();
@@ -3066,7 +3081,9 @@
       return;
     }
     if (m.role !== 'assistant') return;
-    if (m.completed !== false && !assistantRenderable(m)) return;
+    // 没有可展示内容的行（含未收尾的占位 step）一律不画：画出来就是
+    // 一行「头像 + 光标」假输入态；真有内容时尾随/事件会再补。
+    if (!assistantRenderable(m)) return;
 
     removeThinking();
     hideWelcome();
@@ -3272,7 +3289,17 @@
     var sig = messageSignature(m);
     var old = state.messageMap.get(m.id);
     if (old && old.sig === sig) return;      // 内容没变就别动 DOM，免得闪
-    if (m.completed !== false && !assistantRenderable(m)) return;
+    // 收尾后仍然没有可展示内容的（step-start/finish 占位）：之前「正在生成」
+    // 阶段画出来的空壳行（头像+光标）要拆掉，否则页面上会留一行假「正在输入」。
+    if (m.completed !== false && !assistantRenderable(m)) {
+      if (old && old.row && old.row.parentNode) {
+        if (old.mdTimer) { clearTimeout(old.mdTimer); old.mdTimer = null; }
+        old.row.parentNode.removeChild(old.row);
+        state.msgPage.rendered = Math.max(0, state.msgPage.rendered - 1);
+        state.messageMap.delete(m.id);
+      }
+      return;
+    }
     removeThinking();
     hideWelcome();
     if (old && old.mdTimer) { clearTimeout(old.mdTimer); old.mdTimer = null; }  // 别让旧节流器写到已拆掉的 DOM

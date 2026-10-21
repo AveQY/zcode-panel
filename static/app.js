@@ -1097,7 +1097,12 @@
     // 因此只要本轮气泡还活着（state.cur 非空）就直接复用，顺便把真实 ID 补上。
     if (state.cur) {
       if (state.cur.mid === 'live' && mid !== 'live') {
+        // 真实消息 ID 到了：把登记表的 key 一并换掉。否则尾随按 id 找不到这行，
+        // 会再画一条重复气泡，而且这一行永远带着假的 seq=999999999。
+        state.messageMap.delete('live');
         state.cur.mid = mid;
+        state.messageMap.set(mid, state.cur);
+        state.cur.sig = null;          // 让尾随能重建，顺便补上真实 seq
         if (state.cur.row) state.cur.row.dataset.mid = mid;
       }
       return state.cur;
@@ -1475,7 +1480,7 @@
     acts.className = 'msg-actions user-actions';
     acts.innerHTML = '<button type="button" class="msg-copy" data-copy-msg="1" title="复制这条消息">复制</button>';
     row.appendChild(acts);
-    if (prepend) box.insertBefore(row, box.firstChild);
+    if (prepend) box.insertBefore(row, topAnchor());
     else if (beforeEl) box.insertBefore(row, beforeEl);
     else { box.appendChild(row); scrollToBottom(true); }
     // 记一笔：库里那条同样的用户消息稍后会被尾随取回来，靠它认领，别重复渲染。
@@ -1536,6 +1541,9 @@
           var el = fin.mdEl;
           if (el) el.innerHTML = mdParse(fin.raw);
         }
+        // 直播气泡的 999999999 是「排最后」的临时占位。这一轮结束了，
+        // 它不能再当排序锚点用：清成「未知 seq」，等尾随/历史给出真值。
+        if (fin.row && fin.row.dataset.seq === '999999999') fin.row.dataset.seq = '';
         if (state.turnModel) setMsgModel(fin, state.turnModel);
         addMsgTimeEl(fin, d && d.time ? d.time : Date.now());
         state.cur = null;
@@ -2918,6 +2926,20 @@
         return;
       }
       var msgs = r.data.messages || [];
+      // 历史渲染前先把「本地已有、库里还没有」的行摘出来：用户在加载窗口内
+      // 刚发出去的消息就是这种。否则历史会被追加到它们后面，
+      // 新消息反而跑到旧内容上面（线上实测的「AI 回复在我的消息上面」）。
+      var boxEl = $('messages');
+      var pendingRows = [];
+      if (boxEl) {
+        pendingRows = [].slice.call(boxEl.children).filter(function (el) {
+          if (!el.classList || !el.classList.contains('row')) return false;
+          if (el.id === 'thinking-row') return false;
+          var mid = el.dataset.mid || '';
+          return !mid || !msgs.some(function (m) { return m.id === mid; });
+        });
+        pendingRows.forEach(function (el) { boxEl.removeChild(el); });
+      }
       // 切换会话要快：先同步渲染最近一批（用户目光所在），更早的放到
       // 空闲帧里补。整页 50 条一次渲染在长会话上要几十毫秒，切换会有
       // 明显停顿感。
@@ -2925,11 +2947,20 @@
       var head = msgs.length > FIRST_BATCH ? msgs.slice(msgs.length - FIRST_BATCH) : msgs;
       var tail = msgs.length > FIRST_BATCH ? msgs.slice(0, msgs.length - FIRST_BATCH) : [];
       head.forEach(function (m) { renderHistoryMessage(m); });
+      // 把刚才摘出来的「库里还没有」的本地行放回最底部（它们是最新的）
+      if (pendingRows.length && boxEl) {
+        pendingRows.forEach(function (el) {
+          boxEl.insertBefore(el, $('thinking-row') || null);
+        });
+      }
       if (tail.length) {
         var rest = function () {
           if (state.sessionId !== sid) return;
-          // 从旧到新插到顶部（prepend），保持顺序
-          for (var ti = tail.length - 1; ti >= 0; ti--) renderHistoryMessage(tail[ti], true);
+          // 按时间正序逐条插到「当前最靠前的消息行」之前。
+          // 注意不能简单 insertBefore(box.firstChild)：那里可能是
+          // .load-older 加载条，插在它前面会让后面的消息反而排到更上面，
+          // 出现「新消息跑到旧消息上面」的错位。
+          tail.forEach(function (m) { renderHistoryMessage(m, true); });
           updateOlderLoader();
           scrollToBottom(true);   // 顶部补插的行会把视图推走，回到最新消息
           scheduleFold();     // 等全部行都在了再折叠，避免半截分组
@@ -3147,6 +3178,19 @@
     });
   }
 
+  // 顶部定位点：第一条真正的消息行（跳过 .load-older 这类非消息节点）。
+  // 之前直接插到 box.firstChild，而那里往往是「加载更早」的条，
+  // 结果补渲染的历史行全挤到加载条前面、互相反序 —— 表现为新消息跑到上面。
+  function topAnchor() {
+    var box = $('messages');
+    if (!box) return null;
+    for (var i = 0; i < box.children.length; i++) {
+      var el = box.children[i];
+      if (el.classList && el.classList.contains('row')) return el;
+    }
+    return null;
+  }
+
   function renderHistoryMessage(m, prepend, beforeEl) {
     if (m.role === 'user') {
       if (!shouldRenderUserMessage(m)) return;
@@ -3165,7 +3209,7 @@
     hideWelcome();
     var entry = buildAssistantRow(m);
     var box = $('messages');
-    if (prepend) box.insertBefore(entry.row, box.firstChild);
+    if (prepend) box.insertBefore(entry.row, topAnchor());
     // 底部可能有「正在处理」占位行，新内容要插在它前面
     else box.insertBefore(entry.row, beforeEl || $('thinking-row') || null);
   }

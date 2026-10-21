@@ -2883,8 +2883,27 @@
         return;
       }
       var msgs = r.data.messages || [];
-      msgs.forEach(function (m) { renderHistoryMessage(m); });
-      scheduleFold();                       // 历史里的旧轮次收进「执行过程」
+      // 切换会话要快：先同步渲染最近一批（用户目光所在），更早的放到
+      // 空闲帧里补。整页 50 条一次渲染在长会话上要几十毫秒，切换会有
+      // 明显停顿感。
+      var FIRST_BATCH = 12;
+      var head = msgs.length > FIRST_BATCH ? msgs.slice(msgs.length - FIRST_BATCH) : msgs;
+      var tail = msgs.length > FIRST_BATCH ? msgs.slice(0, msgs.length - FIRST_BATCH) : [];
+      head.forEach(function (m) { renderHistoryMessage(m); });
+      if (tail.length) {
+        var rest = function () {
+          if (state.sessionId !== sid) return;
+          // 从旧到新插到顶部（prepend），保持顺序
+          for (var ti = tail.length - 1; ti >= 0; ti--) renderHistoryMessage(tail[ti], true);
+          updateOlderLoader();
+          scrollToBottom(true);   // 顶部补插的行会把视图推走，回到最新消息
+          scheduleFold();     // 等全部行都在了再折叠，避免半截分组
+        };
+        if (window.requestIdleCallback) requestIdleCallback(rest, { timeout: 300 });
+        else setTimeout(rest, 0);
+      } else {
+        scheduleFold();       // 历史里的旧轮次收进「执行过程」
+      }
       state.msgPage.rendered = msgs.length;
       state.msgPage.total = r.data.total || msgs.length;
       state.msgPage.hasMore = !!r.data.hasMore;

@@ -5355,9 +5355,6 @@ async def handle_provider_upsert(request):
     blocked = guard(request)
     if blocked:
         return blocked
-    blocked = restart_guard()
-    if blocked:
-        return blocked
     data = await body_json(request)
     pid = str(data.get("providerId") or "").strip()
     if not pid or not PROVIDER_ID_RE.match(pid):
@@ -5384,16 +5381,16 @@ async def handle_provider_upsert(request):
             cfg["model"] = mcfg
             log(f"主模型已失效，改指 {first}")
         write_zcode_config(cfg)
-    await zc.restart("厂商配置变更")
+    # 不再重启 app-server：registry 是热更新的，推一次即可让新模型立刻可用。
+    # 重启会掐断所有正在跑的会话，所以原来这里必须过 restart_guard，导致
+    # 「有任务在跑时不能加模型」——那是实现偷懒，不是协议限制。
+    await bootstrap_catalog("厂商配置变更")
     log(f"保存厂商: {pid}")
     return web.json_response({"ok": True, "providerId": pid})
 
 
 async def handle_provider_delete(request):
     blocked = guard(request)
-    if blocked:
-        return blocked
-    blocked = restart_guard()
     if blocked:
         return blocked
     pid = request.match_info["pid"]
@@ -5416,7 +5413,8 @@ async def handle_provider_delete(request):
                     cfg["model"] = {"main": "%s/%s" % (first_pid, first_mid[0]),
                                     "lite": "%s/%s" % (first_pid, first_mid[0])}
         write_zcode_config(cfg)
-    await zc.restart("厂商已删除")
+    # 热更新 registry，不重启（重启会打断正在跑的会话）
+    await bootstrap_catalog("厂商已删除")
     log(f"删除厂商: {pid}")
     return json_response_ok()
 
@@ -5427,9 +5425,6 @@ def json_response_ok(**extra):
 
 async def handle_model_upsert(request):
     blocked = guard(request)
-    if blocked:
-        return blocked
-    blocked = restart_guard()
     if blocked:
         return blocked
     pid = request.match_info["pid"]
@@ -5462,16 +5457,14 @@ async def handle_model_upsert(request):
             m["modalities"] = mod
         models[mid] = m
         write_zcode_config(cfg)
-    await zc.restart("模型配置变更")
+    # 热更新 registry：加/改模型不需要重启 app-server
+    await bootstrap_catalog("模型配置变更")
     log(f"保存模型: {pid}/{mid}")
     return json_response_ok(modelId=mid)
 
 
 async def handle_model_delete(request):
     blocked = guard(request)
-    if blocked:
-        return blocked
-    blocked = restart_guard()
     if blocked:
         return blocked
     pid = request.match_info["pid"]
@@ -5492,15 +5485,12 @@ async def handle_model_delete(request):
             nxt = list(models.keys())[0]
             cfg["model"] = {"main": "%s/%s" % (pid, nxt), "lite": "%s/%s" % (pid, nxt)}
         write_zcode_config(cfg)
-    await zc.restart("模型已删除")
+    await bootstrap_catalog("模型已删除")
     return json_response_ok()
 
 
 async def handle_active_model(request):
     blocked = guard(request)
-    if blocked:
-        return blocked
-    blocked = restart_guard()
     if blocked:
         return blocked
     data = await body_json(request)
@@ -5514,7 +5504,7 @@ async def handle_active_model(request):
         full = "%s/%s" % (pid, mid)
         cfg["model"] = {"main": full, "lite": full}
         write_zcode_config(cfg)
-    await zc.restart("默认模型变更")
+    await bootstrap_catalog("默认模型变更")
     log(f"默认模型设为 {full}")
     return json_response_ok(main=full)
 
@@ -5916,9 +5906,13 @@ async def handle_ws(request):
                 f = await feed.ensure_subscription(sid)
                 f.add_subscriber(ws)
                 watched.add(sid)
-                await runner.send(sid, content, mode=mode, model=model, thought_level=tl,
-                                  attachments=atts or None)
-                await safe_send(ws, {"type": "accepted", "sessionId": sid})
+                # 关键：真正发送放到后台任务里，别在 WS 读循环里 await。
+                # runner.send 会先 resume 会话、再串行下发 setMode/setModel/
+                # setThoughtLevel，最后才 session/send（最长 60s）。如果在这里
+                # 等它，同一连接上的 watch（切会话）、ping 全部被堵住 ——
+                # 表现就是「发消息后切会话卡住」。
+                asyncio.create_task(
+                    _ws_send_in_background(ws, sid, content, mode, model, tl, atts))
             except Exception as exc:
                 log(f"发送失败: {exc}")
                 await safe_send(ws, {"type": "error", "message": f"发送失败: {exc}", "sessionId": sid})
@@ -5939,6 +5933,22 @@ async def handle_ws(request):
             pass
 
     return ws
+
+
+async def _ws_send_in_background(ws, sid, content, mode, model, tl, atts):
+    """在后台完成一次发送，并立刻回 acked。
+
+    前端已经在本地把消息画上去了（乐观渲染），这里只负责把真实动作推进去：
+    先回 acked 让界面进入「已提交」，再走 runner.send（resume + 设置 + send）。
+    失败时回 error，前端据此回滚气泡。
+    """
+    try:
+        await safe_send(ws, {"type": "accepted", "sessionId": sid})
+        await runner.send(sid, content, mode=mode, model=model, thought_level=tl,
+                          attachments=atts or None)
+    except Exception as exc:
+        log(f"发送失败: {exc}")
+        await safe_send(ws, {"type": "error", "message": f"发送失败: {exc}", "sessionId": sid})
 
 
 async def safe_send(ws, payload):

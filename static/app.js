@@ -898,9 +898,18 @@
         setStatus('正在停止…');
         var sb = $('stop-btn');
         if (sb) sb.disabled = true;
+        // 停止要"立刻看起来停了"：先把光标/思考行收掉、锁住输入区，
+        // 不等后端把 stop+close 走完（那可能要几十秒）。
+        clearCursors();
+        removeThinking();
         break;
 
       case 'cancelled':
+        // 本地状态立刻收尾，不等后续 done（后端 close 兜底可能要几秒）
+        markRunning(state.sessionId, false);
+        clearCursors();
+        removeThinking();
+        setStatus('');
         toast('已停止生成');
         break;
 

@@ -158,7 +158,11 @@ REVIVE_COOLDOWN = 300.0        # 超过阈值后的冷却时间
 REVIVE_MIN_FREE_MB = 900       # 可用内存低于这个数就先不拉（留给系统喘气）
 BOOTSTRAP_MIN_INTERVAL = 60.0  # 模型目录预热的最小间隔（反复拉起时别每次都重推）
 _last_bootstrap_at = 0.0
-TURN_IDLE_TIMEOUT = 900        # 事件连续静默多久就向 app-server 求证一次
+TURN_IDLE_TIMEOUT = 120        # 事件连续静默多久就向 app-server 求证一次
+# 曾经是 900s：模型异常结束（如上下文超限）时错误事件不一定送到面板，
+# 界面会挂着「思考中」最长 15 分钟。降到 2 分钟，配合「app-server 那边
+# 也不在跑就收尾」的判定，用户不会长时间盯着一个死掉的轮次。
+# 长工具期间不会误杀：求证到 app-server 仍在执行就继续跟随。
 TURN_ABSOLUTE_MAX = 12 * 3600  # 单轮硬上限（求证后仍然在跑也不能无限跟下去）
 # app-server 侧「还在执行」的状态值。会话列表里查不到时保守认为还在跑：
 # 新建会话要等第一轮结束才落库，查不到不代表没在干活。
@@ -2017,14 +2021,20 @@ class SessionFeedManager:
                 if time.time() - f.last_activity > TURN_IDLE_TIMEOUT:
                     # 静默不等于跑完：长工具期间本来就没事件。先求证，还在跑就继续跟着，
                     # 这样即使用户关了网页，任务也能在后台被完整跟到底。
-                    if (time.time() - f.turn_started_at < TURN_ABSOLUTE_MAX
-                            and await remote_turn_alive(session_id)):
+                    alive = await remote_turn_alive(session_id)
+                    if (time.time() - f.turn_started_at < TURN_ABSOLUTE_MAX and alive):
                         f.last_activity = time.time()
                         log(f"事件静默 {TURN_IDLE_TIMEOUT}s，但 {session_id} 仍在执行，继续跟随")
                         await asyncio.sleep(EVENT_POLL_INTERVAL)
                         continue
+                    # 静默且 app-server 那边也没在跑了：说明这一轮早就异常结束
+                    # （典型是 MODEL_CONTEXT_EXCEEDED 之类的错误事件没送到面板），
+                    # 界面却还挂着「思考中」。如实收尾，别让用户干等。
+                    log(f"事件静默 {TURN_IDLE_TIMEOUT}s 且 {session_id} 已不在执行，收尾")
                     await f.broadcast({"type": "error", "sessionId": session_id,
-                                       "message": "执行超时，已停止接收事件"})
+                                       "message": "这一轮已停止（长时间没有输出，模型可能已异常结束）"})
+                    await f.broadcast({"type": "done", "sessionId": session_id,
+                                       "degraded": True})
                     outcome = "failed"
                     break
                 try:
@@ -2595,19 +2605,41 @@ class TurnManager:
         把 turn_active 抹掉，后续消息会被 app-server 当成 queue 投递 ——
         排进 session_input 后再也不会被提升成真正的消息，也就是**静默丢失**。
         所以严格模式保留真实状态，交给调用方等它自然收尾。
+
+        非严格模式（网页点「停止」）必须**一定让界面停下来**：
+        `session/stop` 在 app-server 那边可能已经无事可做（实测 hadActivePrompt
+        = false：模型请求早就异常结束，只是面板没收到 turn.failed 事件），
+        这时只发 stop 什么都不会发生，用户会看到「点了停止还在思考」。
+        所以：stop 发出去之后，再用 session/close 兜一次底（它一定会把会话
+        从内存卸载、终止残留的执行），最后无论如何都本地收尾并广播 done。
         """
-        if session_id not in self.running:
-            return False
+        known = session_id in self.running
+        stopped_remotely = False
         try:
             await zc.call("session/stop", {"sessionId": session_id}, timeout=30)
+            stopped_remotely = True
         except Exception as exc:
             log(f"停止会话失败 {session_id}: {exc}")
+        if not known and not stopped_remotely:
+            return False
+
         f = feed.get(session_id)
         if strict:
             if f:
                 f.stop_requested = True
                 await f.broadcast({"type": "cancelling", "sessionId": session_id})
             return True
+
+        # stop 不保证真的中断（长工具 / app-server 已空）。非严格模式下补一刀
+        # close：把会话从 app-server 内存里卸掉，残留的模型请求与工具调用随之
+        # 终止。下一轮发送时 ensure_active 会自动 resume 回来，不影响后续使用。
+        try:
+            await zc.call("session/close", {"sessionId": session_id}, timeout=15)
+            self.active.discard(session_id)
+        except Exception as exc:
+            # close 失败不要紧（会话可能本来就闲置着），本地收尾照做
+            log(f"停止后 close({session_id}) 未成功（忽略）: {exc}")
+
         if f:
             f.turn_active = False
             f.turn_done = True
@@ -5855,10 +5887,10 @@ async def handle_ws(request):
                 if not sid or not SESSION_ID_RE.match(sid):
                     await safe_send(ws, {"type": "error", "message": "非法的会话 ID"})
                     continue
-                if await runner.cancel(sid):
-                    await safe_send(ws, {"type": "cancelling", "sessionId": sid})
-                else:
-                    await safe_send(ws, {"type": "error", "message": "当前没有正在执行的对话"})
+                # 立即回应，别让界面等 stop+close 的超时（最长 45s）；
+                # 真正的停止动作放后台，完成后再广播 cancelled/done。
+                await safe_send(ws, {"type": "cancelling", "sessionId": sid})
+                asyncio.create_task(_ws_cancel_in_background(ws, sid))
                 continue
 
             if action != "send":
@@ -5935,6 +5967,18 @@ async def handle_ws(request):
             pass
 
     return ws
+
+
+async def _ws_cancel_in_background(ws, sid):
+    """后台执行停止：stop → close 兜底 → 本地收尾。"""
+    try:
+        ok = await runner.cancel(sid)
+        if not ok:
+            await safe_send(ws, {"type": "error", "sessionId": sid,
+                                 "message": "当前没有正在执行的对话"})
+    except Exception as exc:
+        log(f"停止失败 {sid}: {exc}")
+        await safe_send(ws, {"type": "error", "message": f"停止失败: {exc}", "sessionId": sid})
 
 
 async def _ws_send_in_background(ws, sid, content, mode, model, tl, atts):

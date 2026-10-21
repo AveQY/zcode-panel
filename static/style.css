@@ -500,32 +500,48 @@ details.tool > summary .ts-label { display: none; }   /* 复用折叠行骨架�
   margin: 0 auto;
   display: flex;
   align-items: flex-end;
-  gap: 10px;
+  gap: 8px;
   border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 9px 9px 9px 16px;
-  background: #fff;
-  transition: border-color 0.15s, box-shadow 0.15s;
+  border-radius: 18px;
+  padding: 8px 8px 8px 14px;
+  background: var(--surface);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, .04);
+  transition: border-color .16s ease, box-shadow .16s ease;
 }
-.composer-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.composer-box:hover { border-color: var(--border-strong, #d5dae2); }
+/* 点进输入框不要出现描边/聚焦环（用户要求）：保持边框不变，只有极轻的阴影 */
+.composer-box:focus-within {
+  border-color: var(--border);
+  box-shadow: 0 1px 3px rgba(16, 24, 40, .07);
+}
 #input {
   flex: 1;
   border: none;
+  outline: none;
   resize: none;
   background: none;
-  padding: 6px 0;
+  padding: 7px 2px;
   max-height: 200px;
-  line-height: 1.6;
-  font-size: 14px;
+  line-height: 1.65;
+  font-size: 14.5px;
+  color: var(--text);
+}
+#input:focus,
+#input:focus-visible {
+  outline: none;
+  box-shadow: none;
+  border: none;
 }
 #input::placeholder { color: var(--text-mute); }
 .send-btn {
-  width: 34px; height: 34px; border-radius: 10px;
+  width: 34px; height: 34px; border-radius: 11px;
   background: var(--accent); color: #fff;
   display: flex; align-items: center; justify-content: center;
   flex-shrink: 0;
+  transition: background .15s ease, transform .12s ease;
 }
 .send-btn:hover:not(:disabled) { background: var(--accent-hover); }
+.send-btn:active:not(:disabled) { transform: scale(.96); }
 .send-btn:disabled { background: #c9ced6; }
 
 .composer-foot {
@@ -1767,6 +1783,12 @@ a:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+/* 聊天输入框例外：点进去不该出现任何描边（外框已有 hover/focus 的克制反馈） */
+#input:focus,
+#input:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+}
 .messages::-webkit-scrollbar,
 .drawer-body::-webkit-scrollbar,
 .session-list::-webkit-scrollbar,
@@ -2201,11 +2223,12 @@ pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
   flex: none;
   width: 34px; height: 34px;
   display: flex; align-items: center; justify-content: center;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--sidebar);
-  color: var(--text-dim);
+  border-radius: 11px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-mute);
   cursor: pointer;
+  transition: background .15s ease, color .15s ease;
 }
 .attach-btn:hover { background: var(--sidebar-hover); color: var(--accent); }
 .attach-btn:disabled { opacity: .5; cursor: not-allowed; }

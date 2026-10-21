@@ -1985,10 +1985,13 @@
 
   // 首条消息直接发：自动用「第一个工作区 + 当前选择器设置」建一个会话。
   // 以前必须先点「新建会话」填一遍表单才能说第一句话，是最高频的别扭点。
-  // 「session/create」在 zcode 侧固定要 1.3~2 秒（实测与工作区大小无关），面板侧
-  // 只剩 0.000s 可优化 —— 那就把这段等待藏到用户填表/打字的时间里：打开新建弹窗、
-  // 或者刚在欢迎页点输入框时先在后台把会话建好，确认时直接取用。
-  var prewarm = null;        // { sid, wsPath }
+  //
+  // 新建会话改成「草稿」模型（与 zcode 桌面端一致）：点新建只是在本地摆出
+  // 一个空白对话，选好工作区/模型/模式，**发第一条消息时**才真正
+  // POST /api/sessions。这样取消新建不会留下空会话，也不会因为预建出来的
+  // 会话后来失效而报「会话不存在」。
+  var draftWs = null;        // 草稿工作区（还没真正创建会话）
+  var draftPurpose = 'project';
 
   function firstWorkspacePath() {
     var list = (state.workspaces || []).filter(function (w) { return w.purpose !== 'task'; });
@@ -1996,38 +1999,39 @@
     return pick ? (pick.path || '') : '';
   }
 
-  function prewarmSession(wsPath) {
-    var want = wsPath || '';
-    if (prewarm && prewarm.wsPath === want) return;   // 已经有可复用的
-    if (prewarm) prewarm = null;                      // 换了工作区，旧的作废
-    req('/api/sessions', {
-      method: 'POST',
-      body: JSON.stringify({
-        workspacePath: want,
-        purpose: 'project',
-        mode: $('mode-select').value || 'build',
-        model: currentModelValue(),
-        thoughtLevel: $('thought-select').value || null,
-      }),
-    }).then(function (r) {
-      if (r.data && r.data.ok && r.data.sessionId) {
-        prewarm = { sid: r.data.sessionId, wsPath: want };
-        rememberNcPicks($('model-select').value, $('thought-select').value);
+  // 进入草稿态：界面就是「新会话」，但服务端什么都没建
+  function startDraft(wsPath, mode, model, thoughtLevel, purpose) {
+    var path = wsPath || firstWorkspacePath();
+    state.sessionId = null;
+    state.cur = null;
+    stopTail();
+    rememberSession(null);
+    clearMessages();
+    $('messages').innerHTML = welcomeHtml();
+    $('chat-title').textContent = '新会话';
+    $('chat-meta').textContent = path || '';
+    if (mode) { $('mode-select').value = mode; updateModeDesc(); }
+    if (model && model.providerId && model.modelId) {
+      var v = model.providerId + '|' + model.modelId;
+      var sel = $('model-select');
+      for (var i = 0; i < sel.options.length; i++) {
+        if (sel.options[i].value === v) { sel.value = v; break; }
       }
-    }).catch(function () {});
-  }
-
-  function takePrewarm(wsPath) {
-    if (prewarm && prewarm.wsPath === (wsPath || '')) {
-      var sid = prewarm.sid;
-      prewarm = null;
-      return sid;
     }
-    return null;
+    if (thoughtLevel) $('thought-select').value = thoughtLevel;
+    draftWs = path || null;
+    draftPurpose = purpose || 'project';
+    var ww = $('welcome-ws');
+    if (ww) ww.textContent = path || '/root';
+    renderActive();
+    renderModelSelects();
+    updatePanelButtons();
+    syncComposer();
+    $('input').focus();
   }
 
   function quickStartThenSend(text, input) {
-    var pick = firstWorkspacePath();
+    var pick = draftWs || firstWorkspacePath();
     var imgs = (state.pendingImages || []).slice();
     // 先把消息落到界面上：创建会话要 1~2 秒，让用户立刻看到自己发出去的话，
     // 而不是盯着一个空输入框怀疑没点上。失败时再把这个气泡回滚掉。
@@ -2038,21 +2042,11 @@
     setSending(true);
     showThinking();
 
-    var ready = takePrewarm(pick);
-    if (ready) {
-      state.sessionId = ready;
-      rememberSession(ready);
-      updatePanelButtons();
-      loadSessions(true);
-      dispatchSend(text, input, true, { images: imgs });
-      return;
-    }
-
     req('/api/sessions', {
       method: 'POST',
       body: JSON.stringify({
         workspacePath: pick,
-        purpose: 'project',
+        purpose: draftPurpose || 'project',
         mode: $('mode-select').value || 'build',
         model: currentModelValue(),
         thoughtLevel: $('thought-select').value || null,
@@ -2062,6 +2056,7 @@
         throw new Error(r.data.error || '创建会话失败');
       }
       state.sessionId = r.data.sessionId;
+      draftWs = null;                 // 草稿已兑现成真实会话
       rememberNcPicks($('model-select').value, $('thought-select').value);
       rememberSession(state.sessionId);
       updatePanelButtons();
@@ -2250,9 +2245,8 @@
     this.style.height = 'auto';
     this.style.height = Math.min(this.scrollHeight, 200) + 'px';
     syncQueueBtn();
-    // 还没开会话（欢迎页）：一动手打字就在后台预建，等按下回车时通常已经就绪，
-    // 首条消息的 1~2 秒创建等待就消失了
-    if (!state.sessionId) prewarmSession(firstWorkspacePath());
+    // 草稿态不预建会话（以前这里一打字就在后台 create，取消就留下空会话，
+    // 还会导致「会话不存在」）。真正创建发生在发第一条消息时。
   });
 
   /* ============================================ 模型 / 思考等级 / 模式 */
@@ -3494,78 +3488,24 @@
   }
 
   function newChat() {
-    // 别的会话在后台跑着，也不影响你开一个新会话
-    state.sessionId = null;
-    state.cur = null;
-    stopTail();
-    rememberSession(null);
-    clearMessages();
-    $('messages').innerHTML = welcomeHtml();
-    $('chat-title').textContent = '新会话';
-    $('chat-meta').textContent = '';
-    renderActive();
-    updateModeDesc();
-    renderModelSelects();
-    var ww = $('welcome-ws');
-    if (ww) ww.textContent = '/root';
-    syncComposer();
-    $('input').focus();
+    // 点「新建会话」入口（侧栏顶部按钮之外的地方也会调到这里）：统一走草稿态
+    startDraft(null);
   }
 
-  // 创建成功后切到新会话。新建会话弹窗和工作区「+」共用这段收尾逻辑。
-  function activateCreatedSession(sessionId, wsPath, mode, model, thoughtLevel) {
-    newChat();
-    state.sessionId = sessionId;
-    rememberSession(sessionId);
-    if (model && model.providerId && model.modelId) {
-      var v = model.providerId + '|' + model.modelId;
-      var sel = $('model-select');
-      for (var i = 0; i < sel.options.length; i++) {
-        if (sel.options[i].value === v) { sel.value = v; break; }
-      }
-    }
-    if (mode) $('mode-select').value = mode;
-    updateModeDesc();
-    if (thoughtLevel) $('thought-select').value = thoughtLevel;
-    $('chat-title').textContent = '新会话';
-    $('chat-meta').textContent = wsPath || '';
-    var ww = $('welcome-ws');
-    if (ww) ww.textContent = wsPath || '';
-    loadSessions(true).then(renderActive);
-    $('input').focus();
-  }
-
-  // 工作区标题旁「+」的直建逻辑：沿用当前会话的模式/模型/思考等级。
+  // 工作区标题旁「+」：同样只切到草稿态（沿用当前会话的模式/模型/思考等级），
+  // 发第一条消息时才真正创建会话。
   function createSessionInWorkspace(wsPath, btn) {
     if (!wsPath) { toast('工作区路径无效', 'err'); return; }
     var model = currentModelValue();
     var mode = $('mode-select').value || 'build';
     var thoughtLevel = $('thought-select').value || null;
     var w = findWorkspace(wsPath);
-    var purpose = (w && w.purpose === 'task') ? 'task' : 'project';
-    var oldHtml = btn ? btn.innerHTML : '';
-    if (btn) { btn.disabled = true; btn.innerHTML = '&#8230;'; }
-
-    req('/api/sessions', {
-      method: 'POST',
-      body: JSON.stringify({
-        workspacePath: wsPath,
-        purpose: purpose,
-        mode: mode,
-        model: model,
-        thoughtLevel: thoughtLevel,
-      }),
-    }).then(function (r) {
-      if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
-      if (!r.data.ok) { toast(r.data.error || '新建会话失败', 'err'); return; }
-      state.wsCollapsed[wsPath] = false;
-      saveWsCollapsed();
-      activateCreatedSession(r.data.sessionId, wsPath, mode, model, thoughtLevel);
-      toast('已在「' + (w ? w.name : wsNameOf(wsPath)) + '」下创建会话', 'ok');
-    }).catch(function () {
-      if (btn) { btn.disabled = false; btn.innerHTML = oldHtml; }
-      toast('网络异常', 'err');
-    });
+    state.wsCollapsed[wsPath] = false;
+    saveWsCollapsed();
+    startDraft(wsPath, mode, model, thoughtLevel);
+    $('chat-title').textContent = '新会话';
+    $('chat-meta').textContent = wsPath;
+    toast('已在「' + (w ? w.name : wsNameOf(wsPath)) + '」下开始新会话，发送第一条消息即创建', 'ok');
   }
 
   /* ============================================ 新建会话 */
@@ -3575,9 +3515,8 @@
     $('nc-mode-desc').textContent = modeDesc($('nc-mode').value);
     loadWorkspaces().then(function () {
       openModal('newchat-modal');
-      // 弹窗一开就在后台把会话建好（用户还要选工作区/模型/模式，这几秒
-      // 正好把 zcode 侧 1.3~2 秒的 create 开销吃掉）
-      prewarmSession($('nc-workspace').value);
+      // 不在这里预建会话：用户可能只是看看就关掉，预建会留下空会话。
+      // 真正的 create 放到「发第一条消息」时（见 startDraft/quickStartThenSend）。
     });
   }
 
@@ -3624,6 +3563,8 @@
     }
   }
 
+  // 草稿不再需要 purpose（真正创建时统一用 project），保留这个函数给
+  // 工作区弹窗的用途切换用。
   function currentPurpose() {
     var a = document.querySelector('.purpose-card.active');
     return a ? a.dataset.purpose : 'project';
@@ -3845,44 +3786,17 @@
   });
 
   $('nc-create').addEventListener('click', function () {
-    var btn = this;
     var wsPath = $('nc-workspace').value;
     var mv = $('nc-model').value;
     var model = mv ? { providerId: mv.split('|')[0], modelId: mv.split('|').slice(1).join('|') } : null;
     var mode = $('nc-mode').value;
     var thoughtLevel = $('nc-thought').value || null;
     rememberNcPicks(mv, $('nc-thought').value);   // 下次打开表单默认沿用
-    // 打开弹窗时已经预建好了同一个工作区的会话：直接用，创建变成瞬时
-    var ready = takePrewarm(wsPath);
-    if (ready) {
-      closeModal('newchat-modal');
-      activateCreatedSession(ready, wsPath, mode, model, thoughtLevel);
-      toast('会话已创建，可以开始对话了', 'ok');
-      return;
-    }
-    btn.disabled = true;
-    btn.textContent = '创建中…';
-    req('/api/sessions', {
-      method: 'POST',
-      body: JSON.stringify({
-        workspacePath: wsPath,
-        purpose: currentPurpose(),
-        mode: mode,
-        model: model,
-        thoughtLevel: thoughtLevel,
-      }),
-    }).then(function (r) {
-      btn.disabled = false;
-      btn.textContent = '创建并开始';
-      if (!r.data.ok) { toast(r.data.error || '新建会话失败', 'err'); return; }
-      closeModal('newchat-modal');
-      activateCreatedSession(r.data.sessionId, wsPath, mode, model, thoughtLevel);
-      toast('会话已创建，可以开始对话了', 'ok');
-    }).catch(function () {
-      btn.disabled = false;
-      btn.textContent = '创建并开始';
-      toast('网络异常', 'err');
-    });
+    // 只切到草稿：服务端此刻什么都不建，发第一条消息时才 create。
+    // 关掉弹窗后用户可以直接打字，不会有空会话残留。
+    closeModal('newchat-modal');
+    startDraft(wsPath, mode, model, thoughtLevel, currentPurpose());
+    toast('已就绪，发送第一条消息即开始会话', 'ok');
   });
 
   /* ============================================ 设置：框架 */

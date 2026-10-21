@@ -2163,8 +2163,20 @@ class SessionFeedManager:
         if etype == "turn.failed" or etype == "session.error":
             f.error = pl
             f.turn_done = True
+            # 上游的顶层 message 往往只有「Turn failed」这种废话，真正可读的
+            # 原因在 payload.error.message 里。透传它，否则用户只看到一句
+            # 「执行失败」，会误以为面板卡住了。
+            err = pl.get("error") if isinstance(pl.get("error"), dict) else {}
+            msg = err.get("message") or pl.get("message") or "执行失败"
+            code = str(err.get("code") or "")
+            if code == "MODEL_CONTEXT_EXCEEDED":
+                msg = ("当前会话上下文已超出模型上限，自动压缩连续失败。"
+                       "建议新建会话继续，或让工具分段读取大文件、精简输出。"
+                       "（原始错误：" + msg + "）")
+            log(f"轮次失败 {sid}: {code or '-'} {msg[:160]}")
             await f.broadcast({"type": "error", "sessionId": sid,
-                               "message": pl.get("message") or pl.get("error") or "执行失败"})
+                               "message": msg, "code": code,
+                               "context": pl.get("context") or {}})
             return
 
         if etype == "session.updated":
@@ -4313,13 +4325,21 @@ def build_registry():
             item = {"modelId": mid,
                     "label": m.get("name") or mid,
                     "supportsTools": True}
+            # 上下文窗口必须给一个真值：中转站的 /v1/models 不返回这个字段，
+            # 配置里也没写 limit 时 zcode 会拿到 0，压缩阈值随之算成 0 ——
+            # 于是任何内容都被判定「超限」，反复自动压缩后熔断，
+            # 整轮直接 turn.failed（线上实测 MODEL_CONTEXT_EXCEEDED）。
+            ctx = None
+            out = None
             try:
                 if lim.get("context"):
-                    item["contextWindow"] = int(lim["context"])
+                    ctx = int(lim["context"])
                 if lim.get("output"):
-                    item["maxOutputTokens"] = int(lim["output"])
+                    out = int(lim["output"])
             except Exception:
                 pass
+            item["contextWindow"] = ctx or DEFAULT_CONTEXT_WINDOW
+            item["maxOutputTokens"] = out or DEFAULT_MAX_OUTPUT
             if mod.get("input"):
                 item["supportsImages"] = "image" in mod["input"]
             rsn = m.get("reasoning")
@@ -5978,6 +5998,14 @@ async def on_cleanup(app):
 # ---------------------------------------------------------------- 性能：gzip + 静态缓存
 
 PERF_GZIP_MIN = 1024  # 小于 1KB 不压缩，收益抵不过 CPU 开销
+
+# 模型没声明上下文窗口时的兜底值。中转站（OpenAI 兼容）的 /v1/models 通常
+# 不返回 context_length，config.json 里也可能没写 limit；不给兜底的话 zcode
+# 会拿到 contextWindow=0，压缩阈值算成 0，任何内容都被判「超限」，反复
+# 自动压缩后熔断 → turn.failed（MODEL_CONTEXT_EXCEEDED）。
+# 128k 是主流模型的保守下限：给太小会频繁压缩，给太大则真的超限时才报错。
+DEFAULT_CONTEXT_WINDOW = 128000
+DEFAULT_MAX_OUTPUT = 16384
 
 
 @web.middleware

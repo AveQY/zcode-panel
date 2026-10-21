@@ -1426,7 +1426,7 @@
     return { text: text, images: images };
   }
 
-  function appendUserMessage(text, prepend, timeMs, beforeEl, images) {
+  function appendUserMessage(text, prepend, timeMs, beforeEl, images, optimistic) {
     hideWelcome();
     var box = $('messages');
     var row = document.createElement('div');
@@ -1469,9 +1469,14 @@
     if (prepend) box.insertBefore(row, box.firstChild);
     else if (beforeEl) box.insertBefore(row, beforeEl);
     else { box.appendChild(row); scrollToBottom(true); }
-    // 记一笔：库里那条同样的用户消息稍后会被尾随取回来，靠它认领，别重复渲染
-    state.localUserMsgs.push({ text: text, row: row, bound: false });
-    if (state.localUserMsgs.length > 30) state.localUserMsgs.shift();
+    // 记一笔：库里那条同样的用户消息稍后会被尾随取回来，靠它认领，别重复渲染。
+    // 只有「乐观渲染」的（本地刚发、还没有库 id 的）才需要认领；历史/尾随画出来
+    // 的行本身就有 id，绝不能进这个列表 —— 否则两条文字相同的消息（比如连续
+    // 发两次「继续」）新消息会认领到旧行上，出现消息错位（线上实测）。
+    if (optimistic) {
+      state.localUserMsgs.push({ text: text, row: row, bound: false });
+      if (state.localUserMsgs.length > 30) state.localUserMsgs.shift();
+    }
     scheduleFold();          // 新的一轮开始了，上一轮该折起来
     return row;
   }
@@ -2026,7 +2031,7 @@
     var imgs = (state.pendingImages || []).slice();
     // 先把消息落到界面上：创建会话要 1~2 秒，让用户立刻看到自己发出去的话，
     // 而不是盯着一个空输入框怀疑没点上。失败时再把这个气泡回滚掉。
-    var row = appendUserMessage(text, false, Date.now(), null, imgs);
+    var row = appendUserMessage(text, false, Date.now(), null, imgs, true);
     input.value = '';
     input.style.height = 'auto';
     setStatus('正在创建会话…');
@@ -2127,7 +2132,7 @@
 
     // hideBubble：调用方已经乐观地把消息画上去了（快速开始那条路径），别再画一遍
     // 乐观渲染用本地 blob 缩略图，不等上传
-    if (!hideBubble) appendUserMessage(text, false, Date.now(), null, imgs);
+    if (!hideBubble) appendUserMessage(text, false, Date.now(), null, imgs, true);
     imgs.forEach(function (it) { it.used = true; });   // 气泡要用这些 blob URL
     clearPendingImages();
     input.value = '';
@@ -3189,7 +3194,11 @@
       for (var i = 0; i < box.children.length; i++) {
         var el = box.children[i];
         if (!el.classList || !el.classList.contains('row')) continue;
-        if ((+el.dataset.seq || 0) > seq) { anchor = el; break; }
+        // 只拿「知道 seq 的助手行」当锚点。用户行没有 seq（解析成 0），
+        // 拿它比较会把还原的步骤行插到用户消息的错误一侧（消息错位的次因）。
+        if (el.classList.contains('user')) continue;
+        if (!el.dataset.seq && el.dataset.seq !== '0') continue;
+        if (+el.dataset.seq > seq) { anchor = el; break; }
       }
       box.insertBefore(r, anchor);
     });
@@ -3288,9 +3297,11 @@
       if (state.messageMap.get(m.id)) return;
       var up = splitUserParts(m, state.sessionId);
       if (!up.text && !up.images.length) return;
-      // 自己刚发出去、本地已经渲染过的那条：认领它，别出现两条一样的
+      // 自己刚发出去、本地已经渲染过的那条：认领它，别出现两条一样的。
+      // 从后往前找：localUserMsgs 按发送顺序排，库里的消息也是新到先处理，
+      // 新消息必须认领最新那条（连续发同一句话时尤其如此）。
       var locals = state.localUserMsgs || [];
-      for (var i = 0; i < locals.length; i++) {
+      for (var i = locals.length - 1; i >= 0; i--) {
         if (!locals[i].bound && locals[i].text === up.text) {
           locals[i].bound = true;
           locals[i].row.dataset.mid = m.id;

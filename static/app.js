@@ -2819,6 +2819,18 @@
       });
   }
 
+  // 从当前列表里立刻摘掉一行（乐观删除）。失败时由调用方 loadSessions 还原。
+  function dropSessionRow(sid) {
+    var row = document.querySelector('.session-item[data-sid="' + sid + '"]');
+    if (row && row.parentNode) row.parentNode.removeChild(row);
+    var pick = function (arr) {
+      return (arr || []).filter(function (x) { return x.id !== sid; });
+    };
+    state.sessions = pick(state.sessions);
+    state.archived = pick(state.archived);
+    state.listSig = null;          // 强制下一次轮询重绘，别被签名比对跳过
+  }
+
   function deleteSession(sid, force) {
     var title = (state.sessions.concat(state.archived).filter(function (x) {
       return x.id === sid;
@@ -2827,12 +2839,20 @@
       '确定要彻底删除「' + title + '」吗？\n它的全部消息记录会从数据库里删掉，无法恢复。',
       '彻底删除').then(function (ok) {
       if (!ok) return;
+      // 乐观删除：先把行摘掉、切走视图，后台再慢慢做 close + 删库。
+      // 删除本身要等 session/close（最长 20s）、等轮次真正停下、再删库，
+      // 同步等下来用户会以为界面卡死了。
+      dropSessionRow(sid);
+      if (state.sessionId === sid) newChat();
+      toast('正在删除…', '');
+
       req('/api/sessions/' + encodeURIComponent(sid) + (force ? '?force=1' : ''),
           { method: 'DELETE' })
         .then(function (r) {
           // 会话正在跑：后端挡了一道（409）。问一次「停止并删除」，确认后带
           // force 重发——面板会先停掉这一轮、摘掉联动的巡检定时任务，再彻底删除。
           if (r.status === 409 && !force) {
+            loadSessions(true);          // 先把行还原回来
             confirmBox('会话正在执行',
               '「' + title + '」正在执行任务。\n先停止它再彻底删除，关联的定时任务也会一起删除。',
               '停止并删除').then(function (ok2) {
@@ -2840,11 +2860,17 @@
             });
             return;
           }
-          if (!r.data.ok) { toast(r.data.error || '删除失败', 'err'); return; }
+          if (!r.data.ok) {
+            toast(r.data.error || '删除失败', 'err');
+            loadSessions(true);          // 失败就按服务端真实列表还原
+            return;
+          }
           toast(force && r.data.stopped ? '已停止并删除' : '已删除', 'ok');
-          if (state.sessionId === sid) newChat();
           loadSessions(true);
-        }).catch(function () { toast('网络异常', 'err'); });
+        }).catch(function () {
+          toast('网络异常，删除可能未完成', 'err');
+          loadSessions(true);
+        });
     });
   }
 
@@ -3767,8 +3793,33 @@
         if (ws.unregistered) q.push('path=' + encodeURIComponent(ws.path));
         var url = '/api/workspaces/' + encodeURIComponent(ws.id) +
           (q.length ? '?' + q.join('&') : '');
+        // 乐观删除：先把工作区分组和它下面的会话行从侧栏摘掉，弹窗立即关闭。
+        // 后端要清会话/删目录，purge 时可能是秒级，等它会让界面看起来卡死。
+        state.workspaces = (state.workspaces || []).filter(function (x) {
+          return x.path !== ws.path;
+        });
+        if (mode === 'delete' || purge) {
+          (state.sessions || []).filter(function (s) {
+            return s.workspacePath === ws.path;
+          }).forEach(function (s) { dropSessionRow(s.id); });
+          if (state.sessionId && !(state.sessions || []).some(function (s) {
+            return s.id === state.sessionId;
+          })) {
+            newChat();
+          }
+        }
+        state.forceListRender = true;
+        state.listSig = null;
+        closeModal('ws-modal');
+        renderSessions(state.sessions || []);
+        toast('正在删除工作区…', '');
+
         req(url, { method: 'DELETE' }).then(function (r) {
-          if (!r.data.ok) { toast(r.data.error || '删除失败', 'err'); return; }
+          if (!r.data.ok) {
+            toast(r.data.error || '删除失败', 'err');
+            loadWorkspaces().then(function () { loadSessions(true); });   // 还原
+            return;
+          }
           var d = r.data.sessions || {};
           var extra = '';
           if (mode === 'delete' && d.deleted) extra = '，已删除 ' + d.deleted + ' 个会话';
@@ -3776,11 +3827,13 @@
           else if (nSess) extra = '，会话保留在库里';
           toast(purge ? ('工作区与磁盘目录已删除' + extra)
                       : ((ws.unregistered ? '已从侧栏移除' : '已移出工作区列表') + extra), 'ok');
-          closeModal('ws-modal');
           loadWorkspaces().then(function () {
             loadSessions(true);
           });
-        }).catch(function () { toast('网络异常', 'err'); });
+        }).catch(function () {
+          toast('网络异常，删除可能未完成', 'err');
+          loadWorkspaces().then(function () { loadSessions(true); });
+        });
       });
   });
 

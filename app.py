@@ -5384,7 +5384,7 @@ async def handle_provider_upsert(request):
     # 不再重启 app-server：registry 是热更新的，推一次即可让新模型立刻可用。
     # 重启会掐断所有正在跑的会话，所以原来这里必须过 restart_guard，导致
     # 「有任务在跑时不能加模型」——那是实现偷懒，不是协议限制。
-    await bootstrap_catalog("厂商配置变更")
+    asyncio.create_task(bootstrap_catalog("厂商配置变更"))
     log(f"保存厂商: {pid}")
     return web.json_response({"ok": True, "providerId": pid})
 
@@ -5413,8 +5413,9 @@ async def handle_provider_delete(request):
                     cfg["model"] = {"main": "%s/%s" % (first_pid, first_mid[0]),
                                     "lite": "%s/%s" % (first_pid, first_mid[0])}
         write_zcode_config(cfg)
-    # 热更新 registry，不重启（重启会打断正在跑的会话）
-    await bootstrap_catalog("厂商已删除")
+    # 热更新 registry，不重启（重启会打断正在跑的会话）。
+    # 推送要给每个工作区各发一次，放到后台做，删除请求立刻返回。
+    asyncio.create_task(bootstrap_catalog("厂商已删除"))
     log(f"删除厂商: {pid}")
     return json_response_ok()
 
@@ -5457,8 +5458,9 @@ async def handle_model_upsert(request):
             m["modalities"] = mod
         models[mid] = m
         write_zcode_config(cfg)
-    # 热更新 registry：加/改模型不需要重启 app-server
-    await bootstrap_catalog("模型配置变更")
+    # 热更新 registry：加/改模型不需要重启 app-server。
+    # 推送给各工作区放到后台，保存操作立刻可见。
+    asyncio.create_task(bootstrap_catalog("模型配置变更"))
     log(f"保存模型: {pid}/{mid}")
     return json_response_ok(modelId=mid)
 
@@ -5485,7 +5487,7 @@ async def handle_model_delete(request):
             nxt = list(models.keys())[0]
             cfg["model"] = {"main": "%s/%s" % (pid, nxt), "lite": "%s/%s" % (pid, nxt)}
         write_zcode_config(cfg)
-    await bootstrap_catalog("模型已删除")
+    asyncio.create_task(bootstrap_catalog("模型已删除"))
     return json_response_ok()
 
 

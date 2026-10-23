@@ -828,6 +828,11 @@
       case 'backend':
         handleBackendState(d);
         break;
+      case 'catalog-changed':
+        // 有人在设置里改了模型/厂商：所有打开的页面都重拉一次目录，
+        // 否则对话页的模型下拉会一直显示旧的（线上反馈）。
+        loadOptions(true).then(function () { loadSessions(true); });
+        break;
       case 'ready':
         break;
 
@@ -2282,6 +2287,37 @@
       refreshCtxGauge();
       return r.data;
     }).catch(function () {});
+  }
+
+  // 模型配置改完之后刷新模型选择器。
+  // registry 推送现在是后台任务，固定延时很容易抢跑（拉到的还是旧目录）；
+  // 这里轮询到目录真的变了为止，最多等 ~8 秒。
+  function refreshOptionsUntilChanged(before, tries) {
+    tries = (tries === undefined) ? 8 : tries;
+    return loadOptions(true).then(function (data) {
+      if (!data) return;
+      var sig = function (d) {
+        return ((d && d.models) || []).map(function (m) {
+          return (m.providerId || '') + '/' + (m.modelId || '') + ':' + (m.context || '');
+        }).join(',');
+      };
+      if (sig(data) !== before && tries > 0) {
+        // 变了就再拉一次，确认真稳定（推送是分批给各工作区的）
+        return refreshOptionsUntilChanged(sig(data), tries - 1);
+      }
+      if (sig(data) === before && tries > 0) {
+        return new Promise(function (resolve) {
+          setTimeout(resolve, 700);
+        }).then(function () { return refreshOptionsUntilChanged(before, tries - 1); });
+      }
+    });
+  }
+
+  function currentOptionsSig() {
+    var d = state.options || {};
+    return (d.models || []).map(function (m) {
+      return (m.providerId || '') + '/' + (m.modelId || '') + ':' + (m.context || '');
+    }).join(',');
   }
 
   function renderModelSelects() {
@@ -4620,12 +4656,13 @@
         btn.disabled = false;
         btn.textContent = '保存';
         if (!r.data.ok) { toast(r.data.error || '保存失败', 'err'); return; }
-        toast('已保存，正在重载 zcode 配置…', 'ok');
+        toast('已保存，正在同步模型目录…', 'ok');
         closeModal('provider-modal');
-        setTimeout(function () {
-          loadProviders();
-          loadOptions(true);
-        }, 1200);
+        var before = currentOptionsSig();
+        loadProviders();
+        refreshOptionsUntilChanged(before).then(function () {
+          loadSessions(true);   // 侧栏的模型标签也要跟着更新
+        });
       }).catch(function () {
         btn.disabled = false;
         btn.textContent = '保存';
@@ -4644,10 +4681,11 @@
             if (!r.data.ok) { toast(r.data.error || '删除失败', 'err'); return; }
             toast('已删除', 'ok');
             closeModal('provider-modal');
-            setTimeout(function () {
-              loadProviders();
-              loadOptions(true);
-            }, 1200);
+            var before = currentOptionsSig();
+            loadProviders();
+            refreshOptionsUntilChanged(before).then(function () {
+              loadSessions(true);
+            });
           }).catch(function () { toast('网络异常', 'err'); });
       });
   });

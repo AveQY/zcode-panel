@@ -3136,7 +3136,7 @@
 
   // 一条助手消息 -> 一个完整气泡。历史加载、增量尾随、断线对齐都走这里，
   // 保证同一条消息无论从哪条路径来，渲染结果都一致。
-  function buildAssistantRow(m) {
+  function buildAssistantRow(m, lazy) {
     var row = document.createElement('div');
     row.className = 'row';
     // 折叠分组用：id 认领、seq 还原顺序、time 算这轮耗时
@@ -3149,13 +3149,57 @@
       '<div class="msg-actions"><button type="button" class="msg-copy" data-copy-msg="1" title="复制这条回复">复制</button></div>';
     var entry = { mid: m.id, role: 'assistant', row: row,
                   body: row.querySelector('.assistant-body'), mdEl: null, raw: '',
-                  pendingRaw: undefined, mdTimer: null };
+                  pendingRaw: undefined, mdTimer: null, srcMsg: m };
     state.messageMap.set(m.id, entry);   // 先登记：part 里的 handleTool 要按 id 查它
-    fillAssistantParts(entry, m);
+    if (lazy) {
+      // 历史消息：只渲染正文，思考过程/工具卡片留到展开时再建。
+      // 一个几百步的会话里，过程内容占了九成以上的 DOM —— 这正是
+      // 「点开会话要等几秒」的来源。
+      fillAssistantTextOnly(entry, m);
+      entry.lazyParts = true;
+    } else {
+      fillAssistantParts(entry, m);
+    }
     if (m.model) setMsgModel(entry, m.model);
     if (m.completed === false) appendLiveCursor(entry);
     else addMsgTimeEl(entry, m.time);
     return entry;
+  }
+
+  // 只渲染正文（历史加载用）。没有正文但只有过程的消息返回 false，
+  // 由调用方决定要不要留这一行。
+  function fillAssistantTextOnly(entry, m) {
+    var text = '';
+    (m.parts || []).forEach(function (p) {
+      if (p.type === 'text' && p.text) text += p.text;
+    });
+    if (text) {
+      var el = mdElOf(entry);
+      entry.raw = text;
+      el.dataset.raw = text;
+      el.innerHTML = mdParse(text);
+    }
+    return !!text;
+  }
+
+  // 展开折叠块时，把这条消息真正的过程内容补建进去（只做一次）
+  function materializeLazy(entry) {
+    if (!entry || !entry.lazyParts || !entry.srcMsg) return;
+    entry.lazyParts = false;
+    var m = entry.srcMsg;
+    // 正文元素原样留着；把非 text 的 part 追加进 body，最后再把正文元素
+    // 挪回最前面（保持「过程在上、正文在下」的阅读顺序）。
+    var mdEl = entry.mdEl;
+    var raw = entry.raw;
+    fillAssistantParts(entry, {
+      id: m.id, role: m.role, time: m.time,
+      parts: (m.parts || []).filter(function (p) { return p.type !== 'text'; }),
+    });
+    if (mdEl && mdEl.parentNode) {
+      mdEl.parentNode.insertBefore(mdEl, mdEl.parentNode.firstChild);
+    }
+    entry.raw = raw;
+    entry.mdEl = mdEl;
   }
 
   function fillAssistantParts(entry, m) {
@@ -3267,7 +3311,9 @@
 
     removeThinking();
     hideWelcome();
-    var entry = buildAssistantRow(m);
+    // 历史一律惰渲染：只建正文，思考过程/工具卡片等展开时再补。
+    // 实时轮次（尾随/事件流）仍然完整渲染，因为用户正盯着它。
+    var entry = buildAssistantRow(m, m.completed !== false);
     var box = $('messages');
     if (prepend) box.insertBefore(entry.row, topAnchor());
     // 底部可能有「正在处理」占位行，新内容要插在它前面
@@ -3328,6 +3374,9 @@
     var rows = [];
     wraps.forEach(function (w) {
       var det = w.querySelector('.turn-steps');
+      // 折叠时被摘下来的步骤行（惰渲染下它们本身几乎是空壳，重挂很便宜）
+      var kept = (w.__procs || []).slice();
+      kept.forEach(function (r) { if (r.parentNode) r.parentNode.removeChild(r); });
       if (det) {
         dropStaleAdopted(det);
         [].slice.call(det.querySelectorAll('[data-folded-for]')).forEach(function (n) {
@@ -3336,8 +3385,11 @@
           if (body) body.insertBefore(n, body.firstChild);
           else if (n.parentNode) n.parentNode.removeChild(n);
         });
-        [].slice.call(det.querySelectorAll('.ts-body > .row')).forEach(function (r) { rows.push(r); });
+        [].slice.call(det.querySelectorAll('.ts-body > .row')).forEach(function (r) {
+          if (kept.indexOf(r) < 0) rows.push(r);
+        });
       }
+      kept.forEach(function (r) { rows.push(r); });
       if (w.parentNode) w.parentNode.removeChild(w);
     });
     rows.sort(function (a, b) { return (+a.dataset.seq || 0) - (+b.dataset.seq || 0); });
@@ -3386,11 +3438,27 @@
     // 只在知道 seq 的行之间重排；不知道 seq 的行留在原地，避免还原时插错位置
     var procs = rows.filter(function (r) { return r !== result && r.dataset.seq !== ''; });
     var inner = processNodesOf(result);
-    if (!procs.length && !inner.length) return;
+    // 惰渲染的历史行：过程还没建出来，但数据里有 —— 用数据判断这一轮有没有过程
+    var resultEntry = state.messageMap.get(result.dataset.mid);
+    var hasLazyProc = !!(resultEntry && resultEntry.lazyParts && resultEntry.srcMsg &&
+      (resultEntry.srcMsg.parts || []).some(function (p) {
+        return p.type === 'reasoning' || p.type === 'tool';
+      }));
+    if (!procs.length && !inner.length && !hasLazyProc) return;
 
     var tools = 0;
-    procs.forEach(function (r) { tools += r.querySelectorAll('.tool').length; });
+    procs.forEach(function (r) {
+      var e = state.messageMap.get(r.dataset.mid);
+      if (e && e.lazyParts && e.srcMsg) {
+        (e.srcMsg.parts || []).forEach(function (p) { if (p.type === 'tool') tools += 1; });
+      } else {
+        tools += r.querySelectorAll('.tool').length;
+      }
+    });
     inner.forEach(function (n) { if (n.classList.contains('tool')) tools += 1; });
+    if (hasLazyProc && !tools) {
+      (resultEntry.srcMsg.parts || []).forEach(function (p) { if (p.type === 'tool') tools += 1; });
+    }
 
     var t0 = +rows[0].dataset.t || 0, t1 = +rows[rows.length - 1].dataset.t || 0;
     var dur = (t0 && t1 && t1 > t0) ? t1 - t0 : 0;
@@ -3401,9 +3469,14 @@
     var det = document.createElement('details');
     det.className = 'turn-steps';
     if (expandedTurns[key]) det.open = true;
+    // 展开时才把过程内容建出来（惰渲染的关键：默认状态只有一行按钮）
     det.addEventListener('toggle', function () {
-      if (det.open) expandedTurns[key] = 1;
-      else delete expandedTurns[key];
+      if (det.open) {
+        expandedTurns[key] = 1;
+        buildFoldBody(det, procs, result);
+      } else {
+        delete expandedTurns[key];
+      }
     });
     // 摘要行学 zcode 桌面端：一条细线 + 左边小圆点图标 +「思考 · 持续了 Xs」，
     // 右侧一个会转向的箭头。没有边框盒子，视觉上轻得多。
@@ -3417,15 +3490,54 @@
       '<span class="ts-arrow"></span>';
     var sb = document.createElement('div');
     sb.className = 'ts-body';
-    procs.forEach(function (r) { sb.appendChild(r); });
-    inner.forEach(function (n) {
-      n.setAttribute('data-folded-for', result.dataset.mid || '');
-      sb.appendChild(n);
-    });
     det.appendChild(sum);
     det.appendChild(sb);
     wrap.appendChild(det);
+    // 折叠时把过程行从消息流里摘下来（挂在 wrap 上，展开/还原时再挂回去）。
+    // 惰渲染下它们本身只有正文、没有工具卡片，摘挂几乎零成本。
+    wrap.__procs = procs;
+    procs.forEach(function (r) { if (r.parentNode) r.parentNode.removeChild(r); });
     if (result.parentNode) result.parentNode.insertBefore(wrap, result);
+    if (det.open) buildFoldBody(det, procs, result);
+  }
+
+  // 把一轮的过程内容真正建进折叠体（幂等：已建过就跳过）
+  function buildFoldBody(det, procs, result) {
+    var sb = det.querySelector('.ts-body');
+    if (!sb || sb.dataset.built === '1') return;
+    sb.dataset.built = '1';
+    // 首屏给的是 slim 数据（工具卡片只有名字/状态）：先把这几条消息的
+    // 完整内容取回来，再构建。取不到就按现有数据渲染，不至于卡住。
+    var need = [];
+    procs.forEach(function (r) {
+      var e = state.messageMap.get(r.dataset.mid);
+      if (e && e.lazyParts && e.srcMsg && e.srcMsg.slim) need.push(e);
+    });
+    var resultEntry = state.messageMap.get(result.dataset.mid);
+    if (resultEntry && resultEntry.lazyParts && resultEntry.srcMsg && resultEntry.srcMsg.slim) {
+      need.push(resultEntry);
+    }
+    var build = function () {
+      procs.forEach(function (r) {
+        var e = state.messageMap.get(r.dataset.mid);
+        if (e && e.lazyParts) materializeLazy(e);
+        sb.appendChild(r);
+      });
+      var inner = processNodesOf(result);
+      inner.forEach(function (n) {
+        n.setAttribute('data-folded-for', result.dataset.mid || '');
+        sb.appendChild(n);
+      });
+    };
+    if (!need.length) { build(); return; }
+    Promise.all(need.map(function (e) {
+      return req('/api/sessions/' + encodeURIComponent(state.sessionId) +
+                 '/message/' + encodeURIComponent(e.mid)).then(function (r) {
+        if (r.data && r.data.ok && r.data.message) {
+          e.srcMsg = r.data.message;      // 换成完整数据，后续展开直接可用
+        }
+      }).catch(function () {});
+    })).then(build);
   }
 
   var foldTimer = null;
@@ -3490,7 +3602,8 @@
     hideWelcome();
     if (old && old.mdTimer) { clearTimeout(old.mdTimer); old.mdTimer = null; }  // 别让旧节流器写到已拆掉的 DOM
     state.cur = null;                        // 重建期间别让 part 渲染串到别的气泡
-    var entry = buildAssistantRow(m);
+    // 已收尾的消息同样惰渲染：过程内容等折叠块展开时再建
+    var entry = buildAssistantRow(m, m.completed !== false);
     entry.sig = sig;
     var box = $('messages');
     if (old && old.row && old.row.parentNode) {

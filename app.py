@@ -890,7 +890,7 @@ def archive_usage_snapshot(session_id=None):
     return len(model_values) + len(tool_values)
 
 
-def load_messages(session_id, limit=None, before=None):
+def load_messages(session_id, limit=None, before=None, slim=False):
     """还原一个会话的对话（读 zcode 自己的库）。
 
     limit: 只取最近 limit 条；before: 只取 sequence < before 的更早一段。
@@ -924,12 +924,12 @@ def load_messages(session_id, limit=None, before=None):
         cur.execute(sql, params)
         # 倒序取再反转，等价于时间正序的「最后 limit 条」
         rows = list(cur.fetchall())[::-1]
-        return build_payloads(cur, rows)
+        return build_payloads(cur, rows, slim=slim)
     finally:
         conn.close()
 
 
-def build_payloads(cur, rows):
+def build_payloads(cur, rows, slim=False):
     """批量组装 message_payload：一次把这一页所有 part 查回来再按消息分组。
 
     结果与逐条调用 message_payload 完全一致；单条路径（tail 增量等）仍走
@@ -948,12 +948,27 @@ def build_payloads(cur, rows):
     out = []
     for r in rows:
         group = by_msg.get(r["id"]) or []
-        payload = message_payload(cur, r, parts_rows=group)
+        payload = message_payload(cur, r, parts_rows=group, slim=slim)
         out.append(payload)
     return out
 
 
-def message_payload(cur, row, parts_rows=None):
+def slim_part(p):
+    """历史首屏只需要「有没有工具、几次」这类信息。
+
+    工具 part 带着完整的输入和输出（一个会话里能占 90% 以上的响应体积），
+    而这些东西默认是折叠起来的、用户根本看不到。首屏先把它们压成
+    「类型 + 工具名 + 状态」，展开某个折叠块时再按消息 id 拉全文。
+    """
+    if not isinstance(p, dict) or p.get("type") != "tool":
+        return p
+    st = p.get("state") if isinstance(p.get("state"), dict) else {}
+    out = {"type": "tool", "callID": p.get("callID") or p.get("toolCallId"),
+           "tool": p.get("tool"), "state": {"status": st.get("status")}}
+    return out
+
+
+def message_payload(cur, row, parts_rows=None, slim=False):
     """一行 message + 它的 part，拼成前端要的结构（历史与增量共用）。
 
     completed / updated 两个字段是「实时化」补上的：前端靠 completed 判断
@@ -973,9 +988,10 @@ def message_payload(cur, row, parts_rows=None):
     for p in parts_rows:
         updated = max(updated, int(p["time_updated"] or 0))
         try:
-            parts.append(json.loads(p["data"] or "{}"))
+            item = json.loads(p["data"] or "{}")
         except Exception:
             continue
+        parts.append(slim_part(item) if slim else item)
     model = meta.get("modelID")
     if not model and isinstance(meta.get("model"), dict):
         model = meta["model"].get("modelID")
@@ -1007,6 +1023,7 @@ def message_payload(cur, row, parts_rows=None):
         "completed": bool(tinfo.get("completed")),
         "updated": updated,
         "visibleToUser": bool(is_visible_user),
+        "slim": bool(slim),
     }
 
 
@@ -4970,7 +4987,11 @@ async def handle_session_messages(request):
     else:
         before = None
 
-    msgs = load_messages(sid, limit=limit, before=before)
+    # 首屏只要「骨架」：工具卡片的输入输出占了响应体积九成以上，而它们
+    # 默认是折叠起来的。前端展开折叠块时再按消息 id 拉全文（?full=1）。
+    # 大会话首次加载因此从几 MB 降到几百 KB。
+    want_full = request.query.get("full") == "1"
+    msgs = load_messages(sid, limit=limit, before=before, slim=not want_full)
     total, min_seq = session_msg_stats(sid)
     has_more = bool(msgs and min_seq is not None and msgs[0]["seq"] > min_seq)
     f = feed.get(sid)
@@ -4998,6 +5019,39 @@ async def handle_session_messages(request):
         "cursor": cursor,
         "usage": (f.usage if f else None),
     })
+
+
+async def handle_session_message_full(request):
+    """单条消息的完整 parts（展开折叠块时用）。
+
+    历史首屏给的是 slim 版本（工具卡片只留名字和状态）；用户点开某个
+    折叠块时，前端按消息 id 来取这一条的完整内容，避免首屏传输几 MB
+    的、默认根本看不到的工具输出。
+    """
+    blocked = guard(request)
+    if blocked:
+        return blocked
+    sid = request.match_info["sid"]
+    mid = request.match_info["mid"]
+    if not SESSION_ID_RE.match(sid):
+        return json_error("非法的会话 ID", 400)
+    if not re.match(r"^[\w.\-]+$", mid or ""):
+        return json_error("非法的消息 ID", 400)
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT id, data, sequence, time_created, time_updated FROM message "
+            "WHERE id = ? AND session_id = ?", (mid, sid)).fetchone()
+        if not row:
+            return json_error("消息不存在", 404)
+        cur = conn.cursor()
+        payload = message_payload(cur, row, slim=False)
+    except sqlite3.Error as exc:
+        log(f"读取消息失败 {mid}: {exc}")
+        return json_error("读取消息失败", 500)
+    finally:
+        conn.close()
+    return web.json_response({"ok": True, "message": payload})
 
 
 async def handle_session_tail(request):
@@ -6968,6 +7022,7 @@ def make_app():
     app.router.add_get("/api/sessions", handle_sessions)
     app.router.add_post("/api/sessions", handle_session_create)
     app.router.add_get("/api/sessions/{sid}/messages", handle_session_messages)
+    app.router.add_get("/api/sessions/{sid}/message/{mid}", handle_session_message_full)
     app.router.add_get("/api/sessions/{sid}/tail", handle_session_tail)
     app.router.add_post("/api/sessions/{sid}/archive", handle_session_archive)
     app.router.add_delete("/api/sessions/{sid}", handle_session_delete)

@@ -1827,6 +1827,21 @@
     return { providerId: p[0], modelId: p.slice(1).join('|') };
   }
 
+  // 当前（或指定）模型能不能看图。目录里查不到就放行 —— 别拿不确定的信息拦人。
+  function modelSupportsImages(mv) {
+    var want = mv || currentModelValue();
+    if (!want || !want.modelId) return true;
+    var list = ((state.options || {}).models) || [];
+    for (var i = 0; i < list.length; i++) {
+      var m = list[i];
+      if (m.modelId === want.modelId &&
+          (!m.providerId || !want.providerId || m.providerId === want.providerId)) {
+        return !!m.supportsImages;
+      }
+    }
+    return true;
+  }
+
   // 每个会话各用各的模型：改选择器立刻下发给「当前这个会话」。
   // 会话正在执行时不打断它 —— 服务端会把改动登记成下一轮生效。
   function applySessionModel(sel) {
@@ -2111,6 +2126,13 @@
     var imgs = (opts && opts.images) || (state.pendingImages || []).slice();
     var ready = (opts && opts.attachments) || null;
 
+    // 选了个看不了图的模型：当场说清楚，别等模型回一句「我没收到图片」
+    if (imgs.length && !modelSupportsImages(mv)) {
+      toast('当前模型「' + shortModel((mv && mv.modelId) || '') +
+            '」不支持图片，请在下方换一个带图片能力的模型', 'err');
+      return;
+    }
+
     var finish = function (atts) {
       var payloadAtts = (atts && atts.length) ? atts : undefined;
       if (!wsOpen()) {
@@ -2335,10 +2357,12 @@
       var v = (m.providerId || '') + '|' + (m.modelId || '');
       var sel = (m.providerId === cur.providerId && m.modelId === cur.modelId);
       // 选项里带上上下文窗口（借鉴 claudecodeui 模型元数据展示），
-      // 选之前就能看出 128k 和 1m 的差别，不用跑去模型配置页翻
+      // 选之前就能看出 128k 和 1m 的差别，不用跑去模型配置页翻；
+      // 能看图的模型标一下，免得发图时选错（选了不支持图片的会直接拦住）。
       return '<option value="' + esc(v) + '"' + (sel ? ' selected' : '') + '>' +
         esc(m.label || m.modelId) + (m.providerLabel ? ' · ' + esc(m.providerLabel) : '') +
         (m.context ? ' · ' + fmtTokens(m.context) : '') +
+        (m.supportsImages ? ' · 图片' : '') +
         '</option>';
     }).join('');
 
@@ -4291,6 +4315,8 @@
       '<input class="w-name" placeholder="显示名称">' +
       '<input class="w-num" placeholder="上下文" type="number" min="1">' +
       '<input class="w-num" placeholder="最大输出" type="number" min="1">' +
+      '<label class="w-img" title="勾选后这个模型可以接收图片">' +
+      '<input type="checkbox" class="w-img-cb">图片</label>' +
       '<button class="mini-btn probe" type="button" ' +
       'title="用这个模型发一条最小请求，验证厂商能不能通">测试</button>' +
       '<button class="icon-btn del" type="button" title="移除">&#10005;</button>';
@@ -4299,6 +4325,8 @@
     row.querySelector('.w-num').value = m.context || '';
     var nums = row.querySelectorAll('.w-num');
     if (nums[1]) nums[1].value = m.output || '';
+    var imgCb = row.querySelector('.w-img-cb');
+    if (imgCb) imgCb.checked = !!m.supportsImages;
 
     var msg = document.createElement('div');
     msg.className = 'probe-msg hidden';
@@ -4620,11 +4648,13 @@
       var id = rows[i].querySelector('.w-id').value.trim();
       if (!id) continue;
       var nums = rows[i].querySelectorAll('.w-num');
+      var cb = rows[i].querySelector('.w-img-cb');
       models.push({
         modelId: id,
         name: rows[i].querySelector('.w-name').value.trim() || id,
         context: nums[0] ? nums[0].value : '',
         output: nums[1] ? nums[1].value : '',
+        supportsImages: !!(cb && cb.checked),
       });
     }
     if (!models.length) { toast('至少填一个模型', 'err'); return; }

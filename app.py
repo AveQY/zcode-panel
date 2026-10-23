@@ -3630,13 +3630,17 @@ def provider_list(with_secrets=False):
         models = []
         for mid, m in (p.get("models") or {}).items():
             lim = m.get("limit") or {}
+            mod = m.get("modalities") or {}
             models.append({
                 "modelId": mid,
                 "name": m.get("name") or mid,
                 "context": lim.get("context"),
                 "output": lim.get("output"),
                 "isMain": main == "%s/%s" % (pid, mid),
-                "modalities": m.get("modalities"),
+                "modalities": mod,
+                # 前端编辑表单直接读这个布尔值；只给 modalities 的话勾选框
+                # 永远是未选中，用户以为自己没勾过（线上实测）。
+                "supportsImages": "image" in (mod.get("input") or []),
             })
         opts = p.get("options") or {}
         api_key = opts.get("apiKey") or ""

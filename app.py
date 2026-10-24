@@ -155,7 +155,9 @@ APP_SERVER_REVIVE_WAIT = 25.0
 REVIVE_WINDOW = 300.0          # 统计窗口：5 分钟
 REVIVE_MAX_IN_WINDOW = 3       # 窗口内最多自动拉起 3 次
 REVIVE_COOLDOWN = 300.0        # 超过阈值后的冷却时间
-REVIVE_MIN_FREE_MB = 900       # 可用内存低于这个数就先不拉（留给系统喘气）
+REVIVE_MIN_FREE_MB = 900       # 默认值；可被面板 config.json 的 revive_min_free_mb 覆盖
+# 小内存机器（如 1.7G 的新加坡机）基线可用内存不足 900，默认阈值会让看门狗
+# 永远拒绝拉起。启动读配置时按 revive_min_free_mb 覆盖。
 BOOTSTRAP_MIN_INTERVAL = 60.0  # 模型目录预热的最小间隔（反复拉起时别每次都重推）
 _last_bootstrap_at = 0.0
 TURN_IDLE_TIMEOUT = 120        # 事件连续静默多久就向 app-server 求证一次
@@ -6089,6 +6091,14 @@ START_TIME = time.time()
 async def on_startup(app):
     global ban_store, token_store, zc, feed, runner, scheduler, task_runner
     load_config()
+    # 小内存机器可在面板 config.json 里调低看门狗的内存闸门
+    try:
+        gate = int(config.get("revive_min_free_mb") or 0)
+        if gate > 0:
+            global REVIVE_MIN_FREE_MB
+            REVIVE_MIN_FREE_MB = gate
+    except Exception:
+        pass
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     ban_store = BanStore(BAN_PATH)
     token_store = TokenStore(int(config.get("token_ttl", 43200)))

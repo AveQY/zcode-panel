@@ -60,8 +60,8 @@ check("anthropic+paas路径 -> 第1个按配置走",
 check("anthropic+paas路径 -> 第2个是厂商 anthropic 地址",
       c2[1], "https://open.bigmodel.cn/api/anthropic/v1/messages")
 
-c3 = app.probe_candidates("openai-compatible", "https://api.aweqy.top/v1")
-check("已是正确配置 -> 第1个即正确", c3[0], "https://api.aweqy.top/v1/chat/completions")
+c3 = app.probe_candidates("openai-compatible", "https://api.example.com/v1")
+check("已是正确配置 -> 第1个即正确", c3[0], "https://api.example.com/v1/chat/completions")
 
 check("Base URL 反推（openai）", app.probe_base_for(
     "openai-compatible", "https://open.bigmodel.cn/api/paas/v4/chat/completions"),
@@ -167,7 +167,7 @@ async def dead(url, body=None, headers=None, timeout=None):
 
 app.probe_http = dead
 res = LOOP.run_until_complete(
-    app.probe_chat("openai-compatible", "https://api.aweqy.top/v1", "sk", "m"))
+    app.probe_chat("openai-compatible", "https://api.example.com/v1", "sk", "m"))
 check("网络不通：不通", res["ok"], False)
 has("网络不通：提示网络", "网络", res.get("error") or res.get("hint"))
 
@@ -191,12 +191,12 @@ check("  顺带指出列表在哪个地址上",
       res.get("suggestBaseURL"), "https://open.bigmodel.cn/api/paas/v4")
 
 app.probe_http = fake_http({
-    "https://api.aweqy.top/v1/models":
+    "https://api.example.com/v1/models":
         (200, '{"object":"list","data":[{"id":"z-ai/glm-5.3-flash"},'
               '{"id":"deepseek-v4-flash"}]}'),
 })
 res = LOOP.run_until_complete(
-    app.probe_model_list("openai-compatible", "https://api.aweqy.top/v1", "sk-x"))
+    app.probe_model_list("openai-compatible", "https://api.example.com/v1", "sk-x"))
 check("自建网关也能拉", res["models"][0]["id"], "z-ai/glm-5.3-flash")
 check("  配置本来就对 -> 不提示改地址", "suggestBaseURL" in res, False)
 
